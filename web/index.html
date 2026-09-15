@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>hive</title>
     <meta name="description" content="Hive coordinates software work, decisions, reviews, and agent operations from one local control room." />
-    <meta name="color-scheme" content="dark" />
+    <meta name="color-scheme" content="dark light" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="icon" href="/icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
@@ -15,6 +15,14 @@
   </head>
   <body>
     <div id="root"></div>
+    <script>
+      // Apply the saved theme before the first paint so a light session never flashes dark.
+      try {
+        var t = localStorage.getItem("hive.theme");
+        if (t !== "light" && t !== "dark") t = matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+        document.documentElement.dataset.theme = t;
+      } catch (e) {}
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

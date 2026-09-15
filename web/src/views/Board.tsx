@@ -533,6 +533,51 @@ const readView = (): BoardView => {
   return saved === "columns" || saved === "tracked" ? saved : "focus";
 };
 
+// Today's work as a honeycomb: landed cells are filled with honey, running
+// cells have a blue rim, queued cells are empty. Capped so a heavy day stays
+// one glance wide; the counts line beside it carries the exact numbers.
+const COMB_MAX = 36;
+export function combCells(landed: number, running: number, queued: number): string[] {
+  return [
+    ...Array<string>(landed).fill("landed"),
+    ...Array<string>(running).fill("running"),
+    ...Array<string>(queued).fill("queued"),
+  ].slice(0, COMB_MAX);
+}
+
+export function Comb({ landed, running, queued }: { landed: number; running: number; queued: number }) {
+  const cells = combCells(landed, running, queued);
+  if (!cells.length) return null;
+  const r = 7;
+  const gap = 1.5;
+  const h = Math.sqrt(3) * r;
+  const step = 1.5 * r + gap;
+  const cols = Math.ceil(cells.length / 2);
+  const width = 2 * r + (cols - 1) * step;
+  const height = 2 * h + gap + h / 2;
+  const points = (cx: number, cy: number) =>
+    [0, 60, 120, 180, 240, 300]
+      .map((a) => `${(cx + r * Math.cos((a * Math.PI) / 180)).toFixed(1)},${(cy + r * Math.sin((a * Math.PI) / 180)).toFixed(1)}`)
+      .join(" ");
+  return (
+    <svg
+      className="comb"
+      width={width}
+      height={height}
+      viewBox={`0 0 ${width} ${height}`}
+      role="img"
+      aria-label={`${landed} landed, ${running} running, ${queued} queued`}
+    >
+      {cells.map((kind, i) => {
+        const col = Math.floor(i / 2);
+        const cx = r + col * step;
+        const cy = h / 2 + (i % 2) * (h + gap) + (col % 2 ? h / 2 + gap / 2 : 0);
+        return <polygon key={i} className={`comb-${kind}`} points={points(cx, cy)} />;
+      })}
+    </svg>
+  );
+}
+
 export function WorkFocus({ visible }: { visible: Task[] }) {
   const { needsYou, tasks } = useStore();
   const projectFilter = useProjectFilter();
@@ -584,6 +629,7 @@ export function WorkFocus({ visible }: { visible: Task[] }) {
             {queued} queued · {handling.length + pending.length} in flight · {done} done today
           </span>
         </header>
+        <Comb landed={done} running={handling.length + pending.length} queued={queued} />
         {handling.length + pending.length === 0 ? (
           <div className="muted status-lane-empty">No agents working right now.</div>
         ) : (

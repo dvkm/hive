@@ -44,6 +44,7 @@ import Chat from "./views/Chat";
 import Supervisors from "./views/Supervisors";
 import Deployments from "./views/Deployments";
 import { AwayBanner, AwayToggle } from "./views/Away";
+import { ThemeToggle } from "./views/ThemeToggle";
 
 // Enable web-push on this device (phone PWA). Hidden once granted or where
 // unsupported (desktop keeps the osascript notifier). iOS only offers this on
@@ -414,6 +415,7 @@ export default function App() {
           </NavLink>
           <SecondaryNav offline={offline} setOffline={setOffline} />
         </nav>
+        <ThemeToggle />
         <AwayToggle />
         <Bell />
         <ConnDot />

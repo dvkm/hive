@@ -24,6 +24,7 @@
   --orange: #d7864d;
   --red: #df6b72;
   --purple: #a98ac7;
+  --blue: #5b8def;
   --radius: 10px;
   --radius-lg: 18px;
   --shadow: 0 20px 64px rgba(4, 5, 3, 0.38), 0 1px 0 rgba(239, 214, 156, 0.035) inset;
@@ -48,6 +49,54 @@
   --t-lg: 17px;
   --t-xl: 24px;
 }
+
+/* ---- light theme: the honeycomb look. Wax page, white cells, comb-brown ink,
+   honey only on the primary action and filled comb cells. Dark keeps the
+   values above; index.html sets data-theme before first paint. ---- */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #fbf6ea;
+  --bg-elev: #ffffff;
+  --bg-elev2: #f3e9d2;
+  --panel: #fffdf7;
+  --border: #e3d5b4;
+  --border-soft: #ede3cb;
+  --text: #2b2115;
+  --text-dim: #5e5140;
+  --text-faint: #75644b;
+  --accent: #f2a93b;
+  --accent-bright: #b8720e;
+  --accent-dim: #f1d9a6;
+  --green: #24793f;
+  --amber: #96610a;
+  --orange: #b4581a;
+  --red: #b4302a;
+  --purple: #6b4fb3;
+  --blue: #2f7be4;
+  --shadow: 0 8px 24px rgba(43, 33, 21, 0.1), 0 1px 0 rgba(255, 255, 255, 0.7) inset;
+}
+/* No grain, glow or grid on wax: they only ever cost contrast. */
+:root[data-theme="light"] body,
+:root[data-theme="light"] .content,
+:root[data-theme="light"] .manager-page { background: var(--bg); }
+:root[data-theme="light"] body::before { display: none; }
+:root[data-theme="light"] .chief-briefing { background: var(--bg-elev); }
+:root[data-theme="light"] .topbar { background: rgba(251, 246, 234, 0.86); }
+:root[data-theme="light"] .mobnav { background: rgba(251, 246, 234, 0.96); }
+/* Surfaces the dark sheet paints with literal near-black instead of a token. */
+:root[data-theme="light"] .command-trigger,
+:root[data-theme="light"] .manager-chat .chat-compose,
+:root[data-theme="light"] .manager-chat .chat-compose textarea:focus { background: var(--bg-elev); }
+:root[data-theme="light"] .column,
+:root[data-theme="light"] .col-head,
+:root[data-theme="light"] .manager-conversation { background: var(--bg-elev2); }
+:root[data-theme="light"] .card { background: var(--bg-elev); }
+:root[data-theme="light"] .cp-box,
+:root[data-theme="light"] .verification-title,
+:root[data-theme="light"] .palette-item-sel .palette-icon { color: var(--text); }
+:root[data-theme="light"] select,
+:root[data-theme="light"] input,
+:root[data-theme="light"] textarea { color-scheme: light; }
 
 * {
   box-sizing: border-box;
@@ -315,16 +364,17 @@ textarea { font-family: inherit; }
   color: var(--text);
   background: var(--bg-elev2);
 }
+/* Counts live in hexagons: the brand shape, flat-top like the mark. */
 .badge {
-  background: var(--red);
-  color: #fff;
-  border-radius: 10px;
-  padding: 0 6px;
+  background: var(--accent);
+  color: #17150f;
+  clip-path: polygon(25% 0, 75% 0, 100% 50%, 75% 100%, 25% 100%, 0 50%);
+  padding: 0 7px;
   font-size: 11px;
   font-weight: 700;
-  min-width: 18px;
+  min-width: 22px;
   text-align: center;
-  line-height: 17px;
+  line-height: 19px;
 }
 .conn {
   display: inline-flex;
@@ -736,9 +786,9 @@ textarea { font-family: inherit; }
 
 /* status dot */
 .sdot {
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
+  width: 11px;
+  height: 10px;
+  clip-path: polygon(25% 0, 75% 0, 100% 50%, 75% 100%, 25% 100%, 0 50%);
   flex-shrink: 0;
   display: inline-block;
   position: relative;
@@ -6675,9 +6725,17 @@ a.chip-jira:hover { background: #2d5488; }
   font-family: var(--font-display);
 }
 .focus-lane-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 26px;
+  clip-path: polygon(25% 0, 75% 0, 100% 50%, 75% 100%, 25% 100%, 0 50%);
+  background: var(--accent-dim);
+  color: var(--accent-bright);
   font-family: var(--mono);
   font-weight: 700;
-  color: var(--accent-bright);
+  font-size: var(--t-sm);
 }
 .focus-lane-go {
   margin-left: auto;
@@ -6757,6 +6815,29 @@ a.chip-jira:hover { background: #2d5488; }
 .status-lane-counts {
   color: var(--text-dim);
   font-size: var(--t-sm);
+}
+/* Today's comb: honey = landed, blue rim = running (breathing), empty = queued. */
+.comb {
+  display: block;
+  margin: 0 0 var(--s3);
+  overflow: visible;
+}
+.comb-landed {
+  fill: var(--accent);
+  stroke: var(--accent-bright);
+}
+.comb-running {
+  fill: transparent;
+  stroke: var(--blue);
+  stroke-width: 1.5;
+  animation: pulse 2s infinite;
+}
+.comb-queued {
+  fill: var(--bg-elev2);
+  stroke: var(--border);
+}
+.theme-toggle {
+  padding: 2px 9px;
 }
 .status-row {
   background: transparent;
