@@ -19,7 +19,7 @@ import { relTime } from "../lib/time";
 import { useLightbox } from "../lib/lightbox";
 import type { LightboxImage } from "../lib/lightbox";
 import { fmtTokens, fmtUsd } from "./Analytics";
-import { buildTimeline } from "../lib/timeline";
+import { buildTimeline, quietTimeline } from "../lib/timeline";
 import { ANSWERED_BY_LABEL } from "../lib/labels";
 import type { TimelineItem } from "../lib/timeline";
 import { eventText } from "../lib/eventText";
@@ -229,7 +229,9 @@ export default function TaskPage() {
 function PaneTerminal({ taskId }: { taskId: string }) {
   const [text, setText] = useState<string>("");
   const [error, setError] = useState<string>("");
-  const [open, setOpen] = useState(true);
+  // Closed by default: the timeline above already carries the agent's words.
+  // The raw pane is the fallback for when you need the screen itself.
+  const [open, setOpen] = useState(false);
   const boxRef = useRef<HTMLPreElement>(null);
   useEffect(() => {
     if (!open) return;
@@ -537,6 +539,8 @@ export function TaskBody({ id }: { id: string }) {
   const [t, setT] = useState<TaskDetail | null>(null);
   const [jira, setJira] = useState<JiraTaskState | null>(null);
   const [err, setErr] = useState<string>("");
+  const [showEverything, setShowEverything] = useState(false);
+  const [expandTimeline, setExpandTimeline] = useState(false);
   const [steer, setSteer] = useState("");
   const [steerFiles, setSteerFiles] = useState<File[]>([]);
   const [planning, setPlanning] = useState(false);
@@ -578,7 +582,15 @@ export function TaskBody({ id }: { id: string }) {
   if (!t) return <div className="pad">Loading…</div>;
 
   const project = projects.find((p) => p.id === t.project_id);
-  const timeline = buildTimeline(t.events, t.decisions);
+  // Quiet by default: the agent's words, decisions, state changes, evidence and
+  // failures. Tool calls and the permission ledger sit behind "everything";
+  // older rows behind "earlier". The full log is one click away, never in the way.
+  const fullTimeline = buildTimeline(t.events, t.decisions);
+  const quiet = quietTimeline(fullTimeline);
+  const timeline = showEverything ? fullTimeline : quiet;
+  const RECENT = 8;
+  const shownTimeline = expandTimeline ? timeline : timeline.slice(-RECENT);
+  const hiddenEarlier = timeline.length - shownTimeline.length;
   const openDecisions = t.decisions.filter((d) => d.status === "open");
   const pastDecisions = t.decisions.filter((d) => d.status !== "open");
   const children = isTrackingOnly(t) ? trackedSubtasks(t, tasks) : tasks.filter((x) => x.parent_task_id === t.id);
@@ -973,9 +985,21 @@ export function TaskBody({ id }: { id: string }) {
         })()}
 
         <section className="panel">
-          <h2>Timeline</h2>
+          <div className="tl-head">
+            <h2>Timeline</h2>
+            <span className="muted tl-count">{timeline.length} of {fullTimeline.length}</span>
+            <label className="tl-toggle">
+              <input type="checkbox" checked={showEverything} onChange={(e) => setShowEverything(e.target.checked)} />
+              everything (tool calls, permissions)
+            </label>
+          </div>
+          {hiddenEarlier > 0 && (
+            <button className="link-btn tl-earlier" onClick={() => setExpandTimeline(true)}>
+              Show {hiddenEarlier} earlier
+            </button>
+          )}
           <ul className="timeline">
-            {timeline.map((it) => (
+            {shownTimeline.map((it) => (
               <TimelineRow key={it.id} it={it} />
             ))}
           </ul>

@@ -62,10 +62,10 @@ test("failure history includes explicit and payload-based failures", () => {
   expect(eventText({ type: "action_failed", payload: { action: "POST /merge", reason: "CI pending" } })).toBe("POST /merge failed: CI pending");
 });
 
-test("new transcript types are agent-lifecycle for the feed filter", () => {
+test("what an agent says is lifecycle; its tool calls are their own, off-by-default bucket", () => {
   expect(eventCategory("assistant_text")).toBe("lifecycle");
-  expect(eventCategory("tool_use")).toBe("lifecycle");
-  expect(eventCategory("agent_turn_end")).toBe("lifecycle");
+  expect(eventCategory("tool_use")).toBe("tools");
+  expect(eventCategory("agent_turn_end")).toBe("tools");
 });
 
 // #989: the mismatch has to be legible on the board, not just present in the DB.

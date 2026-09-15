@@ -1,6 +1,8 @@
-// Fleet terminals: every live agent's pane at a glance, plus a status strip.
-// Read-only mini panes (poll the /pane endpoint); click through for the full
-// task page with steer input.
+// Fleet terminals: what every live agent is saying, at a glance, plus a status
+// strip. The default is the agent's transcript (its `assistant_text` events,
+// which the hooks lift from the agent's own transcript file), not a scrape of
+// the terminal screen: no TUI chrome, no spinners, just the words. The raw pane
+// is one toggle away for when the screen itself is the question.
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../lib/api";
@@ -9,8 +11,10 @@ import { useStore } from "../lib/store";
 import { Empty, STATE_LABEL, StatusDot } from "../lib/ui";
 import { isTrackingOnly } from "../lib/needsYou";
 import { taskLabel } from "../lib/references";
+import { relTime } from "../lib/time";
 
 const ACTIVE: State[] = ["in_progress", "needs_decision", "in_review", "verifying"];
+const LAST = 6;
 
 function MiniPane({ id }: { id: string }) {
   const [text, setText] = useState("");
@@ -43,8 +47,52 @@ function MiniPane({ id }: { id: string }) {
   );
 }
 
+// The last few things the agent said, newest at the bottom.
+function MiniTranscript({ id }: { id: string }) {
+  const [lines, setLines] = useState<{ id: string; ts: string; text: string }[] | null>(null);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    let live = true;
+    const tick = () =>
+      api
+        .task(id)
+        .then((t) => {
+          if (!live) return;
+          const said = (t.events ?? [])
+            .filter((e) => e.type === "assistant_text" && String(e.payload?.text ?? "").trim())
+            .sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0))
+            .slice(-LAST)
+            .map((e) => ({ id: e.id, ts: e.ts, text: String(e.payload.text) }));
+          setLines(said);
+          requestAnimationFrame(() => {
+            if (ref.current) ref.current.scrollTop = ref.current.scrollHeight;
+          });
+        })
+        .catch(() => live && setLines([]));
+    tick();
+    const t = setInterval(tick, 5000);
+    return () => {
+      live = false;
+      clearInterval(t);
+    };
+  }, [id]);
+  if (lines === null) return <div className="term-transcript muted">…</div>;
+  if (!lines.length) return <div className="term-transcript muted">Nothing said yet.</div>;
+  return (
+    <div className="term-transcript" ref={ref}>
+      {lines.map((l) => (
+        <div className="term-said" key={l.id}>
+          <span className="term-said-age" title={l.ts}>{relTime(l.ts)}</span>
+          <span className="term-said-text">{l.text}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export default function Terminals() {
   const { tasks, decisions } = useStore();
+  const [raw, setRaw] = useState(false);
   const counts = (["queued", ...ACTIVE] as State[]).map((s) => ({
     state: s,
     n: tasks.filter((t) => t.state === s).length,
@@ -54,7 +102,7 @@ export default function Terminals() {
     <div className="pad">
       <div className="page-head">
         <h1 className="page-title">Terminals</h1>
-        <p className="page-sub">Every live agent's pane. Click a title to open the task and steer it.</p>
+        <p className="page-sub">What every live agent is saying. Click a title to open the task and steer it.</p>
       </div>
       <div className="fleet-strip">
         {counts.map((c) => (
@@ -65,11 +113,14 @@ export default function Terminals() {
         <Link to="/decisions" className="chip">
           open decisions: {decisions.length}
         </Link>
+        <label className="chip fleet-raw">
+          <input type="checkbox" checked={raw} onChange={(e) => setRaw(e.target.checked)} /> raw screens
+        </label>
       </div>
       {live.length === 0 ? (
         <Empty
           title="No agents running"
-          hint="Panes appear here the moment a task is dispatched. Dispatch one from the board to watch it work."
+          hint="Agents appear here the moment a task is dispatched. Dispatch one from the board to watch it work."
         />
       ) : (
         <div className="fleet-grid">
@@ -82,7 +133,7 @@ export default function Terminals() {
                 </Link>
                 <span className="chip">{STATE_LABEL[t.state]}</span>
               </header>
-              <MiniPane id={t.id} />
+              {raw ? <MiniPane id={t.id} /> : <MiniTranscript id={t.id} />}
             </section>
           ))}
         </div>

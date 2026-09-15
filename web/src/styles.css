@@ -7039,6 +7039,23 @@ a.chip-jira:hover { background: #2d5488; }
   from { transform: translateX(24px); opacity: 0; }
 }
 
+/* ---- timeline: quiet and short by default ---- */
+.tl-head { display: flex; align-items: baseline; gap: 12px; }
+.tl-head h2 { margin: 0; }
+.tl-count { font-size: var(--t-xs); font-family: var(--mono); }
+.tl-toggle { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; font-size: var(--t-xs); color: var(--text-faint); cursor: pointer; }
+.tl-toggle input { accent-color: var(--accent); margin: 0; }
+.tl-earlier { display: block; margin: 6px 0 2px; font-size: var(--t-xs); }
+.timeline li { padding: 5px 0; font-size: 12.5px; }
+
+/* ---- terminals: the agent's words, not its screen ---- */
+.fleet-raw { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.fleet-raw input { accent-color: var(--accent); margin: 0; }
+.term-transcript { max-height: 220px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border: 1px solid var(--border-soft); border-radius: 9px; background: var(--bg-elev); font-size: 12.5px; line-height: 1.45; }
+.term-said { display: grid; grid-template-columns: 44px 1fr; gap: 8px; align-items: baseline; }
+.term-said-age { font-family: var(--mono); font-size: 11px; color: var(--text-faint); }
+.term-said-text { white-space: pre-wrap; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; }
+
 /* ---- the intent card reads as prose; empty sections are a line to fill in ---- */
 .intent-prose { margin: 0; white-space: pre-wrap; font-family: var(--font); font-size: var(--t-md); line-height: 1.55; }
 .intent-section-empty { display: flex; align-items: center; gap: 12px; }

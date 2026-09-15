@@ -351,20 +351,28 @@ export function eventText(e: EventLike): string {
 }
 
 // Feed filter categories. Keep in sync with FEED_CATEGORIES in server/src/api.ts.
-export type FeedCategory = "state" | "decision" | "evidence" | "incident" | "lifecycle";
+export type FeedCategory = "state" | "decision" | "evidence" | "incident" | "lifecycle" | "tools";
 
 export const FEED_CATEGORIES: { key: FeedCategory; label: string }[] = [
   { key: "state", label: "State changes" },
   { key: "decision", label: "Decisions" },
   { key: "evidence", label: "Evidence" },
   { key: "incident", label: "Incidents" },
-  { key: "lifecycle", label: "Agent lifecycle" },
+  { key: "lifecycle", label: "Agent words and lifecycle" },
+  { key: "tools", label: "Tool calls" },
 ];
+
+// Off by default in the feed: every tool call, the permission ledger, dispatch
+// bookkeeping and heartbeats. What an agent says stays in lifecycle.
+export const TOOL_TYPES = ["tool_use", "agent_turn_end", "authority_logged", "dispatch_scope", "agent_status"];
 
 const CATEGORY_OF: Record<string, FeedCategory> = {
   assistant_text: "lifecycle",
-  tool_use: "lifecycle",
-  agent_turn_end: "lifecycle",
+  tool_use: "tools",
+  agent_turn_end: "tools",
+  authority_logged: "tools",
+  dispatch_scope: "tools",
+  agent_status: "tools",
   auto_resume: "lifecycle",
   state_change: "state",
   ready_for_review: "state",

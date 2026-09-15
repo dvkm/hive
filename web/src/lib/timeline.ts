@@ -44,6 +44,16 @@ export type TimelineItem =
   | { kind: "tools"; id: string; ts: string; tools: { tool: string; summary: string }[] }
   | { kind: "decision"; id: string; ts: string; decision: TLDecision; open: boolean; answerLabel: string | null };
 
+// What the director does not need to see by default: every tool call, the
+// permission ledger, dispatch bookkeeping, agent heartbeats. The quiet timeline
+// keeps what a person would say out loud: the agent's own words, decisions,
+// state changes, evidence, failures, comments.
+export const QUIET_TYPES = new Set(["tool_use", "authority_logged", "dispatch_scope", "agent_status", "status", "steer_receipt"]);
+
+export function quietTimeline(items: TimelineItem[]): TimelineItem[] {
+  return items.filter((it) => it.kind !== "tools" && !(it.kind === "event" && QUIET_TYPES.has(it.ev.type)));
+}
+
 // True for the bare hook-status rows we want gone (also cleans legacy data).
 export function isHookStatusNoise(ev: { type: string; payload?: Record<string, unknown> }): boolean {
   return ev.type === "status" && String(ev.payload?.note ?? "").startsWith("hook:");

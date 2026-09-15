@@ -2908,7 +2908,8 @@ const FEED_CATEGORIES: Record<string, string[]> = {
   decision: ["needs-decision", "decision_answered", "planned", "authority_required", "authority_granted", "auto_approved", "auto_approve_declined"],
   evidence: ["evidence", "smoke_passed"],
   incident: ["blocked", "stale", "spawn_error", "spawn_gave_up", "smoke_failed", "steer_error", "planner_error", "supervise_error", "authority_denied", "merge_failed", "requeue_failed"],
-  lifecycle: ["created", "spawned", "agent_status", "status", "steer", "note", "ci_status", "pr_merged", "planning", "assistant_text", "tool_use", "agent_turn_end", "auto_resume"],
+  lifecycle: ["created", "spawned", "status", "steer", "note", "ci_status", "pr_merged", "planning", "assistant_text", "auto_resume"],
+  tools: ["tool_use", "agent_turn_end", "authority_logged", "dispatch_scope", "agent_status"],
 };
 
 function listFeed(db: DB, url: URL): Response {

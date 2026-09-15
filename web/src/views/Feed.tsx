@@ -36,7 +36,9 @@ export default function Feed() {
   const lightbox = useLightbox();
 
   const [project, setProject] = useState(""); // "" = all projects
-  const [cats, setCats] = useState<Set<FeedCategory>>(new Set(ALL_CATS));
+  // Tool calls are off until asked for: the feed is what agents said and what
+  // changed, not every Read and Grep.
+  const [cats, setCats] = useState<Set<FeedCategory>>(new Set([...ALL_CATS].filter((c) => c !== "tools")));
   const [serverRows, setServerRows] = useState<FeedEvent[]>([]);
 
   // The last-looked marker: read the stored value now, then stamp this visit so
@@ -108,7 +110,9 @@ export default function Feed() {
     })
     .filter((r): r is FeedEvent => r !== null);
 
-  const rows = [...liveRows, ...serverRows];
+  // Server rows go through the same category filter as live ones, so the feed
+  // reads the same whichever server version answered.
+  const rows = [...liveRows, ...serverRows.filter((r) => allSelected || cats.has(eventCategory(r.type)))];
 
   // Digest strip — counts over the currently-visible window.
   const digest = useMemo(() => {
