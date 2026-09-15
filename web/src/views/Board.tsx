@@ -534,6 +534,53 @@ const readView = (): BoardView => {
   return saved === "columns" || saved === "tracked" ? saved : "focus";
 };
 
+// The now strip: three counts in hexagons and today's comb, one cell per task
+// drawn as the honey lifecycle (lib/comb.tsx). Work passes its scoped tasks;
+// Home reads the store itself.
+export function NowStrip({ visible }: { visible?: Task[] }) {
+  const { needsYou, tasks } = useStore();
+  const projectFilter = useProjectFilter();
+  const scoped = visible ?? (projectFilter ? tasks.filter((t) => t.project_id === projectFilter) : tasks);
+  const live = scoped.filter((task) => !isTrackingOnly(task));
+  const needs = actionableItems(needsYou, tasks, projectFilter).length;
+  const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
+  const today = (task: Task) => Date.parse(task.updated_at) >= dayAgo;
+  const count = (state: State) => live.filter((task) => task.state === state).length;
+  const running = count("in_progress") + count("in_review");
+  const landed = live.filter((task) => task.state === "done" && today(task)).length;
+  const failed = live.filter((task) => task.state === "failed" && today(task)).length;
+  const queued = count("queued");
+  const cells = combCells({
+    capped: landed,
+    full: count("verifying"),
+    question: count("needs_decision"),
+    filling: count("in_review"),
+    bee: count("in_progress"),
+    cracked: failed,
+    empty: queued,
+  });
+  return (
+    <div className="now-strip">
+      <div className="now-tiles">
+        <HexTile n={needs} label="need you" tone={needs ? "amber" : "muted"} />
+        <HexTile n={running} label="running" tone={running ? "blue" : "muted"} />
+        <HexTile n={failed} label="failed" tone={failed ? "red" : "muted"} />
+      </div>
+      {cells.length > 0 && (
+        <>
+          <div className="now-divider" />
+          <div className="now-comb">
+            <Comb cells={cells} size={28} label={`${landed} landed, ${running} running, ${queued} queued`} />
+            <span>
+              Today's comb · {landed} capped · {running} in flight · {queued} empty
+            </span>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 export function WorkFocus({ visible }: { visible: Task[] }) {
   const { needsYou, tasks } = useStore();
   const projectFilter = useProjectFilter();
@@ -555,40 +602,11 @@ export function WorkFocus({ visible }: { visible: Task[] }) {
   const done = visible.filter(
     (task) => !isTrackingOnly(task) && task.state === "done" && Date.parse(task.updated_at) >= dayAgo
   ).length;
-  const live = visible.filter((task) => !isTrackingOnly(task));
-  const failed = live.filter((task) => task.state === "failed" && Date.parse(task.updated_at) >= dayAgo).length;
-  // Today's comb: one cell per task, drawn as the honey lifecycle (lib/comb.tsx).
-  const cells = combCells({
-    capped: done,
-    full: live.filter((task) => task.state === "verifying").length,
-    question: live.filter((task) => task.state === "needs_decision").length,
-    filling: pending.length,
-    bee: handling.length,
-    cracked: failed,
-    empty: queued,
-  });
 
   return (
     <div className="work-focus">
       <AttentionBudgetBanner count={items.length} />
-      <div className="now-strip">
-        <div className="now-tiles">
-          <HexTile n={items.length} label="need you" tone={items.length ? "amber" : "muted"} />
-          <HexTile n={handling.length + pending.length} label="running" tone={handling.length + pending.length ? "blue" : "muted"} />
-          <HexTile n={failed} label="failed" tone={failed ? "red" : "muted"} />
-        </div>
-        {cells.length > 0 && (
-          <>
-            <div className="now-divider" />
-            <div className="now-comb">
-              <Comb cells={cells} size={28} label={`${done} landed, ${handling.length + pending.length} running, ${queued} queued`} />
-              <span>
-                Today's comb · {done} capped · {handling.length + pending.length} in flight · {queued} empty
-              </span>
-            </div>
-          </>
-        )}
-      </div>
+      <NowStrip visible={visible} />
       <section className="focus-lane">
         <header className="focus-lane-head">
           <h2>Needs you</h2>

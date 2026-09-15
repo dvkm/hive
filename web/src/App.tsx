@@ -96,67 +96,6 @@ const SECONDARY_NAV: { label: string; items: [string, string, IconDefinition][] 
   },
 ];
 
-function SecondaryNav({ offline, setOffline, rail }: { offline: boolean; setOffline: (v: boolean) => void; rail?: boolean }) {
-  const location = useLocation();
-  const detailsRef = useRef<HTMLDetailsElement>(null);
-  const active = SECONDARY_NAV.some(({ items }) => items.some(([to]) => location.pathname.startsWith(to)));
-  useEffect(() => {
-    if (detailsRef.current) detailsRef.current.open = false;
-  }, [location.pathname]);
-  useEffect(() => {
-    const close = () => {
-      if (detailsRef.current) detailsRef.current.open = false;
-    };
-    window.addEventListener("hive:palette", close);
-    window.addEventListener("hive:notifications", close);
-    return () => {
-      window.removeEventListener("hive:palette", close);
-      window.removeEventListener("hive:notifications", close);
-    };
-  }, []);
-  const close = (event: React.MouseEvent<HTMLAnchorElement>) => {
-    const details = event.currentTarget.closest("details");
-    if (details) details.open = false;
-  };
-  return (
-    <details
-      ref={detailsRef}
-      className={`more-menu ${active ? "more-menu-active" : ""}`}
-      onToggle={(event) => {
-        if (event.currentTarget.open) window.dispatchEvent(new Event("hive:browse"));
-      }}
-    >
-      <summary className={rail ? "rail-item" : undefined} title={rail ? "More" : undefined} aria-label={rail ? "More" : undefined}>
-        {rail ? <Icon name="more" /> : <>Browse <span aria-hidden="true">⌄</span></>}
-      </summary>
-      <div className="more-popover">
-        {SECONDARY_NAV.map((group) => (
-          <div className="more-group" key={group.label}>
-            <div className="more-group-label">{group.label}</div>
-            {group.items.map(([to, label, icon]) => (
-              <NavLink key={to} to={to} onClick={close}>
-                <FontAwesomeIcon icon={icon} />
-                {label}
-              </NavLink>
-            ))}
-          </div>
-        ))}
-        <div className="more-system-actions">
-          <PushButton />
-          <button
-            className={`offline-toggle ${offline ? "offline-on" : ""}`}
-            onClick={() => {
-              setOffline(!offline);
-              if (detailsRef.current) detailsRef.current.open = false;
-            }}
-          >
-            {offline ? "Resume Hive" : "Go offline"}
-          </button>
-        </div>
-      </div>
-    </details>
-  );
-}
 
 // Stroke icons for the rail, on a 24px grid so they scale and recolor with the theme.
 const ICONS: Record<string, string> = {
@@ -177,8 +116,9 @@ function Icon({ name }: { name: keyof typeof ICONS }) {
   );
 }
 
-// The left rail: the five places the director goes, the secondary pages behind
-// More, search, and the live dot. Icon-only; the page title says where you are.
+// The navigation sidebar: the five places the director goes, then the
+// secondary pages by group, then search and the live dot. Labels show at
+// desktop widths; under 1100px it collapses to the icon rail (CSS).
 function Rail({ inboxCount, offline, setOffline }: { inboxCount: number; offline: boolean; setOffline: (v: boolean) => void }) {
   const items: [string, string, keyof typeof ICONS][] = [
     ["/", "Home", "home"],
@@ -195,15 +135,35 @@ function Rail({ inboxCount, offline, setOffline }: { inboxCount: number; offline
           <path d="M17.05,9 L14.9,12.72 L10.6,12.72 L8.45,9 L10.6,5.28 L14.9,5.28 Z" />
           <path d="M9.55,13.33 L7.4,17.05 L3.1,17.05 L0.95,13.33 L3.1,9.61 L7.4,9.61 Z" />
         </svg>
+        <span className="rail-label rail-wordmark">hive</span>
       </NavLink>
       {items.map(([to, label, icon]) => (
         <NavLink key={to} to={to} end={to === "/"} className="rail-item" title={label} aria-label={label}>
           <Icon name={icon} />
+          <span className="rail-label">{label}</span>
           {to === "/inbox" && inboxCount > 0 && <span className="badge rail-badge">{inboxCount}</span>}
         </NavLink>
       ))}
+      <div className="rail-groups">
+        {SECONDARY_NAV.map((group) => (
+          <div className="rail-group" key={group.label}>
+            <div className="rail-group-label rail-label">{group.label}</div>
+            {group.items.map(([to, label, icon]) => (
+              <NavLink key={to} to={to} className="rail-item rail-sub" title={label} aria-label={label}>
+                <FontAwesomeIcon icon={icon} />
+                <span className="rail-label">{label}</span>
+              </NavLink>
+            ))}
+          </div>
+        ))}
+      </div>
       <div className="rail-gap" />
-      <SecondaryNav offline={offline} setOffline={setOffline} rail />
+      <div className="rail-system">
+        <PushButton />
+        <button className={`offline-toggle ${offline ? "offline-on" : ""}`} onClick={() => setOffline(!offline)}>
+          {offline ? "Resume Hive" : "Go offline"}
+        </button>
+      </div>
       <button
         className="rail-item"
         onClick={() => window.dispatchEvent(new Event("hive:palette"))}
@@ -211,6 +171,8 @@ function Rail({ inboxCount, offline, setOffline }: { inboxCount: number; offline
         aria-label="Search or jump to anything"
       >
         <Icon name="search" />
+        <span className="rail-label">Search</span>
+        <kbd className="rail-label rail-kbd">⌘K</kbd>
       </button>
       <ConnDot />
     </nav>

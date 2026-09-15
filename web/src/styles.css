@@ -6857,53 +6857,73 @@ a.chip-jira:hover { background: #2d5488; }
   padding: 2px 9px;
 }
 
-/* ---- the rail: five destinations, More, search, live dot ---- */
+/* ---- the navigation sidebar: five destinations, the secondary pages by group,
+   search and the live dot. Labels at desktop widths; an icon rail under 1100px. ---- */
 .rail {
-  width: 60px;
+  width: 224px;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
-  align-items: center;
-  gap: 4px;
-  padding: 10px 0 14px;
+  gap: 2px;
+  padding: 10px 12px 14px;
+  overflow-y: auto;
   background: var(--rail-bg);
   border-right: 1px solid var(--border-soft);
+  font-family: var(--font);
   z-index: 110;
 }
 .rail-brand {
   display: flex;
   align-items: center;
-  justify-content: center;
-  width: 40px;
+  gap: 10px;
   height: 44px;
-  margin-bottom: 6px;
+  padding: 0 10px;
+  margin-bottom: 8px;
   color: var(--accent-bright);
 }
 .rail-brand:hover { color: var(--accent); }
+.rail-wordmark { font-size: 19px; font-weight: 700; letter-spacing: -0.01em; color: var(--text); }
 .rail-item {
   position: relative;
   display: flex;
   align-items: center;
-  justify-content: center;
-  width: 40px;
+  gap: 12px;
   height: 38px;
+  padding: 0 12px;
   border-radius: 9px;
   border: 0;
   background: none;
   color: var(--text-dim);
+  font-family: inherit;
+  font-size: 14.5px;
+  font-weight: 500;
+  text-align: left;
   cursor: pointer;
-  list-style: none;
 }
+.rail-item svg { flex-shrink: 0; width: 20px; }
 .rail-item:hover { background: var(--bg-elev2); color: var(--text); }
-.rail-item.active { background: var(--bg-elev); color: var(--text); box-shadow: 0 0 0 1px var(--border-soft); }
-.rail-badge { position: absolute; top: 1px; right: -3px; }
-.rail-gap { flex: 1; }
-.rail .more-menu { position: relative; }
-.rail .more-menu > summary.rail-item { padding: 0; }
-.rail .more-menu[open] > summary.rail-item { background: var(--bg-elev2); color: var(--text); }
-.rail .more-popover { top: auto; bottom: 0; left: 50px; right: auto; }
-.rail .conn { margin-top: 8px; }
-.rail .conn-label { display: none; }
+.rail-item.active { background: var(--bg-elev); color: var(--text); font-weight: 600; box-shadow: 0 0 0 1px var(--border-soft); }
+.rail-badge { margin-left: auto; }
+.rail-groups { display: flex; flex-direction: column; gap: 10px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border-soft); }
+.rail-group { display: flex; flex-direction: column; gap: 1px; }
+.rail-group-label { padding: 0 12px 4px; font-size: 11.5px; font-weight: 600; color: var(--text-faint); }
+.rail-sub { height: 32px; font-size: 13.5px; font-weight: 400; }
+.rail-sub svg { width: 14px; }
+.rail-gap { flex: 1; min-height: 12px; }
+.rail-system { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 4px 8px; }
+.rail-system .offline-toggle { margin: 0; }
+.rail-kbd { margin-left: auto; font-family: inherit; font-size: 11px; padding: 1px 6px; border: 1px solid var(--border); border-radius: 5px; color: var(--text-faint); }
+.rail .conn { padding: 8px 12px 0; }
+@media (max-width: 1100px) {
+  .rail { width: 60px; padding: 10px 10px 14px; align-items: center; overflow: visible; }
+  .rail-label, .rail-groups .rail-group-label, .rail-system { display: none; }
+  .rail-brand { justify-content: center; padding: 0; }
+  .rail-item { width: 40px; height: 38px; padding: 0; justify-content: center; }
+  .rail-sub { height: 32px; }
+  .rail-badge { position: absolute; top: 1px; right: -3px; margin: 0; }
+  .rail .conn { padding: 8px 0 0; }
+  .rail .conn-label { display: none; }
+}
 @media (max-width: 768px) {
   .rail { display: none; }
 }

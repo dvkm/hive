@@ -10,6 +10,7 @@ import type { Brief, ChatMessage, ChatThread, Decision, Event, Task } from "../l
 import { relTime } from "../lib/time";
 import { eventText } from "../lib/eventText";
 import { STATE_LABEL } from "../lib/labels";
+import { NowStrip } from "./Board";
 import { StatusDot, toast } from "../lib/ui";
 import { DecisionCard } from "./DecisionCard";
 import { actionableItems, isInMotion } from "../lib/needsYou";
@@ -512,6 +513,7 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
         </div>
       </header>
       <div className={embedded ? "manager-body" : "chat-body"}>
+        {embedded && <NowStrip />}
         {embedded && <ChiefBriefing thread={managerThread} awaiting={awaiting} />}
         <div className={embedded ? `manager-conversation${chatMessages.length > 0 && visibleMessages.length === 0 ? " manager-conversation-quiet" : ""}` : undefined}>
           <div className="chat-scroll" ref={scrollRef}>
