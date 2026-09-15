@@ -15,7 +15,7 @@ import { RequestChanges } from "./RequestChanges";
 import { HeldSummary } from "./Away";
 import { AttentionBudgetBanner } from "./Board";
 import { fmtUsd, fmtTokens } from "./Analytics";
-import { itemProject, orderFocusItems } from "../lib/needsYou";
+import { focusSlot, itemProject, orderFocusItems } from "../lib/needsYou";
 import type { NeedsYouItem } from "../lib/needsYou";
 import { useProjectFilter, setProjectFilter, inProjectFilter } from "../lib/projectFilter";
 import { taskLabel } from "../lib/references";
@@ -236,9 +236,26 @@ export default function Brief() {
     }), tasks);
   }, [needsYou, tasks, answered, passedQuizzes, reviewed]);
   const focusCount = focusItems.length;
+  // The card you are on is pinned by identity, not by slot: saving an answer
+  // bumps the intent's updated_at and re-sorts the queue, and that must not
+  // swap the card under you. The slot is only the fallback for when the pinned
+  // item leaves the queue (accepted, answered), which lands on the next in line.
   const [focusIdx, setFocusIdx] = useState(0);
-  const at = Math.min(focusIdx, Math.max(0, focusCount - 1));
+  const [pinned, setPinned] = useState<string | null>(null);
+  const focusKey = (item: NeedsYouItem) => `${item.kind}:${item.id}`;
+  const pinnedAt = pinned ? focusItems.findIndex((item) => focusKey(item) === pinned) : -1;
+  const at = Math.max(0, focusSlot(focusItems.map(focusKey), pinned, focusIdx));
   const focusItem = focusItems[at];
+  const go = (n: number) => {
+    const item = focusItems[n];
+    setFocusIdx(Math.max(0, n));
+    setPinned(item ? focusKey(item) : null);
+  };
+  useEffect(() => {
+    if (!focusItem) return;
+    if (pinnedAt < 0) setPinned(focusKey(focusItem));
+    else if (focusIdx !== pinnedAt) setFocusIdx(pinnedAt);
+  }, [focusItem, pinnedAt, focusIdx]);
   const chooseMode = (next: "focus" | "backlogs") => {
     setMode(next);
     localStorage.setItem(MODE_KEY, next);
@@ -300,9 +317,9 @@ export default function Brief() {
           <div className="brief-focus-meta">
             <span>{ITEM_LABELS[focusItem.kind]}</span>
             <span className="brief-focus-nav">
-              <button className="btn btn-mini" aria-label="Previous item" disabled={at === 0} onClick={() => setFocusIdx(at - 1)}>&larr;</button>
+              <button className="btn btn-mini" aria-label="Previous item" disabled={at === 0} onClick={() => go(at - 1)}>&larr;</button>
               {at + 1} of {focusCount}
-              <button className="btn btn-mini" aria-label="Next item" disabled={at >= focusCount - 1} onClick={() => setFocusIdx(at + 1)}>&rarr;</button>
+              <button className="btn btn-mini" aria-label="Next item" disabled={at >= focusCount - 1} onClick={() => go(at + 1)}>&rarr;</button>
             </span>
           </div>
           {focusItem.kind === "decision" && (
@@ -387,7 +404,7 @@ export default function Brief() {
             <ul className="brief-backlog-list">
               {digests.map((digest) => (
                 <li key={digest.id}>
-                  <button className="link-btn" onClick={() => { setFocusIdx(focusItems.findIndex((item) => item.id === digest.id)); chooseMode("focus"); }}>
+                  <button className="link-btn" onClick={() => { go(focusItems.findIndex((item) => item.id === digest.id)); chooseMode("focus"); }}>
                     Catch up on {digest.total} shipped {digest.total === 1 ? "change" : "changes"}
                   </button>
                   <span>{digest.remaining.length} left</span>
@@ -402,7 +419,7 @@ export default function Brief() {
             <ul className="brief-backlog-list">
               {draftIntents.map((intent) => (
                 <li key={intent.id}>
-                  <button className="link-btn" onClick={() => { setFocusIdx(focusItems.findIndex((item) => item.id === intent.id)); chooseMode("focus"); }}>
+                  <button className="link-btn" onClick={() => { go(focusItems.findIndex((item) => item.id === intent.id)); chooseMode("focus"); }}>
                     {intentSection(intent.body_md, "Problem").split("\n")[0] || "Untitled ask"}
                   </button>
                   <span>{projects.find((p) => p.id === intent.project_id)?.name ?? intent.project_id} · from {intent.source}</span>

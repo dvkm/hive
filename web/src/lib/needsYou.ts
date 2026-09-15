@@ -70,6 +70,15 @@ const intentProject = (item: NeedsYouItem) => (item.kind === "intent" ? item.int
 
 // Priority is a head start, not a permanent lane: one day per level means an
 // old lower-priority item eventually outranks a steady stream of new urgent work.
+// Which slot the focus view shows: the pinned item wherever the re-sort put
+// it, and only when that item has left the queue the slot it was in (clamped),
+// which is the next thing in line. -1 when the queue is empty.
+export function focusSlot(keys: string[], pinned: string | null, slot: number): number {
+  if (!keys.length) return -1;
+  const at = pinned ? keys.indexOf(pinned) : -1;
+  return at >= 0 ? at : Math.min(Math.max(0, slot), keys.length - 1);
+}
+
 export function orderFocusItems(items: NeedsYouItem[], tasks: Task[]): NeedsYouItem[] {
   const byId = new Map(tasks.map((task) => [task.id, task]));
   return items
