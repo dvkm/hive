@@ -79,6 +79,36 @@ export function answerOpenQuestion(body: string, index: number, answer = ""): st
   return body;
 }
 
+// Mirror of server/src/intentDraft.ts DEFAULT_OPEN_QUESTION: the one question
+// hive itself adds to every draft so a human reads it before an agent starts.
+// On the card, Accept IS the answer to it; only questions people asked hold.
+export const DEFAULT_OPEN_QUESTION = "Is this the ask, and what does done look like? Tick this once you have read the draft.";
+
+export function isHiveQuestion(text: string): boolean {
+  return text.trim() === DEFAULT_OPEN_QUESTION;
+}
+
+// What Accept saves before it accepts: hive's own question ticked, everything
+// else untouched. Returns the body unchanged when hive did not ask.
+export function answerHiveQuestion(body: string): string {
+  const mine = openQuestions(body).findIndex(isHiveQuestion);
+  return mine >= 0 ? answerOpenQuestion(body, mine) : body;
+}
+
+// Replace what sits under one heading (adding the heading at the end if the
+// draft lacks it), so a section can be filled in from the card without opening
+// the whole Markdown.
+export function setIntentSection(body: string, heading: string, text: string): string {
+  const lines = String(body ?? "").split("\n");
+  const start = lines.findIndex((line) => HEADING.exec(line)?.[1] === heading);
+  const block = text.trim() ? [text.trim(), ""] : [""];
+  if (start === -1) return `${String(body ?? "").trimEnd()}\n\n## ${heading}\n${block.join("\n")}`;
+  const rest = lines.slice(start + 1);
+  const next = rest.findIndex((line) => HEADING.test(line));
+  const end = next === -1 ? lines.length : start + 1 + next;
+  return [...lines.slice(0, start + 1), ...block, ...lines.slice(end)].join("\n");
+}
+
 export function isDraft(intent: Intent): boolean {
   return intent.status === "draft";
 }

@@ -1,13 +1,23 @@
 // The intent card: what was asked, and the one tap that accepts it (HIVE-636).
 //
 // Deterministic rendering, no model call — the five sections come straight out
-// of body_md. Three actions: Accept, Edit (inline Markdown), and "Ask the
-// originator", which adds an open question. An open question holds acceptance,
-// so asking one is also how you park an intent you cannot accept yet.
+// of body_md. Accept IS the answer to hive's own "is this the ask?" question,
+// so a plain yes is one tap; questions people asked are answered on the card
+// and hold acceptance until they are. Empty sections are filled in on the card
+// too. Edit (raw Markdown) and "Ask the originator" remain for everything else.
 import { useState } from "react";
 import { api } from "../lib/api";
 import type { Intent } from "../lib/api";
-import { addOpenQuestion, answerOpenQuestion, intentSections, openQuestions, questionBullets } from "../lib/intent";
+import {
+  addOpenQuestion,
+  answerHiveQuestion,
+  answerOpenQuestion,
+  intentSections,
+  isHiveQuestion,
+  openQuestions,
+  questionBullets,
+  setIntentSection,
+} from "../lib/intent";
 import { toast } from "../lib/ui";
 
 const STATUS_LABEL: Record<Intent["status"], string> = {
@@ -16,15 +26,30 @@ const STATUS_LABEL: Record<Intent["status"], string> = {
   superseded: "Superseded",
 };
 
-// Open questions answered on the card: tick the box (with an optional one-line
-// answer) and it is saved as "[x] question — answer" in the Markdown, which is
-// what unlocks Accept. No editor round trip for a one-line yes.
-function OpenQuestions({ body, busy, onAnswer }: { body: string; busy: boolean; onAnswer: (index: number, answer: string) => void }) {
-  const [answers, setAnswers] = useState<Record<number, string>>({});
-  let openIndex = -1;
+const NOT_STATED = "(not stated)";
+const ADD_HINT: Record<string, string> = {
+  "Proposed outcome": "What does done look like? Enter to save",
+  "Affected users and systems": "Who and what does this touch? Enter to save",
+  Constraints: "What must not change? Enter to save",
+};
+
+// Questions people asked, answered where they are read: tick the box (with an
+// optional one-line answer) and it is saved as "[x] question — answer".
+function OpenQuestions({
+  body,
+  busy,
+  onAnswer,
+}: {
+  body: string;
+  busy: boolean;
+  onAnswer: (index: number, answer: string) => void;
+}) {
+  const [answers, setAnswers] = useState<Record<string, string>>({});
+  const open = openQuestions(body);
+  const bullets = questionBullets(body).filter((q) => !isHiveQuestion(q.text));
   return (
     <ul className="intent-questions">
-      {questionBullets(body).map((q, i) => {
+      {bullets.map((q, i) => {
         if (q.done) {
           return (
             <li key={i} className="intent-q intent-q-done">
@@ -33,8 +58,8 @@ function OpenQuestions({ body, busy, onAnswer }: { body: string; busy: boolean; 
             </li>
           );
         }
-        const index = ++openIndex;
-        const answer = answers[index] ?? "";
+        const index = open.indexOf(q.text);
+        const answer = answers[q.text] ?? "";
         return (
           <li key={i} className="intent-q">
             <input
@@ -48,10 +73,10 @@ function OpenQuestions({ body, busy, onAnswer }: { body: string; busy: boolean; 
             <input
               className="intent-q-answer"
               aria-label="Your answer (optional)"
-              placeholder="Your answer, optional — tick the box to save"
+              placeholder="Your answer, optional — tick the box or press Enter to save"
               value={answer}
               disabled={busy}
-              onChange={(e) => setAnswers((prev) => ({ ...prev, [index]: e.target.value }))}
+              onChange={(e) => setAnswers((prev) => ({ ...prev, [q.text]: e.target.value }))}
               onKeyDown={(e) => {
                 if (e.key === "Enter") onAnswer(index, answer);
               }}
@@ -63,6 +88,27 @@ function OpenQuestions({ body, busy, onAnswer }: { body: string; busy: boolean; 
   );
 }
 
+// An empty section is a line to fill in, not "(not stated)" three times.
+function AddLine({ heading, busy, onSave }: { heading: string; busy: boolean; onSave: (text: string) => void }) {
+  const [value, setValue] = useState("");
+  return (
+    <div className="intent-section intent-section-empty">
+      <h3>{heading}</h3>
+      <input
+        className="intent-add"
+        aria-label={`Add ${heading.toLowerCase()}`}
+        placeholder={ADD_HINT[heading] ?? "Add… Enter to save"}
+        value={value}
+        disabled={busy}
+        onChange={(e) => setValue(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && value.trim()) onSave(value.trim());
+        }}
+      />
+    </div>
+  );
+}
+
 export function IntentCard({ intent, onChange }: { intent: Intent; onChange?: (next: Intent) => void }) {
   const [busy, setBusy] = useState(false);
   const [editing, setEditing] = useState(false);
@@ -70,8 +116,11 @@ export function IntentCard({ intent, onChange }: { intent: Intent; onChange?: (n
   const [asking, setAsking] = useState(false);
   const [question, setQuestion] = useState("");
   const open = openQuestions(intent.body_md);
+  // Only questions people asked hold Accept; hive's own one is answered by accepting.
+  const asked = open.filter((q) => !isHiveQuestion(q));
+  const isDraft = intent.status === "draft";
 
-  const save = async (body_md: string, done: () => void) => {
+  const save = async (body_md: string, done: () => void = () => {}) => {
     setBusy(true);
     try {
       onChange?.(await api.updateIntent(intent.id, { body_md }));
@@ -86,6 +135,10 @@ export function IntentCard({ intent, onChange }: { intent: Intent; onChange?: (n
   const accept = async () => {
     setBusy(true);
     try {
+      // Accepting is the answer to hive's question, so tick it on the way through:
+      // the server's "[x]" gate stays the authority and the Markdown keeps the record.
+      const ticked = answerHiveQuestion(intent.body_md);
+      if (ticked !== intent.body_md) await api.updateIntent(intent.id, { body_md: ticked });
       // No toast: the card itself flips to "Accepted", which is the feedback.
       onChange?.(await api.acceptIntent(intent.id));
     } catch (e) {
@@ -120,42 +173,52 @@ export function IntentCard({ intent, onChange }: { intent: Intent; onChange?: (n
         </>
       ) : (
         <>
-          {intentSections(intent.body_md).map(({ heading, text }) => (
-            <div className="intent-section" key={heading}>
-              <h3>{heading}</h3>
-              {heading === "Open questions" && intent.status === "draft" && questionBullets(intent.body_md).length > 0 ? (
-                <OpenQuestions
-                  body={intent.body_md}
-                  busy={busy}
-                  onAnswer={(index, answer) => save(answerOpenQuestion(intent.body_md, index, answer), () => {})}
-                />
-              ) : (
-                <pre className="brief">{text || "(none)"}</pre>
-              )}
-            </div>
-          ))}
+          {intentSections(intent.body_md).map(({ heading, text }) => {
+            if (heading === "Open questions") {
+              const shown = questionBullets(intent.body_md).some((q) => !isHiveQuestion(q.text));
+              return (
+                <div className="intent-section" key={heading}>
+                  <h3>{heading}</h3>
+                  {shown && isDraft ? (
+                    <OpenQuestions body={intent.body_md} busy={busy} onAnswer={(index, answer) => save(answerOpenQuestion(intent.body_md, index, answer))} />
+                  ) : (
+                    <p className="intent-prose muted">{shown ? text : "(none)"}</p>
+                  )}
+                </div>
+              );
+            }
+            const empty = !text || text === NOT_STATED;
+            if (empty && isDraft && heading !== "Problem") {
+              return <AddLine key={heading} heading={heading} busy={busy} onSave={(value) => save(setIntentSection(intent.body_md, heading, value))} />;
+            }
+            return (
+              <div className="intent-section" key={heading}>
+                <h3>{heading}</h3>
+                <p className={`intent-prose${empty ? " muted" : ""}`}>{text || "(none)"}</p>
+              </div>
+            );
+          })}
 
-          {intent.status === "draft" && (
-            <div className="intent-actions">
-              {/* Same rule the server enforces, said before the tap rather than
-                  as a 409 after it. */}
-              <button
-                className="btn btn-primary"
-                disabled={busy || open.length > 0}
-                title={open.length ? `Answer ${open.length} open question${open.length === 1 ? "" : "s"} first` : "Accept this ask"}
-                onClick={accept}
-              >
-                Accept
-              </button>
-              <button className="btn" disabled={busy} onClick={() => setEditing(true)}>Edit</button>
-              <button className="btn" disabled={busy} onClick={() => setAsking((on) => !on)}>Ask the originator</button>
-            </div>
-          )}
-
-          {open.length > 0 && intent.status === "draft" && (
-            <div className="muted intent-open-note">
-              {open.length} open question{open.length === 1 ? "" : "s"} to answer before this can be accepted.
-            </div>
+          {isDraft && (
+            <>
+              <div className="intent-actions">
+                <button
+                  className="btn btn-primary"
+                  disabled={busy || asked.length > 0}
+                  title={asked.length ? `Answer ${asked.length} question${asked.length === 1 ? "" : "s"} above first` : "This is the ask: accept it"}
+                  onClick={accept}
+                >
+                  Accept
+                </button>
+                <button className="btn" disabled={busy} onClick={() => setEditing(true)}>Edit</button>
+                <button className="btn" disabled={busy} onClick={() => setAsking((on) => !on)}>Ask the originator</button>
+              </div>
+              <div className="muted intent-open-note">
+                {asked.length
+                  ? `${asked.length} open question${asked.length === 1 ? "" : "s"} for you above before this can be accepted.`
+                  : "Accept means: this is the ask. Hive then rewrites the task's brief from it and can start the work."}
+              </div>
+            </>
           )}
 
           {asking && (

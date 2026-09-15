@@ -79,6 +79,15 @@ test("Accept is held while an open question is unanswered", () => {
   expect(button(create(<IntentCard intent={ticked} />), "Accept").props.disabled).toBe(false);
 });
 
+test("hive's own question does not hold Accept: accepting is the answer to it", () => {
+  const drafted = { ...intent, body_md: BODY + "- [ ] Is this the ask, and what does done look like? Tick this once you have read the draft.\n" };
+  const tree = create(<IntentCard intent={drafted} />);
+  expect(button(tree, "Accept").props.disabled).toBe(false);
+  const shown = texts(tree).join("");
+  expect(shown).not.toContain("Tick this once");
+  expect(shown).toContain("Accept means: this is the ask.");
+});
+
 test("an accepted intent shows no Accept, Edit or Ask buttons", () => {
   const tree = create(<IntentCard intent={{ ...intent, status: "accepted", accepted_by: "director" }} />);
   for (const label of ["Accept", "Edit", "Ask the originator"]) expect(button(tree, label)).toBeUndefined();

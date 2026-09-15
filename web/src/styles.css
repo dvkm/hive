@@ -7039,6 +7039,23 @@ a.chip-jira:hover { background: #2d5488; }
   from { transform: translateX(24px); opacity: 0; }
 }
 
+/* ---- the intent card reads as prose; empty sections are a line to fill in ---- */
+.intent-prose { margin: 0; white-space: pre-wrap; font-family: var(--font); font-size: var(--t-md); line-height: 1.55; }
+.intent-section-empty { display: flex; align-items: center; gap: 12px; }
+.intent-section-empty h3 { margin: 0; flex-shrink: 0; }
+.intent-add {
+  flex: 1;
+  min-width: 200px;
+  padding: 5px 9px;
+  border: 1px dashed var(--border);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: var(--t-sm);
+}
+.intent-add:focus { border-style: solid; background: var(--bg-elev); outline: none; border-color: var(--accent); }
+
 /* ---- open questions answered on the intent card ---- */
 .intent-questions { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 .intent-q { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: var(--t-md); }
