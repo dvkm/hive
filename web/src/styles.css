@@ -619,12 +619,18 @@ textarea { font-family: inherit; }
   flex-shrink: 0;
 }
 .col-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 28px;
+  height: 24px;
+  padding: 0 6px;
+  clip-path: polygon(25% 0, 75% 0, 100% 50%, 75% 100%, 25% 100%, 0 50%);
   font-family: var(--mono);
   font-size: var(--t-xs);
-  color: var(--text-faint);
-  background: rgba(255, 255, 255, 0.035);
-  border-radius: 10px;
-  padding: 1px var(--s2);
+  font-weight: 700;
+  color: var(--text-dim);
+  background: var(--bg-elev);
 }
 .col-body {
   padding: 10px;
@@ -4034,9 +4040,17 @@ a.dbundle-fact:hover {
   border-color: var(--accent);
 }
 .needs-you-strip-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 30px;
+  height: 26px;
+  padding: 0 6px;
+  clip-path: polygon(25% 0, 75% 0, 100% 50%, 75% 100%, 25% 100%, 0 50%);
+  background: var(--accent-dim);
   font-family: var(--mono);
   font-weight: 700;
-  font-size: 15px;
+  font-size: 13px;
   color: var(--accent-bright);
 }
 .needs-you-strip-text {
