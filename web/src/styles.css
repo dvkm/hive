@@ -7038,6 +7038,24 @@ a.chip-jira:hover { background: #2d5488; }
 @keyframes drawerIn {
   from { transform: translateX(24px); opacity: 0; }
 }
+
+/* ---- open questions answered on the intent card ---- */
+.intent-questions { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.intent-q { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: var(--t-md); }
+.intent-q input[type="checkbox"] { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); cursor: pointer; }
+.intent-q-done { color: var(--text-dim); }
+.intent-q-done span { text-decoration: line-through; }
+.intent-q-answer {
+  flex: 1;
+  min-width: 220px;
+  padding: 5px 9px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg-elev);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--t-sm);
+}
 .status-row {
   background: transparent;
   border-color: transparent;

@@ -47,6 +47,38 @@ export function addOpenQuestion(body: string, question: string): string {
   return out.join("\n");
 }
 
+// Every bullet under "## Open questions", ticked or not, in document order.
+export function questionBullets(body: string): { text: string; done: boolean }[] {
+  return intentSection(body, "Open questions")
+    .split("\n")
+    .flatMap((line) => {
+      const m = /^\s*[-*]\s+(.*)$/.exec(line);
+      if (!m) return [];
+      const raw = m[1].trim();
+      const done = /^\[x\]\s*/i.test(raw);
+      return [{ text: raw.replace(/^\[[x\s]?\]\s*/i, ""), done }];
+    });
+}
+
+// Tick the nth unanswered bullet (in openQuestions order) and keep the answer
+// on the same line, so the server's "[x]" gate and a reader of the Markdown
+// both see it. Ticking is what unlocks Accept; the answer text is optional.
+export function answerOpenQuestion(body: string, index: number, answer = ""): string {
+  const lines = String(body ?? "").split("\n");
+  const start = lines.findIndex((line) => HEADING.exec(line)?.[1] === "Open questions");
+  if (start === -1) return body;
+  let seen = 0;
+  for (let i = start + 1; i < lines.length && !HEADING.test(lines[i]); i++) {
+    const m = /^(\s*[-*]\s+)(.*)$/.exec(lines[i]);
+    if (!m || /^\[x\]/i.test(m[2].trim())) continue;
+    if (seen++ !== index) continue;
+    const question = m[2].trim().replace(/^\[\s?\]\s*/, "");
+    lines[i] = `${m[1]}[x] ${question}${answer.trim() ? ` — ${answer.trim()}` : ""}`;
+    return lines.join("\n");
+  }
+  return body;
+}
+
 export function isDraft(intent: Intent): boolean {
   return intent.status === "draft";
 }
