@@ -87,6 +87,7 @@ export interface SpawnArgs {
   base?: string; // base ref for the worktree
   env?: Record<string, string>; // extra env (secrets), injected as --env K=V
   model?: string; // claude --model for the default argv (ignored when agentArgv overrides)
+  agentMcp?: "none" | "inherit"; // project's config.agent_mcp; default "none" (see defaultAgentArgv)
   agentArgv?: string[]; // command run inside the agent; per-project override (verbatim)
   // Called after the worktree exists but BEFORE the agent starts, so the caller
   // can seed the worktree (e.g. write .claude hook settings) structurally.
@@ -154,7 +155,7 @@ export function worktreeCreateArgv(repoPath: string, branch: string, base?: stri
 // itself, with no fragile send-text/composer-autocomplete step (the hazard
 // an earlier herdr-backend doc documents). The agent stays live afterward and
 // tolerates the captain attaching and typing.
-export function defaultAgentArgv(brief: string, model?: string): string[] {
+export function defaultAgentArgv(brief: string, model?: string, mcp: "none" | "inherit" = "none"): string[] {
   // auto (was acceptEdits, director's call 2026-07-12): the model classifier judges each
   // action instead of prompting — nobody is at a worker's pane to answer, and
   // acceptEdits still let non-edit dialogs stall sessions. hive's PreToolUse
@@ -163,6 +164,12 @@ export function defaultAgentArgv(brief: string, model?: string): string[] {
   // config.agent_argv (verbatim override).
   const a = ["claude", brief, "--permission-mode", "auto"];
   if (model) a.push("--model", model);
+  // HIVE-641: a project-scoped .mcp.json (graft's SessionStart hook writes one
+  // into every fresh worktree) makes claude stop at "New MCP server found …
+  // Use this MCP server?" with nobody at the pane to answer. Agents don't need
+  // MCP servers, so hand claude an empty config and forbid it from reading any
+  // other. Per-project opt-in: config.agent_mcp="inherit".
+  if (mcp !== "inherit") a.push("--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}');
   return a;
 }
 
@@ -784,7 +791,7 @@ export class Herdr {
       worktreePath: wt.path,
       hiveUrl: args.hiveUrl,
       env: args.env,
-      agentArgv: args.agentArgv ?? defaultAgentArgv(args.brief, args.model),
+      agentArgv: args.agentArgv ?? defaultAgentArgv(args.brief, args.model, args.agentMcp),
       workspaceId: fleetWs,
       tabId,
     });

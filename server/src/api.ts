@@ -4565,6 +4565,7 @@ export async function spawnAgent(
       base: projectBaseBranch(config),
       env,
       model: modelForTask(config, task.kind),
+      agentMcp: config?.agent_mcp === "inherit" ? "inherit" : "none",
       agentArgv: agentArgvFor(config, task.kind, brief),
       // Seed the worktree BEFORE the agent starts: agent hook wiring
       // (structural Stop/SubagentStop/PostToolUse reporting), then the

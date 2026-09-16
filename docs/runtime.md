@@ -186,6 +186,13 @@ its canonical `taskId` name so probe/send/focus by `agent_target` keep resolving
 Per-project `config.agent_argv` overrides the command verbatim (the operator owns
 briefing in that case).
 
+**MCP is off for claude workers.** The default argv carries `--strict-mcp-config`
+and an empty `--mcp-config`, so claude ignores every project- and user-scoped MCP
+server. Without it a `.mcp.json` in the fresh worktree (graft's SessionStart hook
+writes one) stops the pane on "New MCP server found in this project … Use this MCP
+server?" with nobody there to answer. Set `config.agent_mcp: "inherit"` on a
+project whose agents genuinely need MCP tools. Codex argv is unaffected.
+
 **Model selection.** Claude workers stay explicitly pinned by task kind: `ship → opus`, `scout`/`chore` → `sonnet`, overridable through `config.model` or `config.model_by_kind`. Codex workers inherit the current ChatGPT/Codex default unless `config.codex_model` or `config.codex_model_by_kind` is set. Hive bounds Codex's default token use with `medium` reasoning for ship tasks, `low` for scout/chore tasks, compaction at 64,000 tokens, and 6,000-token tool output. Override those with `config.codex_reasoning_effort`, `config.codex_reasoning_effort_by_kind`, `config.codex_auto_compact_token_limit`, and `config.codex_tool_output_token_limit`. `config.agent_argv` bypasses all of these paths. The planner one-shot remains Claude and is pinned to `sonnet` unless `config.planner_argv` overrides it.
 
 **Token controls.** The composed prompt keeps the lifecycle and standing-authority contracts inline, but stores policy, reference, prior-decision, and failure bodies behind task-scoped `hive recall` searches. Default processed-token warning/cap thresholds are 75M/200M and wait-call thresholds are 25/100; projects can override or disable each with `processed_token_warn`, `processed_token_cap`, `wait_call_warn`, and `wait_call_cap`. Warnings steer once. A cap parks an in-progress task behind a wrap-up-or-continue decision, and continuing doubles that task's effective threshold. This works for unpriced models because it does not depend on `cost_usd`. A chat supervisor session is the exception: it has no definition of done, so a "wrap up" steer changes nothing. At the processed-token warning its task is cancelled outright and the thread says so; the director's next message is the deliberate restart.
