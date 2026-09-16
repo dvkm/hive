@@ -36,6 +36,7 @@ export interface StreamSpawnArgs {
   brief: string;
   env?: Record<string, string>;
   model?: string;
+  mcp?: "none" | "inherit";
 }
 
 interface Session {
@@ -99,9 +100,11 @@ export function userMessage(text: string): string {
   return JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "text", text }] } }) + "\n";
 }
 
-export function streamArgv(sessionId: string, model?: string): string[] {
+export function streamArgv(sessionId: string, model?: string, mcp: "none" | "inherit" = "none"): string[] {
   const a = ["claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--permission-mode", "auto", "--session-id", sessionId];
   if (model) a.push("--model", model);
+  // HIVE-641, same as the pane argv: no MCP servers unless the project opts in.
+  if (mcp !== "inherit") a.push("--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}');
   return a;
 }
 
@@ -143,7 +146,7 @@ export class ClaudeStreamRuntime {
       HIVE_URL: args.hiveUrl,
       HIVE_CLI: args.hiveCli,
     };
-    const proc = this.spawnProc(streamArgv(sessionId, args.model), { cwd: args.cwd, env });
+    const proc = this.spawnProc(streamArgv(sessionId, args.model, args.mcp), { cwd: args.cwd, env });
     const session: Session = {
       taskId: args.taskId,
       cwd: args.cwd,

@@ -310,6 +310,7 @@ const CHECKS: Record<string, Check> = {
   // "protocol": claude agents run over stream-json (runtime/claudeStream.ts)
   // instead of an interactive pane. Claude only; codex keeps its pane.
   agent_driver: oneOf("pane", "protocol"),
+  agent_mcp: oneOf("none", "inherit"), // HIVE-641: "none" (default) hides every MCP config from claude workers
   model: str,
   model_by_kind: obj,
   codex_model: str,

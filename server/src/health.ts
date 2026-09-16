@@ -320,10 +320,27 @@ export function taskWithHealth(db: DB, task: any, sidecar?: SidecarReport | null
   // read (HIVE-525). `permanent` is the distinction that matters on the board:
   // "not yet" (capacity, backoff, a blocker) versus "not ever until someone
   // changes something". Only queued tasks can carry one.
-  const skip = task.skip_reason && SKIP_REASONS[task.skip_reason]
+  // HIVE-2234: a deferred task is excluded from the dispatcher's queued lap
+  // (dispatcher.ts's NOT_DEFERRED clause), so its skip_reason is frozen at
+  // whatever the dispatcher last saw before deferral — it can go stale (e.g.
+  // "intent_not_accepted" after the intent was since accepted) and never
+  // self-corrects while parked. The human-written deferral note is the true
+  // "why waiting" while deferred, so it replaces the gate label rather than
+  // racing it on the card.
+  const deferred = isDeferred(task);
+  const skip = !deferred && task.skip_reason && SKIP_REASONS[task.skip_reason]
     ? { reason: task.skip_reason, ...SKIP_REASONS[task.skip_reason], since: task.skip_reason_at ?? null }
     : null;
-  return { ...task, display_id: taskIdentifier(db, task), health: computeHealth(db, task), requeued_to, needs_you_since, never_dispatched: neverDispatched(db, task), review_actionable: actionable ? actionable.has(task.id) : reviewActionable(db, task), reviewed, skip, sidecar: sidecar !== undefined ? sidecar : latestSidecar(db, task.id) };
+  let deferred_note: string | null = null;
+  if (deferred) {
+    const last = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'deferred' ORDER BY ts DESC LIMIT 1").get(task.id) as { payload: string } | undefined;
+    if (last) {
+      try {
+        deferred_note = JSON.parse(last.payload).note ?? null;
+      } catch {}
+    }
+  }
+  return { ...task, display_id: taskIdentifier(db, task), health: computeHealth(db, task), requeued_to, needs_you_since, never_dispatched: neverDispatched(db, task), review_actionable: actionable ? actionable.has(task.id) : reviewActionable(db, task), reviewed, skip, deferred_note, sidecar: sidecar !== undefined ? sidecar : latestSidecar(db, task.id) };
 }
 
 // Batched form of taskWithHealth for list endpoints (task HIVE-447): looks up

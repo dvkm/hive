@@ -54,7 +54,9 @@ test("the brief goes in as a user message, words and tool calls land in the tran
 test("argv pins the protocol flags and tool lines carry one cheap field", () => {
   expect(streamArgv("abc", "opus")).toEqual([
     "claude", "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--permission-mode", "auto", "--session-id", "abc", "--model", "opus",
+    "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
   ]);
+  expect(streamArgv("abc", undefined, "inherit")).not.toContain("--strict-mcp-config");
   expect(toolLine("Edit", { file_path: "/a/b.ts" })).toBe("▸ Edit: /a/b.ts");
   expect(toolLine("Read", {})).toBe("▸ Read");
 });

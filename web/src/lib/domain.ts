@@ -71,6 +71,7 @@ export interface Task {
   depends_on: string[]; // task ids governed by the server dependency gate (docs/API.md)
   intent_id?: string | null; // the accepted ask this work implements; a draft intent holds dispatch
   deferred_until?: string | null; // parked pending an offline human action; nudges suppressed while future-dated
+  deferred_note?: string | null; // the human blocker named when deferred; server-computed, only set while deferred_until is future
   parked_for_director?: string | null; // director took the worktree over; no agent runs on it until hand-back
   land_queued_at?: string | null; // marked approved-to-land; the land queue merges it in graph order
   needs_you_since?: string | null; // when review/failed entered Focus; unlike updated_at, CI and metadata cannot reset it

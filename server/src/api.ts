@@ -4566,6 +4566,7 @@ export async function spawnAgent(
       base: projectBaseBranch(config),
       env,
       model: modelForTask(config, task.kind),
+      agentMcp: config?.agent_mcp === "inherit" ? "inherit" : "none",
       agentArgv: agentArgvFor(config, task.kind, brief),
       // Per-project driver switch (phase 1: claude over stream-json, no pane).
       // config.agent_argv overrides are pane-only and are ignored on the protocol driver.
