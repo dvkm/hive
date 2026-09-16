@@ -95,6 +95,11 @@ export function Card({ task }: { task: Task }) {
   // `decisions` is the open-cards list, so an intake_triage card here means this
   // task is held waiting on the director to pick a reading.
   const awaitingTriage = decisions.some((d) => d.task_id === task.id && d.decision_class === "intake_triage");
+  // A deferred task is excluded from the dispatcher's queued lap, so its
+  // `skip` reason is frozen from before the deferral and can go stale (e.g.
+  // "intent is still a draft" surviving the intent's acceptance) — the
+  // deferred chip below, with the director's own note, is the true reason.
+  const deferred = !!task.deferred_until && Date.parse(task.deferred_until) > Date.now();
 
   return (
     <Link to={`/tasks/${task.id}`} state={{ backgroundLocation: location }} className="card">
@@ -142,7 +147,7 @@ export function Card({ task }: { task: Task }) {
         {/* Why this queued task is not running (HIVE-525). A permanent reason is
             the loud one: nothing changes until a human changes a setting. The
             two reasons with their own richer chip above are left out. */}
-        {task.state === "queued" && task.skip && !["dependency_blocked", "file_overlap"].includes(task.skip.reason) && (
+        {task.state === "queued" && !deferred && task.skip && !["dependency_blocked", "file_overlap"].includes(task.skip.reason) && (
           <span
             className={task.skip.permanent ? "chip chip-error" : "chip"}
             title={`Dispatcher skipped this task: ${task.skip.label}`}
@@ -161,9 +166,12 @@ export function Card({ task }: { task: Task }) {
           <span className="chip chip-deferred" title="You took this worktree over; no agent runs on it until you hand it back">
             yours
           </span>
-        ) : task.deferred_until && Date.parse(task.deferred_until) > Date.now() && (
-          <span className="chip chip-deferred" title="Deferred pending an offline human action; nudges suppressed">
-            deferred
+        ) : deferred && (
+          // HIVE-2234: while deferred, the human-written deferral note IS the
+          // waiting reason — the dispatcher's intent/skip gate text never
+          // applies here (server already omits `skip` while deferred).
+          <span className="chip chip-deferred" title={task.deferred_note ? `Deferred: ${task.deferred_note}` : "Deferred pending an offline human action; nudges suppressed"}>
+            {task.deferred_note ? `deferred · ${task.deferred_note}` : "deferred"}
           </span>
         )}
         <span className="card-age">{age}</span>

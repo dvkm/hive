@@ -267,6 +267,31 @@ test("an intake task nobody has reviewed still says unreviewed", async () => {
   expect(chipText(renderer)).toContain("intake · unreviewed");
 });
 
+// A deferred task's intent can be accepted after the last time the dispatcher
+// looked at it (it stops re-checking a parked task, server/src/dispatcher.ts's
+// NOT_DEFERRED clause) — so `skip` can still say "intent_not_accepted" even
+// once accepted. The server omits `skip` while deferred and sends the human's
+// own deferral note instead (server/src/health.ts); the card must show that
+// note, never the stale gate text. HIVE-2234.
+test("a queued+deferred task with an accepted intent shows the deferral note, not the stale intent gate", async () => {
+  const t = task("deferred-accepted", {
+    state: "queued",
+    deferred_until: "9999-01-01T00:00:00.000Z",
+    deferred_note: "waiting on the App Store review",
+    intent_id: "int_a85e9e2f6102",
+    // Stale: the dispatcher set this before the intent was accepted, then
+    // stopped re-evaluating once the task was deferred.
+    skip: { reason: "intent_not_accepted", label: "its intent is still a draft — accept it first", permanent: false, since: null },
+  });
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(tree(t));
+  });
+  const labels = chipText(renderer);
+  expect(labels).toContain("waiting on the App Store review");
+  expect(labels).not.toContain("still a draft");
+});
+
 // ---- priority (HIVE-430) ------------------------------------------------
 // The chip IS the quick-set control (a <select> painted as a chip), so the
 // class name is what says whether the card carries a visible priority: only
