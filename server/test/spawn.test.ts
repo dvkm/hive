@@ -322,6 +322,8 @@ test("modelForTask: per-kind default, config.model, config.model_by_kind overrid
   expect(custom).toContain('model_reasoning_effort="high"');
   expect(custom).toContain("model_auto_compact_token_limit=80000");
   expect(custom).toContain("tool_output_token_limit=4000");
+  // HIVE-641: the MCP kill-switch is claude-only; codex argv never carries it.
+  expect(scout.some((a) => a === "--strict-mcp-config" || a === "--mcp-config")).toBe(false);
 });
 
 // hive-1090 adoption guard: a requeue's resume_pr_url pointer is normally

@@ -307,6 +307,7 @@ const CHECKS: Record<string, Check> = {
   stack_setup_timeout_ms: num,
   // agent behaviour
   agent: oneOf(...AGENTS),
+  agent_mcp: oneOf("none", "inherit"), // HIVE-641: "none" (default) hides every MCP config from claude workers
   model: str,
   model_by_kind: obj,
   codex_model: str,
