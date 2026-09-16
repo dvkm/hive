@@ -52,6 +52,8 @@ function stubExec(handler: (argv: string[], input?: string) => ExecResult): { ex
 const OK = (stdout = ""): ExecResult => ({ code: 0, stdout, stderr: "" });
 const FAIL = (stderr = "boom"): ExecResult => ({ code: 1, stdout: "", stderr });
 
+const NO_MCP = ["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}'];
+
 test("argv builders construct the documented herdr commands", () => {
   expect(worktreeCreateArgv("/repo", "hive/abc")).toEqual([
     "worktree", "create", "--cwd", "/repo", "--branch", "hive/abc", "--json",
@@ -59,7 +61,9 @@ test("argv builders construct the documented herdr commands", () => {
   expect(worktreeCreateArgv("/repo", "hive/abc", "main")).toContain("--base");
 
   // INTERACTIVE claude: the brief is claude's first prompt arg, never `-p`.
-  expect(defaultAgentArgv("do the thing")).toEqual(["claude", "do the thing", "--permission-mode", "auto"]);
+  expect(defaultAgentArgv("do the thing")).toEqual([
+    "claude", "do the thing", "--permission-mode", "auto", ...NO_MCP,
+  ]);
 
   // Fleet workspace + labelled tab builders (JSON is default; no --json flag).
   expect(workspaceListArgv()).toEqual(["workspace", "list"]);
@@ -227,7 +231,7 @@ test("spawn builds the visible interactive fleet: worktree, fleet workspace, lab
   expect(start).toContain("--workspace");
   expect(start).toContain("wF:t2");
   expect(start).toContain("TOKEN=sekret");
-  expect(start.slice(start.indexOf("--") + 1)).toEqual(["claude", "Fix the bug. Definition of done: ...", "--permission-mode", "auto"]);
+  expect(start.slice(start.indexOf("--") + 1)).toEqual(["claude", "Fix the bug. Definition of done: ...", "--permission-mode", "auto", ...NO_MCP]);
   expect(start).not.toContain("-p");
   // does NOT rename the agent: rename breaks agent_target resolution (verified
   // live), so the tab label carries the "id + title", not the agent name.
@@ -534,8 +538,14 @@ test("reclaim refuses to touch a directory git does not track as a worktree", as
 });
 
 test("defaultAgentArgv pins the model when one is given", () => {
-  expect(defaultAgentArgv("b", "sonnet")).toEqual(["claude", "b", "--permission-mode", "auto", "--model", "sonnet"]);
-  expect(defaultAgentArgv("b")).toEqual(["claude", "b", "--permission-mode", "auto"]); // unpinned stays unpinned
+  expect(defaultAgentArgv("b", "sonnet")).toEqual(["claude", "b", "--permission-mode", "auto", "--model", "sonnet", ...NO_MCP]);
+  expect(defaultAgentArgv("b")).toEqual(["claude", "b", "--permission-mode", "auto", ...NO_MCP]); // unpinned stays unpinned
+});
+
+// HIVE-641: a worktree .mcp.json used to stall the pane on "New MCP server found".
+test("defaultAgentArgv shuts claude's MCP config off unless the project opts in", () => {
+  expect(defaultAgentArgv("b", undefined, "none")).toEqual(["claude", "b", "--permission-mode", "auto", ...NO_MCP]);
+  expect(defaultAgentArgv("b", undefined, "inherit")).toEqual(["claude", "b", "--permission-mode", "auto"]);
 });
 
 test("spawn passes SpawnArgs.model into the interactive claude argv", async () => {
@@ -549,7 +559,7 @@ test("spawn passes SpawnArgs.model into the interactive claude argv", async () =
   const h = new Herdr(exec, "herdr");
   await h.spawn({ taskId: "m", repoPath: "/repo", hiveUrl: "u", title: "t", brief: "b", model: "opus" });
   const start = calls.find((c) => has(c, "agent", "start"))!;
-  expect(start.slice(start.indexOf("--") + 1)).toEqual(["claude", "b", "--permission-mode", "auto", "--model", "opus"]);
+  expect(start.slice(start.indexOf("--") + 1)).toEqual(["claude", "b", "--permission-mode", "auto", "--model", "opus", ...NO_MCP]);
 });
 
 test("agent_name_taken error parsing", () => {
