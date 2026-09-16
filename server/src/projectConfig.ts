@@ -307,6 +307,9 @@ const CHECKS: Record<string, Check> = {
   stack_setup_timeout_ms: num,
   // agent behaviour
   agent: oneOf(...AGENTS),
+  // "protocol": claude agents run over stream-json (runtime/claudeStream.ts)
+  // instead of an interactive pane. Claude only; codex keeps its pane.
+  agent_driver: oneOf("pane", "protocol"),
   model: str,
   model_by_kind: obj,
   codex_model: str,
