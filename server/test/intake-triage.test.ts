@@ -9,6 +9,7 @@ import { join } from "node:path";
 
 const HOME = mkdtempSync(join(tmpdir(), "hive-triage-"));
 process.env.HIVE_HOME = HOME;
+delete process.env.TYPESAFE_API_KEY; // no live Jev calls; the tests below set it themselves
 
 const { openDb, newId, now } = await import("../src/db.ts");
 const { triageIntake, triageHold, resolveIntakeTriageForDecision, extractTriage, isTriageSource } = await import(
@@ -226,6 +227,115 @@ test("a triage card survives every auto-answer sweep", async () => {
   expect(ok.status).toBe(200);
   expect(openCards(db, id)).toHaveLength(0);
   expect(isReviewed(db, id)).toBe(true);
+});
+
+// --- TypeSafe (Jev) pre-judgment -------------------------------------------
+// A typed judgment runs in front of the sonnet call. Shadow only records it;
+// enforce may answer 'mechanical' on its own, but never 'decision_required'.
+
+// A stub judge: fixed probabilities, records that it was called.
+const judgeStub = (p_mechanical: number, category = "feature", category_confidence = 0.8, calls: number[] = []) =>
+  async () => {
+    calls.push(1);
+    return {
+      model: "jev-test",
+      ms: 12,
+      usage: { input_tokens: 1, output_tokens: 1 },
+      answers: {
+        bucket: {
+          type: "choice" as const,
+          choice: p_mechanical >= 0.5 ? "mechanical" : "decision_required",
+          probabilities: { mechanical: p_mechanical, decision_required: 1 - p_mechanical },
+          confidence: 0.9,
+        },
+        category: {
+          type: "choice" as const,
+          choice: category,
+          probabilities: { [category]: category_confidence },
+          confidence: category_confidence,
+        },
+      },
+    };
+  };
+
+const withKey = (mode: "shadow" | "enforce") => {
+  process.env.TYPESAFE_API_KEY = "test-key";
+  return setup({ intake_triage: true, typesafe: { mode } });
+};
+
+test("shadow: the judgment is recorded and the sonnet classifier still runs", async () => {
+  const { db, id, task } = withKey("shadow");
+  const seen: string[] = [];
+  const v = await triageIntake(db, task, {
+    exec: stub(AMBIGUOUS, seen),
+    judge: judgeStub(0.98, "bug", 0.95),
+  });
+  expect(v?.bucket).toBe("decision_required"); // unchanged by the judgment
+  expect(seen.length).toBe(1);
+  const ts = events(db, id, "intake_triage")[0].payload.typesafe;
+  expect(ts).toEqual({
+    bucket: "mechanical",
+    p_mechanical: 0.98,
+    category: "bug",
+    category_confidence: 0.95,
+    model: "jev-test",
+    ms: 12,
+  });
+});
+
+test("enforce: a confident p(mechanical) skips the sonnet call entirely", async () => {
+  const { db, id, task } = withKey("enforce");
+  const seen: string[] = [];
+  const v = await triageIntake(db, task, { exec: stub(AMBIGUOUS, seen), judge: judgeStub(0.95) });
+  expect(v?.bucket).toBe("mechanical");
+  expect(seen.length).toBe(0);
+  expect(v?.reasoning).toBe("typesafe p(mechanical)=0.95 category=feature");
+  expect(isReviewed(db, id)).toBe(true);
+  expect(openCards(db, id).length).toBe(0);
+  expect(events(db, id, "intake_triage")[0].payload.typesafe.p_mechanical).toBe(0.95);
+});
+
+test("enforce: an unconfident judgment still pays for the sonnet call", async () => {
+  const { db, id, task } = withKey("enforce");
+  const seen: string[] = [];
+  const v = await triageIntake(db, task, { exec: stub(AMBIGUOUS, seen), judge: judgeStub(0.5) });
+  expect(v?.bucket).toBe("decision_required"); // only sonnet can raise a card
+  expect(seen.length).toBe(1);
+  expect(events(db, id, "intake_triage")[0].payload.typesafe.p_mechanical).toBe(0.5);
+});
+
+test("enforce: confident noise skips the sonnet call too", async () => {
+  const { db, id, task } = withKey("enforce");
+  const seen: string[] = [];
+  const v = await triageIntake(db, task, { exec: stub(AMBIGUOUS, seen), judge: judgeStub(0.2, "noise", 0.95) });
+  expect(v?.bucket).toBe("mechanical");
+  expect(seen.length).toBe(0);
+  expect(v?.reasoning).toBe("typesafe category=noise confidence=0.95");
+  expect(isReviewed(db, id)).toBe(true);
+});
+
+test("enforce: a null judgment falls through to the sonnet call", async () => {
+  const { db, id, task } = withKey("enforce");
+  const seen: string[] = [];
+  const v = await triageIntake(db, task, { exec: stub(AMBIGUOUS, seen), judge: async () => null });
+  expect(v?.bucket).toBe("decision_required");
+  expect(seen.length).toBe(1);
+  expect(events(db, id, "intake_triage")[0].payload.typesafe).toBeUndefined();
+});
+
+test("off: without the API key no project config can turn Jev on", async () => {
+  delete process.env.TYPESAFE_API_KEY;
+  const { db, id, task } = setup({ intake_triage: true, typesafe: { mode: "enforce" } });
+  const seen: string[] = [];
+  const calls: number[] = [];
+  const v = await triageIntake(db, task, {
+    exec: stub({ bucket: "mechanical", reasoning: "one clear reading" }, seen),
+    judge: judgeStub(0.99, "chore", 0.99, calls),
+  });
+  expect(v?.bucket).toBe("mechanical");
+  expect(seen.length).toBe(1); // sonnet ran as before
+  expect(calls.length).toBe(0); // and Jev was never asked
+  expect(events(db, id, "intake_triage")[0].payload.typesafe).toBeUndefined();
 });
 
 // The standing-CI ruling fires inside createDecision, before any later gate can

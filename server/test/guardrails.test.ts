@@ -849,6 +849,70 @@ test("a zero-risk explainer verdict flips the recommended option away from Deny;
   expect(recommended(optionsOf(realRisk.json.decision_id))).toBe("deny");
 });
 
+// Jev in front of haiku: a confident typed verdict settles the card without a
+// haiku call; an unsure one, or shadow mode, hands off to haiku and only notes
+// what Jev said.
+test("explainer: Jev decides at the gate in enforce mode, otherwise haiku decides with Jev noted", async () => {
+  const { explainCommandDecision } = await import("../src/explain.ts");
+  const optionsOf = (did: string) => JSON.parse((db.query("SELECT options FROM decisions WHERE id = ?").get(did) as any).options);
+  const recommended = (opts: any[]) => opts.find((o) => o.recommended)?.key;
+  const row = (did: string) => db.query("SELECT context, explainer_verdict FROM decisions WHERE id = ?").get(did) as any;
+  const card = async (target: string) =>
+    (await post(`/api/tasks/${id}/guarded-action`, {
+      action: "command.dangerous.sql-update-without-where",
+      target,
+      detail: "command approval (dangerous): SQL UPDATE without WHERE",
+      summary: "look at the update site",
+    })).json.decision_id;
+  const jev = (choice: string, confidence: number, read_only: number) => async () => ({
+    model: "jev-test",
+    answers: {
+      verdict: { type: "choice" as const, choice, probabilities: { [choice]: confidence }, confidence },
+      read_only: { type: "noul" as const, noul: read_only },
+    },
+    usage: { input_tokens: 1, output_tokens: 0 },
+    ms: 7,
+  });
+  let haikuCalls = 0;
+  const haiku = async () => {
+    haikuCalls++;
+    return { code: 0, stdout: JSON.stringify({ result: "VERDICT: real-risk\n- haiku says it writes" }), stderr: "" };
+  };
+  const id = await newTask("jev explainer");
+  const enforce = { TYPESAFE_API_KEY: "k", HIVE_TYPESAFE_MODE: "enforce" } as NodeJS.ProcessEnv;
+  const shadow = { TYPESAFE_API_KEY: "k" } as NodeJS.ProcessEnv;
+
+  // confident zero-risk: decided by Jev, haiku never runs, approve recommended
+  const a = await card("grep -rn UPDATE server/src");
+  await explainCommandDecision(db, a, "grep -rn UPDATE server/src", { exec: haiku, judge: jev("zero_risk", 0.95, 0.97), env: enforce });
+  expect(haikuCalls).toBe(0);
+  expect(row(a).explainer_verdict).toBe("zero-risk");
+  expect(row(a).context).toContain("Jev zero-risk");
+  expect(recommended(optionsOf(a))).toBe("approve");
+
+  // choice says zero-risk but read-only probability is under the gate: haiku decides
+  const b = await card("hive emit checkpoint");
+  await explainCommandDecision(db, b, "hive emit checkpoint", { exec: haiku, judge: jev("zero_risk", 0.95, 0.21), env: enforce });
+  expect(haikuCalls).toBe(1);
+  expect(row(b).explainer_verdict).toBe("real-risk");
+  expect(row(b).context).toContain("haiku says it writes");
+  expect(row(b).context).toContain("not decisive");
+
+  // shadow mode: Jev is confident but only annotates; haiku's verdict stands
+  const c = await card("grep -rn UPDATE cli");
+  await explainCommandDecision(db, c, "grep -rn UPDATE cli", { exec: haiku, judge: jev("zero_risk", 0.95, 0.97), env: shadow });
+  expect(haikuCalls).toBe(2);
+  expect(row(c).explainer_verdict).toBe("real-risk");
+  expect(row(c).context).toContain("Jev zero-risk");
+  expect(recommended(optionsOf(c))).toBe("deny");
+
+  // no key: no Jev call at all, plain haiku path
+  const d = await card("grep -rn UPDATE web/src");
+  await explainCommandDecision(db, d, "grep -rn UPDATE web/src", { exec: haiku, judge: async () => { throw new Error("must not be called"); }, env: {} });
+  expect(haikuCalls).toBe(3);
+  expect(row(d).context).not.toContain("Jev");
+});
+
 // ---- pane view --------------------------------------------------------------------
 
 test("GET /pane returns the agent's pane text with ANSI stripped; 404 when agentless", async () => {

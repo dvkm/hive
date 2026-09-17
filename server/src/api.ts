@@ -121,6 +121,8 @@ import { checkUsageGuardrails, resolveUsageCapForDecision, taskSpend } from "./c
 import { startRace, raceView, pickWinner, resolveRaceForDecision } from "./race.ts";
 import { resolveScopeDriftForDecision } from "./drift.ts";
 import { evaluateAutoApprove, evaluateAutopilotApprove, riskLevel, NO_AUTO_ANSWER_REASON } from "./autoapprove.ts";
+import { classifyCardText } from "./policy.ts";
+import { typesafeSettings, typesafeStatus, saveTypesafeSettings, probeTypesafe } from "./typesafe.ts";
 import { decisionAnswerTokenOk, vapidPublicKey, saveSubscription, removeSubscription, type PushSub } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
 import { confirmedRisks, unfinishedRiskCheck, cautionCleared, latestAutoReviewVerdict, reviewPipelineSettled, livePrHead } from "./reviewer.ts";
@@ -575,6 +577,14 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 
       // ---- braindump intake ----
       if (pathname === "/api/intake" && method === "POST") return intake(db, await req.json(), deps);
+
+      // ---- TypeSafe (Jev) key and mode, editable from the Settings page ----
+      if (pathname === "/api/settings/typesafe" && method === "GET") return json(typesafeStatus(db));
+      if (pathname === "/api/settings/typesafe" && method === "POST") {
+        saveTypesafeSettings(db, (await req.json()) as { api_key?: unknown; mode?: unknown });
+        return json(typesafeStatus(db));
+      }
+      if (pathname === "/api/settings/typesafe/test" && method === "POST") return json(await probeTypesafe());
 
       // ---- director chat (persistent supervisor session over hive) ----
       if (pathname === "/api/chat/supervisor" && method === "GET")
@@ -4568,9 +4578,11 @@ export async function spawnAgent(
       model: modelForTask(config, task.kind),
       agentMcp: config?.agent_mcp === "inherit" ? "inherit" : "none",
       agentArgv: agentArgvFor(config, task.kind, brief),
-      // Per-project driver switch (phase 1: claude over stream-json, no pane).
-      // config.agent_argv overrides are pane-only and are ignored on the protocol driver.
-      driver: agent === "claude" && config.agent_driver === "protocol" ? "protocol" : "pane",
+      // Per-project driver switch: no pane, the agent's own JSON stream instead.
+      // Claude takes config.agent_argv overrides on the pane path only; codex's
+      // protocol runtime uses the same argv, with `exec --json` spliced in.
+      agent,
+      driver: config.agent_driver === "protocol" ? "protocol" : "pane",
       // Seed the worktree BEFORE the agent starts: agent hook wiring
       // (structural Stop/SubagentStop/PostToolUse reporting), then the
       // per-project spawn hook (config.setup_argv, e.g. wt.sh up {worktree}) so
@@ -9007,7 +9019,7 @@ export function apiAnswerDecision(db: DB, herdr: Herdr, id: string, body: any, s
 // If it doesn't clear, answers NOTHING, leaves the card open for the director,
 // logs `auto_approve_declined`, and returns 403 so the supervisor knows to
 // escalate. The verdict — not the caller's identity — is the gate.
-export function apiAutoAnswerDecision(db: DB, herdr: Herdr, id: string, body: any): Response {
+export async function apiAutoAnswerDecision(db: DB, herdr: Herdr, id: string, body: any): Promise<Response> {
   const r: any = db.query("SELECT * FROM decisions WHERE id = ?").get(id);
   if (!r) return err("decision not found. List the open ones: curl -s \"$HIVE_URL/api/decisions?status=open\"", 404);
   const closed = closedDecisionResponse(db, r);
@@ -9029,13 +9041,19 @@ export function apiAutoAnswerDecision(db: DB, herdr: Herdr, id: string, body: an
     return json({ effect: "escalate", category: "autonomy", reason: "project autonomy is conservative; decision requires the director" }, 403);
   }
 
-  const verdict = evaluateAutoApprove(db, r, answerKey);
+  const typesafeCfg = typesafeSettings(
+    JSON.parse(
+      ((db.query("SELECT config FROM projects WHERE id = ?").get(task?.project_id ?? "") as { config: string | null } | undefined)?.config) ?? "{}"
+    )
+  );
+  const verdict = evaluateAutoApprove(db, r, answerKey, await classifyCardText(r), { riskMax: typesafeCfg.thresholds.risk_max });
+  const typesafe = verdict.typesafe_shadow ?? null;
   if (!verdict.allow) {
     writeEvent(db, {
       task_id: r.task_id,
       source: "chat_supervisor",
       type: "auto_approve_declined",
-      payload: { decision_id: id, answer_key: answerKey, category: verdict.category, reason: verdict.reason, actor },
+      payload: { decision_id: id, answer_key: answerKey, category: verdict.category, reason: verdict.reason, actor, typesafe },
     });
     return json({ effect: "escalate", category: verdict.category, reason: verdict.reason }, 403);
   }
@@ -9046,7 +9064,7 @@ export function apiAutoAnswerDecision(db: DB, herdr: Herdr, id: string, body: an
     task_id: r.task_id,
     source: "chat_supervisor",
     type: "auto_approved",
-    payload: { decision_id: id, answer_key: answerKey, category: verdict.category, reason: verdict.reason, note: body?.answer_note ?? null, actor },
+    payload: { decision_id: id, answer_key: answerKey, category: verdict.category, reason: verdict.reason, note: body?.answer_note ?? null, actor, typesafe },
   });
   return apiAnswerDecision(db, herdr, id, { ...body, source: "chat_supervisor" }, true);
 }

@@ -20,6 +20,7 @@ import { startGchatPoll } from "./intake/gchat.ts";
 import { startJiraSync } from "./intake/jira.ts";
 import { startWatchers } from "./watch.ts";
 import { startAutoReviewer } from "./reviewer.ts";
+import { applyTypesafeSettings } from "./typesafe.ts";
 import { startDriftWatch } from "./drift.ts";
 import { startPromoter } from "./promoter.ts";
 import { selfAuditOnce, startSelfAudit } from "./selfAudit.ts";
@@ -33,10 +34,12 @@ import { defaultExec } from "./exec.ts";
 import { claimLease, startLease, holdsLease, interloperReason, interloperAdvice, registerInstance, unregisterInstance, evictContenders, LEASE_MS } from "./lease.ts";
 import { enqueue } from "./notifications.ts";
 import { setSetting, now } from "./db.ts";
+import { setUsageSink, insertOneshotUsage } from "./planner.ts";
 
 const port = Number(process.env.HIVE_PORT || 4700);
 const dbPath = defaultDbPath();
 const db = openDb(dbPath);
+applyTypesafeSettings(db);
 
 // Refuse to be the second server on the live fleet database. A custom port with
 // the default DB is the signature of a throwaway/test server that forgot
@@ -156,6 +159,11 @@ const { instance, displaced } = claimLease(db);
       });
     }
   }, LEASE_MS);
+
+// Every server-side one-shot `claude -p` reports its tokens and cost through
+// this sink. Rows that carry a task id land in `usage` (source
+// 'server_oneshot'); the rest are logged and kept in planner.ts's ring buffer.
+setUsageSink((row) => insertOneshotUsage(db, row));
 
 // Boot stamp: the teardown guard reads it so nothing is failed, requeued or
 // reaped in the first minutes after a restart/self-deploy, when herdr's agent

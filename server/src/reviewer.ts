@@ -24,6 +24,7 @@ import { supervisedSql } from "./supervision.ts";
 import { PLAIN_ENGLISH } from "./plainEnglish.ts";
 import { parseUnifiedDiff } from "./diff.ts";
 import { startLoop } from "./loop.ts";
+import { judge, noul, typesafeSettings, type Question } from "./typesafe.ts";
 
 const TIMEOUT_MS = Number(process.env.HIVE_REVIEWER_TIMEOUT_MS || 180_000);
 // How many tasks one pass reviews at the same time. One-at-a-time made the
@@ -49,6 +50,7 @@ const RETRY_DIFF_LIMIT = 15_000;
 export interface ReviewerDeps {
   exec?: PlannerExec; // the claude -p runner (injectable in tests)
   shellExec?: Exec; // gh/git for the diff
+  judge?: typeof judge; // the TypeSafe pre-judgment (injectable in tests)
 }
 
 export interface AutoReview {
@@ -329,6 +331,8 @@ async function reviewOne(db: DB, t: any, deps: ReviewerDeps): Promise<void> {
       timeoutMs: TIMEOUT_MS,
       ...(project?.repo_path ? { cwd: project.repo_path } : {}),
       env: claudeProfileEnvForProject(db, t.project_id),
+      taskId: t.id,
+      site: "review",
     });
   } catch (e: any) {
     if (!stillCurrent() || (t.pr_url && (await livePrHead(shell, t.pr_url)) !== reviewedHead)) return;
@@ -557,11 +561,21 @@ const MAX_VERIFY_ATTEMPTS = 3;
 // last with an emptier result (observed on corebeat ed28a0ca27c6).
 const verifyInFlight = new Set<string>();
 
+// What the TypeSafe (Jev) pre-judgment said about this finding, recorded on the
+// verdict in every mode so shadow runs can be scored against opus from the
+// stored events. `p` is the noul probability, null when the answer was not one.
+export interface TypesafeNote {
+  p: number | null;
+  model: string;
+  ms: number;
+}
+
 export interface RiskVerdict {
   risk: string;
   verdict: "confirmed" | "refuted";
   why: string;
   evidence_path?: string;
+  typesafe?: TypesafeNote;
 }
 
 // A question is only cleared when the code itself answers it. "Did you check
@@ -570,7 +584,45 @@ export interface QuestionVerdict {
   question: string;
   answerable: "machine" | "human";
   answer: string;
+  typesafe?: TypesafeNote;
 }
+
+// A typed pre-judgment in front of the per-finding opus run: one cheap Jev call
+// decides the easy findings, opus keeps the middle. Shadow mode (the default)
+// only records it beside the opus verdict; enforce mode acts on it.
+//
+// Asymmetric on purpose. A risk goes either way, because both a confirmed and a
+// refuted risk are re-checked by a human reading the card. A question does not:
+// "machine" CLEARS a merge veto, and the opus prompt's own rule is "if you are
+// unsure, say human" — so Jev may only push a question TOWARDS the human.
+//
+// Both cut-offs come from the project's `config.typesafe` (refute_at /
+// confirm_at), resolved once per verification run.
+
+const RISK_JEV: Record<string, Question> = {
+  risk_real: {
+    type: "noul",
+    instructions:
+      "Is this flagged risk a real defect present in the diff, given the commits that landed after the review and the director's settled decisions?",
+    criteria: {
+      true: "You can point at code in the diff or the checkout that makes the risk true, or at behaviour introduced by a commit made after the director's ruling.",
+      false:
+        "It is refuted: it rests only on a state this work itself produced, it only re-asks a question the director already settled, or the attached evidence already reports that check on the commit under review.",
+    },
+  },
+};
+
+const QUESTION_JEV: Record<string, Question> = {
+  answerable_by_code: {
+    type: "noul",
+    instructions: "Can this question be settled by reading the repository, without asking the director?",
+    criteria: {
+      true: "Reading this repository settles it, or an attached caption already answers it for the commit under review.",
+      false:
+        "It needs something outside the code: a manual check on a running or installed app, product intent, a business decision, credentials, or anything only the director knows. If you are unsure, false.",
+    },
+  },
+};
 
 export function extractVerdict(raw: string): { verdict: "confirmed" | "refuted"; why: string; evidence_path?: string } | null {
   return parseModelJson(raw, (o: any) => {
@@ -954,6 +1006,8 @@ async function runVerification(
         timeoutMs: TIMEOUT_MS,
         cwd: task.worktree_path ?? undefined,
         env: claudeProfileEnvForProject(db, task.project_id),
+        taskId: task.id,
+        site: "review_verify",
       });
     } catch {
       return null;
@@ -969,17 +1023,42 @@ async function runVerification(
     ...todoRisks.map((risk) => ({ kind: "risk" as const, text: risk, prompt: verifyPrompt(task, risk, input.diff, settled) })),
     ...todoQuestions.map((q) => ({ kind: "question" as const, text: q, prompt: answerPrompt(task, q, input.diff, evidenceBlock(evidence, QUESTION_USE_EVIDENCE)) })),
   ];
+  const projectConfig = JSON.parse(
+    ((db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id) as { config: string | null } | undefined)?.config) ?? "{}"
+  );
+  const { mode, thresholds } = typesafeSettings(projectConfig);
+  const judgeFn = deps.judge ?? judge;
+  const jevState = (job: { kind: "risk" | "question"; text: string }) => ({
+    task: { number: task.number, title: task.title },
+    [job.kind]: job.text,
+    branch_commits: repairBlock(commits),
+    settled_decisions: decisions.length ? settledBlock(decisions) : "",
+    evidence_captions: evidenceBlock(evidence, job.kind === "risk" ? RISK_USE_EVIDENCE : QUESTION_USE_EVIDENCE),
+    diff: input.diff.slice(0, DIFF_LIMIT),
+  });
   const results = await mapLimit(jobs, RISK_CONCURRENCY, async (job) => {
     if (aborted) return null;
     if (!(await current())) {
       aborted = true;
       return null;
     }
+    // Fail-open by construction: judge() returns null on no key, timeout, or
+    // junk, and a null pre-judgment is exactly the old behaviour.
+    const pre = mode === "off" ? null : await judgeFn(jevState(job), job.kind === "risk" ? RISK_JEV : QUESTION_JEV);
+    const p = pre ? noul(pre.answers[job.kind === "risk" ? "risk_real" : "answerable_by_code"]) : null;
+    const typesafe: TypesafeNote | undefined = pre ? { p, model: pre.model, ms: pre.ms } : undefined;
+    if (mode === "enforce" && p !== null) {
+      if (job.kind === "risk" && (p <= thresholds.refute_at || p >= thresholds.confirm_at))
+        return { job, value: { verdict: p <= thresholds.refute_at ? "refuted" : "confirmed", why: `typesafe p=${p}`, typesafe } as any };
+      if (job.kind === "question" && p <= thresholds.refute_at)
+        return { job, value: { answerable: "human", answer: `typesafe p=${p}`, typesafe } as any };
+    }
     const res = await run(job.prompt);
     const failed = !res || noteModelCall(db, res.code === 0 && !res.timedOut ? null : modelErrorText(res, { timeoutMs: TIMEOUT_MS }));
     if (typeof failed === "string") unverified_reason = failed;
     if (failed) return { job, value: null };
-    return { job, value: job.kind === "risk" ? extractVerdict(res!.stdout) : extractAnswer(res!.stdout) };
+    const value: any = job.kind === "risk" ? extractVerdict(res!.stdout) : extractAnswer(res!.stdout);
+    return { job, value: value && typesafe ? { ...value, typesafe } : value };
   });
   if (aborted) return;
   const freshRisk = new Map<string, any>();

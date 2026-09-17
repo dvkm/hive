@@ -144,6 +144,107 @@ async function buildInvestigatePromptOf(intent: any): Promise<string> {
   return buildInvestigatePrompt(intent, null, true);
 }
 
+// ------------------------------------------------- the typed second opinion
+// A draft the investigator emptied of questions is emptied by the same model
+// that rewrote it; TypeSafe answers "does a person still have to decide?"
+// beside that outcome, and in enforce mode holds the draft when it says yes.
+const { DEFAULT_OPEN_QUESTION } = await import("../src/intentDraft.ts");
+
+const judgeStub = (p: number | null) => async () =>
+  p === null ? null : { model: "jev-1", answers: { needs_person: { type: "noul" as const, noul: p } }, usage: { input_tokens: 0, output_tokens: 0 }, ms: 7 };
+
+function withMode<T>(mode: string, fn: () => Promise<T>): Promise<T> {
+  const key = process.env.TYPESAFE_API_KEY, m = process.env.HIVE_TYPESAFE_MODE;
+  process.env.TYPESAFE_API_KEY = "k";
+  process.env.HIVE_TYPESAFE_MODE = mode;
+  return fn().finally(() => {
+    if (key === undefined) delete process.env.TYPESAFE_API_KEY; else process.env.TYPESAFE_API_KEY = key;
+    if (m === undefined) delete process.env.HIVE_TYPESAFE_MODE; else process.env.HIVE_TYPESAFE_MODE = m;
+  });
+}
+
+test("shadow mode records the typed judgment beside the outcome and still accepts", async () => {
+  const f = fixture();
+  await withMode("shadow", () =>
+    investigateOnce(f.db, { exec: f.stub(() => ({ code: 0, stdout: answered })), accept: f.accept, judge: judgeStub(0.9) as any })
+  );
+  expect(getIntent(f.db, f.intent.id)!.status).toBe("accepted");
+  expect(f.events()[0]).toMatchObject({ questions_after: 0, typesafe: { needs_person: 0.9, model: "jev-1", ms: 7 } });
+});
+
+test("enforce mode holds a draft TypeSafe says still needs a person", async () => {
+  const f = fixture();
+  await withMode("enforce", () =>
+    investigateOnce(f.db, { exec: f.stub(() => ({ code: 0, stdout: answered })), accept: f.accept, judge: judgeStub(0.9) as any })
+  );
+  const after = getIntent(f.db, f.intent.id)!;
+  expect(after.status).toBe("draft");
+  expect(openQuestions(after.body_md)).toEqual([DEFAULT_OPEN_QUESTION]);
+  // The investigation's findings are still recorded on the held draft.
+  expect(intentSection(after.body_md, "Affected users and systems")).toContain("What hive found in the code:");
+  expect(f.events()[0]).toMatchObject({ questions_after: 1, typesafe: { needs_person: 0.9 } });
+});
+
+test("enforce mode accepts when TypeSafe agrees nothing is left to decide", async () => {
+  const f = fixture();
+  await withMode("enforce", () =>
+    investigateOnce(f.db, { exec: f.stub(() => ({ code: 0, stdout: answered })), accept: f.accept, judge: judgeStub(0.1) as any })
+  );
+  expect(getIntent(f.db, f.intent.id)!.status).toBe("accepted");
+  expect(f.events()[0]).toMatchObject({ questions_after: 0, typesafe: { needs_person: 0.1 } });
+});
+
+test("a null judgment fails open: enforce accepts exactly as today", async () => {
+  const f = fixture();
+  await withMode("enforce", () =>
+    investigateOnce(f.db, { exec: f.stub(() => ({ code: 0, stdout: answered })), accept: f.accept, judge: judgeStub(null) as any })
+  );
+  expect(getIntent(f.db, f.intent.id)!.status).toBe("accepted");
+  expect(f.events()[0].typesafe).toBeUndefined();
+});
+
+const setConfig = (f: ReturnType<typeof fixture>, config: Record<string, unknown>) =>
+  f.db.query("UPDATE projects SET config = ? WHERE id = 'proj'").run(JSON.stringify(config));
+
+// Nothing a project writes into config.typesafe reaches Jev without a key in
+// the server env: both runs produce the same outcome and the judge never runs.
+test("without TYPESAFE_API_KEY a project config.typesafe=enforce changes nothing", async () => {
+  let judged = 0;
+  const spy = (async () => {
+    judged++;
+    return judgeStub(0.9)();
+  }) as any;
+  const run = async (config: Record<string, unknown>) => {
+    const f = fixture();
+    setConfig(f, config);
+    await investigateOnce(f.db, { exec: f.stub(() => ({ code: 0, stdout: answered })), accept: f.accept, judge: spy });
+    const after = getIntent(f.db, f.intent.id)!;
+    return { status: after.status, questions: openQuestions(after.body_md), event: f.events()[0] };
+  };
+  const off = await run({});
+  const enforce = await run({ typesafe: { mode: "enforce", needs_person_at: 0.1 } });
+  expect(judged).toBe(0);
+  expect(enforce.status).toBe(off.status);
+  expect(enforce.questions).toEqual(off.questions);
+  expect(enforce.event.typesafe).toBeUndefined();
+  expect(off.event.typesafe).toBeUndefined();
+});
+
+test("a project needs_person_at holds a draft the default threshold would accept", async () => {
+  const held = fixture();
+  setConfig(held, { typesafe: { needs_person_at: 0.3 } });
+  await withMode("enforce", () =>
+    investigateOnce(held.db, { exec: held.stub(() => ({ code: 0, stdout: answered })), accept: held.accept, judge: judgeStub(0.35) as any })
+  );
+  expect(getIntent(held.db, held.intent.id)!.status).toBe("draft");
+
+  const dflt = fixture();
+  await withMode("enforce", () =>
+    investigateOnce(dflt.db, { exec: dflt.stub(() => ({ code: 0, stdout: answered })), accept: dflt.accept, judge: judgeStub(0.35) as any })
+  );
+  expect(getIntent(dflt.db, dflt.intent.id)!.status).toBe("accepted");
+});
+
 test("argv pins the read-only tool list and the JSON envelope", () => {
   const argv = investigateArgv("look", "sonnet");
   expect(argv.slice(1, 6)).toEqual(["-p", "--model", "sonnet", "look", "--output-format"]);

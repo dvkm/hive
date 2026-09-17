@@ -155,6 +155,8 @@ export async function critiquePlan(
         timeoutMs: TIMEOUT_MS,
         ...(task.worktree_path ? { cwd: task.worktree_path } : {}),
         env: claudeProfileEnvForProject(db, task.project_id),
+        taskId: task.id,
+        site: "plan_critic",
       }
     );
   } catch (e: any) {
