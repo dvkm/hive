@@ -13,6 +13,7 @@ import { getTask, writeEvent, transition, startRecoveryEpoch, recoveryAttemptId,
 import { Herdr, herdr as defaultHerdr } from "./runtime/herdr.ts";
 import { isTrackingOnlyTask } from "./supervision.ts";
 import { queuedSteers, queueSteerEvent } from "./steer.ts";
+import { previewState, stopPreview } from "./preview.ts";
 import { broadcastTask } from "./health.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec, projectBaseBranch } from "./exec.ts";
@@ -301,7 +302,7 @@ export const PROGRESS_MIN_GAP_MS = 10 * 60_000;
 // The current deferral run's anchor: the newest cleanup_deferred event, but only
 // if nothing terminal-ish has happened since. A task that gets cleaned, reopened
 // and re-deferred therefore starts a fresh clock instead of inheriting a stale one.
-function lastDeferral(db: DB, taskId: string): { ts: string; fingerprint: string | null } | null {
+function lastDeferral(db: DB, taskId: string): { ts: string; fingerprint: string | null; preview_status: string | null } | null {
   const r = db
     .query(
       "SELECT type, ts, payload FROM events WHERE task_id = ? AND type IN ('cleanup_deferred','cleaned_up','cleanup_skipped') ORDER BY ts DESC, rowid DESC LIMIT 1"
@@ -309,12 +310,15 @@ function lastDeferral(db: DB, taskId: string): { ts: string; fingerprint: string
     .get(taskId) as { type: string; ts: string; payload: string } | undefined;
   if (!r || r.type !== "cleanup_deferred") return null;
   let fingerprint: string | null = null;
+  let preview_status: string | null = null;
   try {
-    fingerprint = JSON.parse(r.payload)?.fingerprint ?? null;
+    const payload = JSON.parse(r.payload);
+    fingerprint = payload?.fingerprint ?? null;
+    preview_status = payload?.preview_status ?? null;
   } catch {
     /* legacy/unparseable payload — treated as "no fingerprint recorded" */
   }
-  return { ts: r.ts, fingerprint };
+  return { ts: r.ts, fingerprint, preview_status };
 }
 
 // A cheap digest of the agent's pane tail. Any change at all counts as progress;
@@ -437,6 +441,42 @@ export async function cleanupTask(
         )} minutes, so cleanup treated it as wedged and removed the worktree. Uncommitted work was rescued to a ghost branch. If the agent was in fact alive, this is the HIVE-213 failure mode recurring.`,
       });
     }
+  }
+
+  // The same gap, one step over: a preview stack builds INSIDE the task's own
+  // worktree, with cwd = that directory. An auto-merge can take a task to done
+  // while `up` is still running (docker bring-up is minutes), and removing the
+  // checkout under it is why CORE-1526's preview build failed. A `queued`
+  // preview has the same problem from the other side: the sweeper starts it
+  // later, in a directory that is already gone. So defer while the stack still
+  // needs the checkout, exactly as a live agent does.
+  //
+  // This normally costs one sweep, not a pin: previewOnStateChange tears the
+  // stack down on the way to done, which moves the status off building/queued.
+  // The DEFER_CAP_MS backstop covers the case it can't — an `up` that never
+  // returns, so the status never moves on its own.
+  const preview = previewState(db, task, config);
+  if (preview && (preview.status === "building" || preview.status === "queued")) {
+    const last = lastDeferral(db, taskId);
+    const anchor = last?.preview_status ? last : null;
+    const sinceMs = anchor ? Date.now() - Date.parse(anchor.ts) : 0;
+    if (!anchor) {
+      writeEvent(db, {
+        task_id: taskId,
+        source: "cleanup",
+        type: "cleanup_deferred",
+        payload: {
+          reason: "preview stack still needs the worktree",
+          preview_status: preview.status,
+        },
+      });
+      return noop;
+    }
+    if (Number.isFinite(sinceMs) && sinceMs < DEFER_CAP_MS) return noop;
+    // Past the cap. Take the stack down while its `down` command can still run
+    // in the worktree, or the containers outlive every handle onto them.
+    await stopPreview(db, taskId, "cleanup", { exec: opts.exec });
+    if (!ownsCleanupGeneration()) return noop;
   }
 
   // 0) per-project stack teardown (docker etc.) — BEFORE the worktree goes
