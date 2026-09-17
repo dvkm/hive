@@ -30,7 +30,8 @@ export function typesafeMode(env: NodeJS.ProcessEnv = process.env): TypesafeMode
 
 // Per-project tuning under `config.typesafe`, e.g.
 //   { "mode": "enforce", "refute_at": 0.05, "confirm_at": 0.95,
-//     "needs_person_at": 0.5, "risk_max": 1.5, "triage_mechanical_at": 0.9 }
+//     "needs_person_at": 0.5, "risk_max": 1.5, "triage_mechanical_at": 0.9,
+//     "explain_decide_at": 0.9 }
 // Every field is optional; a project without the block gets the defaults, and
 // no project can turn Jev on without TYPESAFE_API_KEY in the server env.
 export interface TypesafeThresholds {
@@ -39,6 +40,7 @@ export interface TypesafeThresholds {
   needs_person_at: number; // intent: needs_person at or above this holds the draft
   risk_max: number | null; // inbox: Jev risk score (0 low … 3 high) a card may carry and still auto-approve; null keeps the explicit low/normal text bar
   triage_mechanical_at: number; // intake: P(mechanical) at or above this skips the sonnet triage
+  explain_decide_at: number; // command cards: Jev's verdict stands without haiku when its choice confidence and read-only probability both clear this
 }
 export const DEFAULT_THRESHOLDS: TypesafeThresholds = {
   refute_at: 0.05,
@@ -46,6 +48,7 @@ export const DEFAULT_THRESHOLDS: TypesafeThresholds = {
   needs_person_at: 0.5,
   risk_max: null,
   triage_mechanical_at: 0.9,
+  explain_decide_at: 0.9,
 };
 
 export function typesafeSettings(
@@ -66,6 +69,7 @@ export function typesafeSettings(
       needs_person_at: num(raw?.needs_person_at, 1) ?? DEFAULT_THRESHOLDS.needs_person_at,
       risk_max: raw?.risk_max === null ? null : num(raw?.risk_max, 3) ?? DEFAULT_THRESHOLDS.risk_max,
       triage_mechanical_at: num(raw?.triage_mechanical_at, 1) ?? DEFAULT_THRESHOLDS.triage_mechanical_at,
+      explain_decide_at: num(raw?.explain_decide_at, 1) ?? DEFAULT_THRESHOLDS.explain_decide_at,
     },
   };
 }
