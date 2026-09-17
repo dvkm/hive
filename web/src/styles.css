@@ -18,6 +18,9 @@
   --accent: #d7b56d;
   --accent-bright: #efd69c;
   --accent-dim: #3d3420;
+  /* Accent as TEXT on the page ground: the honey fill is fine on dark chrome
+     but reads at 2:1 on the light one, so text gets its own shade. */
+  --accent-text: #d7b56d;
   --green: #78b98a;
   --amber: #d5a754;
   --yellow: var(--amber);
@@ -82,6 +85,7 @@
   --accent: #e9a23b;
   --accent-bright: #9a6410;
   --accent-dim: #f3e0bd;
+  --accent-text: #9a6410;
   --green: #20733c;
   --amber: #8a5a0c;
   --orange: #b4581a;
@@ -249,7 +253,7 @@ textarea { font-family: inherit; }
   display: inline-flex;
   width: 18px;
   height: 18px;
-  color: var(--accent);
+  color: var(--accent-text);
   transition: color 240ms ease;
 }
 .brand-mark svg {
@@ -689,7 +693,7 @@ textarea { font-family: inherit; }
 .feed-num {
   font-family: var(--mono);
   font-weight: 600;
-  color: var(--accent);
+  color: var(--accent-text);
   white-space: nowrap;
 }
 .card-num {
@@ -803,7 +807,7 @@ textarea { font-family: inherit; }
   font-size: 11px;
 }
 .card-subtask-id {
-  color: var(--accent);
+  color: var(--accent-text);
   font-family: var(--mono);
   font-weight: 600;
 }
@@ -1049,7 +1053,7 @@ textarea { font-family: inherit; }
   text-transform: capitalize;
 }
 .chip-ship {
-  color: var(--accent);
+  color: var(--accent-text);
   border-color: var(--accent-dim);
 }
 .chip-scout {
@@ -1349,7 +1353,7 @@ textarea { font-family: inherit; }
   text-align: center;
 }
 .src-agent {
-  color: var(--accent);
+  color: var(--accent-text);
 }
 .src-director {
   color: var(--green);
@@ -2561,7 +2565,7 @@ a.dbundle-fact:hover {
   min-width: 20px;
 }
 .pol-switch.on .pol-switch-label {
-  color: var(--accent);
+  color: var(--accent-text);
 }
 .pol-switch input:focus-visible + .pol-switch-track {
   box-shadow: 0 0 0 2px var(--accent-dim);
@@ -2890,7 +2894,7 @@ a.dbundle-fact:hover {
   border-color: rgba(226, 165, 66, 0.4);
 }
 .learn-link {
-  color: var(--accent);
+  color: var(--accent-text);
   border-color: var(--accent-dim);
 }
 .learn-age {
@@ -3054,7 +3058,7 @@ a.dbundle-fact:hover {
   font-size: 12px;
 }
 .an-link {
-  color: var(--accent);
+  color: var(--accent-text);
 }
 .an-unpriced {
   background: var(--amber);
@@ -3212,7 +3216,7 @@ a.dbundle-fact:hover {
   font-weight: 550;
 }
 .feed-task:hover {
-  color: var(--accent);
+  color: var(--accent-text);
 }
 .feed-text {
   color: var(--text-dim);
@@ -3260,7 +3264,7 @@ a.dbundle-fact:hover {
   align-items: center;
   gap: 10px;
   margin: 14px 2px;
-  color: var(--accent);
+  color: var(--accent-text);
   font-size: 11px;
   letter-spacing: 0.5px;
   text-transform: uppercase;
@@ -3484,7 +3488,7 @@ a.dbundle-fact:hover {
   color: var(--text-faint);
 }
 .lb-task {
-  color: var(--accent);
+  color: var(--accent-text);
   font-weight: 550;
 }
 .lb-count {
@@ -3600,7 +3604,7 @@ a.dbundle-fact:hover {
   gap: 8px;
 }
 .evb-open {
-  color: var(--accent);
+  color: var(--accent-text);
   font-size: 12px;
 }
 .evb-cap {
@@ -3630,7 +3634,7 @@ a.dbundle-fact:hover {
   flex: 1;
 }
 .evb-task:hover {
-  color: var(--accent);
+  color: var(--accent-text);
 }
 .evb-age {
   flex-shrink: 0;
@@ -4062,7 +4066,7 @@ a.dbundle-fact:hover {
 }
 .needs-you-strip-go {
   margin-left: auto;
-  color: var(--accent);
+  color: var(--accent-text);
   font-size: 12px;
 }
 
@@ -4342,7 +4346,7 @@ a.dbundle-fact:hover {
 .review-recommendation-label {
   display: block;
   margin-bottom: 4px;
-  color: var(--accent);
+  color: var(--accent-text);
   font-size: var(--t-eyebrow);
   font-weight: 700;
   letter-spacing: 0.06em;
@@ -4635,7 +4639,7 @@ a.dbundle-fact:hover {
   background: color-mix(in srgb, var(--bg-elev) 88%, var(--accent) 12%);
 }
 .understanding-quiz-label {
-  color: var(--accent);
+  color: var(--accent-text);
   font-size: var(--t-eyebrow);
   font-weight: 700;
   letter-spacing: 0.08em;
@@ -4798,11 +4802,11 @@ a.dbundle-fact:hover {
   line-height: 1.45;
 }
 .rs-why { opacity: 0.65; }
-.rs-done { --rs-tint: #2da44e; }
-.rs-iffy { --rs-tint: #d4a72c; }
-.rs-decisions { --rs-tint: #8250df; }
-.rs-testing { --rs-tint: #0969da; }
-.rs-followups { --rs-tint: #6e7781; }
+.rs-done { --rs-tint: var(--green); }
+.rs-iffy { --rs-tint: var(--amber); }
+.rs-decisions { --rs-tint: var(--purple); }
+.rs-testing { --rs-tint: var(--blue); }
+.rs-followups { --rs-tint: var(--text-faint); }
 
 /* ---- checkpoints: live build-time checkboxes ---- */
 .cp-panel, .cp-inbox {
@@ -5254,7 +5258,7 @@ button.rev-ev-chip { font: inherit; color: inherit; background: none; cursor: po
   font-weight: 600;
 }
 .fleet-title:hover {
-  color: var(--accent);
+  color: var(--accent-text);
 }
 .term-mini {
   max-height: 220px;
@@ -6005,7 +6009,7 @@ button.rev-ev-chip { font: inherit; color: inherit; background: none; cursor: po
   gap: var(--s4);
 }
 .manager-eyebrow {
-  color: var(--accent);
+  color: var(--accent-text);
   font-size: var(--t-sm);
   font-weight: 600;
   letter-spacing: 0.1px;
@@ -6134,7 +6138,7 @@ button.rev-ev-chip { font: inherit; color: inherit; background: none; cursor: po
   content: "↗";
   display: block;
   margin-top: 6px;
-  color: var(--accent);
+  color: var(--accent-text);
   font-size: var(--t-xs);
 }
 .manager-project-empty {
@@ -6152,7 +6156,7 @@ button.rev-ev-chip { font: inherit; color: inherit; background: none; cursor: po
   width: 48px;
   height: 58px;
   border: 1px solid rgba(215, 181, 109, 0.35);
-  color: var(--accent);
+  color: var(--accent-text);
   font-family: var(--mono);
   font-size: var(--t-xs);
   transform: skewY(-6deg);
@@ -6790,7 +6794,7 @@ a.chip-jira:hover { background: #2d5488; }
 }
 .focus-lane-go {
   margin-left: auto;
-  color: var(--accent);
+  color: var(--accent-text);
   font-size: var(--t-xs);
 }
 .focus-rows,
@@ -6821,7 +6825,7 @@ a.chip-jira:hover { background: #2d5488; }
   font-size: var(--t-eyebrow);
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  color: var(--accent);
+  color: var(--accent-text);
 }
 .focus-row-wrap {
   display: flex;
