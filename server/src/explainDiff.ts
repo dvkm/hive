@@ -219,6 +219,8 @@ async function generateExplanation(db: DB, task: any, head: string | null, deps:
       timeoutMs: TIMEOUT_MS,
       cwd: task.worktree_path,
       env: claudeProfileEnvForProject(db, task.project_id),
+      taskId: task.id,
+      site: "explain_diff",
     }
   );
   if (res.timedOut || res.code !== 0) return fail(`explanation run ${modelFailure(db, res, { timeoutMs: TIMEOUT_MS })}`);

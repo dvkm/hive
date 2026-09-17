@@ -117,7 +117,7 @@ test("apiAutoAnswerDecision resolves a recommended authority deny without granti
   db.query(
     "INSERT INTO authority_grants (id, task_id, action, target, decision_id, status, created_at) VALUES (?,?,?,?,?, 'pending', ?)"
   ).run(newId("agr"), taskId, "command.dangerous.force-delete-branch", "git branch -D tmp", d.id, now());
-  const res = apiAutoAnswerDecision(db, herdr as any, d.id, { answer_key: "deny", answer_note: "leave the harmless ref" });
+  const res = await apiAutoAnswerDecision(db, herdr as any, d.id, { answer_key: "deny", answer_note: "leave the harmless ref" });
   expect(res.status).toBe(200);
   expect((db.query("SELECT status FROM authority_grants WHERE decision_id=?").get(d.id) as any).status).toBe("denied");
 });
@@ -130,7 +130,7 @@ test("agent-dialog deny only closes a stale card from the current agent generati
   });
   marker("blocked_card", released);
   marker("agent_released", released);
-  expect(apiAutoAnswerDecision(db, herdr as any, released, { answer_key: "deny" }).status).toBe(200);
+  expect((await apiAutoAnswerDecision(db, herdr as any, released, { answer_key: "deny" })).status).toBe(200);
 
   const done = seedDecision({
     title: "Agent blocked on a dialog: permission prompt",
@@ -139,7 +139,7 @@ test("agent-dialog deny only closes a stale card from the current agent generati
   });
   marker("blocked_card", done);
   marker("agent_status", done, { status: "done" });
-  expect(apiAutoAnswerDecision(db, herdr as any, done, { answer_key: "deny" }).status).toBe(200);
+  expect((await apiAutoAnswerDecision(db, herdr as any, done, { answer_key: "deny" })).status).toBe(200);
 
   const live = seedDecision({
     title: "Agent blocked on a dialog: permission prompt",
@@ -147,7 +147,7 @@ test("agent-dialog deny only closes a stale card from the current agent generati
     options: [{ key: "approve", label: "Approve" }, { key: "deny", label: "Deny" }],
   });
   marker("blocked_card", live);
-  expect(apiAutoAnswerDecision(db, herdr as any, live, { answer_key: "deny" }).status).toBe(403);
+  expect((await apiAutoAnswerDecision(db, herdr as any, live, { answer_key: "deny" })).status).toBe(403);
 
   const respawned = seedDecision({
     title: "Agent blocked on a dialog: permission prompt",
@@ -157,7 +157,7 @@ test("agent-dialog deny only closes a stale card from the current agent generati
   marker("blocked_card", respawned);
   marker("agent_released", respawned);
   marker("spawned", respawned);
-  expect(apiAutoAnswerDecision(db, herdr as any, respawned, { answer_key: "deny" }).status).toBe(403);
+  expect((await apiAutoAnswerDecision(db, herdr as any, respawned, { answer_key: "deny" })).status).toBe(403);
 
   const approve = seedDecision({
     title: "Agent blocked on a dialog: permission prompt",
@@ -166,14 +166,14 @@ test("agent-dialog deny only closes a stale card from the current agent generati
   });
   marker("blocked_card", approve);
   marker("agent_released", approve);
-  expect(apiAutoAnswerDecision(db, herdr as any, approve, { answer_key: "approve" }).status).toBe(403);
+  expect((await apiAutoAnswerDecision(db, herdr as any, approve, { answer_key: "approve" })).status).toBe(403);
 
   const unrelated = seedDecision({
     title: "Choose a launch segment",
     risk: "normal",
     options: [{ key: "deny", label: "Deny" }],
   });
-  const response = apiAutoAnswerDecision(db, herdr as any, unrelated, { answer_key: "deny" });
+  const response = await apiAutoAnswerDecision(db, herdr as any, unrelated, { answer_key: "deny" });
   expect(response.status).toBe(403);
   expect((await response.json()).reason).toBe("only the raiser's recommended option can be auto-approved");
 });
@@ -202,7 +202,7 @@ test("apiAutoAnswerDecision: safe card is answered, resolver runs, audit trail r
     risk: "normal",
     options: [{ key: "save", label: "Save as reference", recommended: true }, { key: "ignore", label: "ignore" }],
   });
-  const res = apiAutoAnswerDecision(db, herdr as any, d.id, { answer_key: "save", answer_note: "the dashboard", actor: "supervisor-session-a" });
+  const res = await apiAutoAnswerDecision(db, herdr as any, d.id, { answer_key: "save", answer_note: "the dashboard", actor: "supervisor-session-a" });
   expect(res.status).toBe(200);
 
   // Card is answered and the resolver ran (reference stored).
@@ -225,10 +225,10 @@ test("apiAutoAnswerDecision: malformed body is rejected before audit", async () 
     risk: "normal",
     options: [{ key: "save", label: "Save as reference", recommended: true }, { key: "ignore", label: "ignore" }],
   });
-  const note = apiAutoAnswerDecision(db, herdr as any, d.id, { answer_key: "save", answer_note: 123 });
+  const note = await apiAutoAnswerDecision(db, herdr as any, d.id, { answer_key: "save", answer_note: 123 });
   expect(note.status).toBe(400);
   expect(await note.json()).toEqual({ error: "answer_note must be a string" });
-  const indices = apiAutoAnswerDecision(db, herdr as any, d.id, { answer_key: "save", selected_indices: "[]" });
+  const indices = await apiAutoAnswerDecision(db, herdr as any, d.id, { answer_key: "save", selected_indices: "[]" });
   expect(indices.status).toBe(400);
   expect(await indices.json()).toEqual({ error: "selected_indices must be an array of indices" });
   expect((db.query("SELECT status FROM decisions WHERE id=?").get(d.id) as any).status).toBe("open");
@@ -245,7 +245,7 @@ test("apiAutoAnswerDecision: unsafe card is left OPEN and escalated with a reaso
   db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
     newId("evt"), taskId, now(), "system", "cost_cap", JSON.stringify({ decision_id: d.id })
   );
-  const res = apiAutoAnswerDecision(db, herdr as any, d.id, { answer_key: "wrap_up" });
+  const res = await apiAutoAnswerDecision(db, herdr as any, d.id, { answer_key: "wrap_up" });
   expect(res.status).toBe(403);
   const body = await res.json();
   expect(body.effect).toBe("escalate");
@@ -266,4 +266,70 @@ test("categories outside the allow-list (cost cap, deny guardrail, plain questio
 
   const question = seedDecision({ title: "Ship the redesign to which segment first?", risk: "normal", options: [REC("beta"), { key: "all", label: "all" }] });
   expect(evaluateAutoApprove(db, db.query("SELECT * FROM decisions WHERE id=?").get(question), "beta").allow).toBe(false);
+});
+
+// ---- the Jev classifier can never loosen this bar ---------------------------
+
+test("a typesafe classification cannot turn a safetyBar refusal into an approval", async () => {
+  const { classifyCardText } = await import("../src/policy.ts");
+  const allClear = (async () =>
+    new Response(
+      JSON.stringify({
+        model: "jev-test",
+        answers: {
+          risk: { type: "score", score: 0, legend: {}, probabilities: {}, confidence: 1 },
+          blast: { type: "choice", choice: "local", probabilities: {}, confidence: 1 },
+          reversible: { type: "noul", noul: 1 },
+          needs_input: { type: "noul", noul: 0 },
+        },
+        usage: { input_tokens: 1, output_tokens: 1 },
+      })
+    )) as any;
+  const env = { TYPESAFE_API_KEY: "k", HIVE_TYPESAFE_MODE: "enforce" } as any;
+
+  // Prose risk: riskLevel() reads "high", and the bar's own explicit-low/normal
+  // string check refuses it whatever Jev thinks.
+  const prosy = seedDecision({
+    title: "Save recurring link as a project reference? https://x.io",
+    risk: "if these keys are real, anyone with repo read access can use them",
+    options: [REC("save")],
+  });
+  const prosyRow = db.query("SELECT * FROM decisions WHERE id=?").get(prosy);
+  const cls = await classifyCardText(prosyRow as any, { env, fetch: allClear });
+  expect(cls.risk).toBe("low"); // Jev did talk the unparseable prose down...
+  expect(evaluateAutoApprove(db, prosyRow, "save", cls).allow).toBe(false); // ...and it changed nothing
+
+  // Prod blast radius: enforce only ever raises blast, so a "local" judgment
+  // cannot wash it out either.
+  const prod = seedDecision({ title: "Recover failed task: t", risk: "normal", blast: "deploy to prod", options: [REC("requeue")] });
+  const prodRow = db.query("SELECT * FROM decisions WHERE id=?").get(prod);
+  const prodCls = await classifyCardText(prodRow as any, { env, fetch: allClear });
+  expect(prodCls.blast).toBe("prod");
+  expect(evaluateAutoApprove(db, prodRow, "requeue", prodCls).allow).toBe(false);
+});
+
+test("shadow mode hands the caller a typesafe_shadow to log on its existing event", async () => {
+  const { classifyCardText } = await import("../src/policy.ts");
+  const shadowFetch = (async () =>
+    new Response(
+      JSON.stringify({
+        model: "jev-test",
+        answers: {
+          risk: { type: "score", score: 3, legend: {}, probabilities: {}, confidence: 1 },
+          blast: { type: "choice", choice: "prod", probabilities: {}, confidence: 1 },
+          reversible: { type: "noul", noul: 0 },
+          needs_input: { type: "noul", noul: 1 },
+        },
+        usage: { input_tokens: 1, output_tokens: 1 },
+      })
+    )) as any;
+  const id = seedDecision({ title: "Task #4 passed its cost cap ($5) — wrap up?", risk: "normal", options: [REC("wrap_up")] });
+  const row = db.query("SELECT * FROM decisions WHERE id=?").get(id);
+  const cls = await classifyCardText(row as any, {
+    env: { TYPESAFE_API_KEY: "k", HIVE_TYPESAFE_MODE: "shadow" } as any,
+    fetch: shadowFetch,
+  });
+  const v = evaluateAutoApprove(db, row, "wrap_up", cls);
+  expect(v.allow).toBe(false); // shadow changes no decision
+  expect(v.typesafe_shadow).toMatchObject({ risk: "high", blast: "prod", source: "typesafe" });
 });

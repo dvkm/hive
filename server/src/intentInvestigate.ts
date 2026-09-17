@@ -21,7 +21,8 @@ import { now } from "./db.ts";
 import { getTask, writeEvent } from "./state.ts";
 import { broadcast } from "./bus.ts";
 import { getIntent, intentSection, openQuestions, INTENT_SECTIONS, type Intent } from "./intents.ts";
-import { renderIntentBody, sourceText, type IntentSourceText } from "./intentDraft.ts";
+import { DEFAULT_OPEN_QUESTION, renderIntentBody, sourceText, type IntentSourceText } from "./intentDraft.ts";
+import { judge as typesafeJudge, noul, typesafeMode, type Question } from "./typesafe.ts";
 import { claudeBin, defaultPlannerExec, parseModelJson, type PlannerExec } from "./planner.ts";
 import { claudeProfileEnvForRepo } from "./claudeProfiles.ts";
 import { modelFailure, noteModelCall } from "./modelCall.ts";
@@ -36,9 +37,27 @@ const MAX_TURNS = 40;
 // tool outside this list (Edit, Write, an arbitrary shell command) is denied.
 export const READ_ONLY_TOOLS = ["Read", "Grep", "Glob", "Bash(graft:*)", "Bash(git log:*)", "Bash(git grep:*)", "Bash(git show:*)", "Bash(ls:*)"];
 
+// A draft the investigator emptied of questions was emptied by the same model
+// that rewrote it. Before hive accepts on that word alone, a typed second
+// opinion says whether anything is still a person's call. >= this is "yes".
+const NEEDS_PERSON = 0.5;
+
+const NEEDS_PERSON_Q: Record<string, Question> = {
+  needs_person: {
+    type: "noul",
+    instructions:
+      "Does anything in this draft still require a person to decide (scope, product behavior, a tradeoff, an ambiguity the code does not settle), as opposed to being fully determined by the request and the code findings?",
+    criteria: {
+      true: "Something in the draft is a person's call: the scope, the product behavior, a tradeoff, or an ambiguity the findings do not settle.",
+      false: "The request and the code findings fully determine the work; an agent can start without asking anyone anything.",
+    },
+  },
+};
+
 export interface InvestigatorDeps {
   exec?: PlannerExec;
   accept: (intentId: string) => Promise<unknown>;
+  judge?: typeof typesafeJudge;
   concurrency?: number;
   timeoutMs?: number;
   model?: string;
@@ -211,7 +230,8 @@ async function investigateIntent(db: DB, intent: Intent, deps: InvestigatorDeps)
     return;
   }
   const graft = (deps.graftAvailable ?? graftIndexed)(repoPath);
-  const prompt = buildInvestigatePrompt(intent, requestText(db, intent, anchor), graft);
+  const src = requestText(db, intent, anchor);
+  const prompt = buildInvestigatePrompt(intent, src, graft);
   const timeoutMs = deps.timeoutMs ?? TIMEOUT_MS;
   let res: Awaited<ReturnType<PlannerExec>>;
   try {
@@ -242,10 +262,34 @@ async function investigateIntent(db: DB, intent: Intent, deps: InvestigatorDeps)
     return;
   }
   const before = openQuestions(current.body_md);
-  const body = investigatedBody(inv, current.body_md);
-  const after = openQuestions(body);
+  let body = investigatedBody(inv, current.body_md);
+  let after = openQuestions(body);
+
+  // Nothing left to ask, per the model that just rewrote the draft. Get an
+  // independent read before hive accepts on its own say-so.
+  let typesafe: { needs_person: number; model: string; ms: number } | undefined;
+  const mode = typesafeMode();
+  if (after.length === 0 && mode !== "off") {
+    const state = {
+      request: src ? sourceText(src) : "",
+      draft: { problem: inv.problem, proposed_outcome: inv.proposed_outcome, affected: inv.affected, constraints: inv.constraints },
+      findings: inv.findings,
+    };
+    const j = await (deps.judge ?? typesafeJudge)(state, NEEDS_PERSON_Q);
+    const p = j ? noul(j.answers.needs_person) : null;
+    if (j && p !== null) {
+      typesafe = { needs_person: p, model: j.model, ms: j.ms };
+      // Shadow only records; enforce holds the draft in the inbox with the
+      // question every draft carries by default.
+      if (mode === "enforce" && p >= NEEDS_PERSON) {
+        body = investigatedBody({ ...inv, open_questions: [...(inv.open_questions ?? []), DEFAULT_OPEN_QUESTION] }, current.body_md);
+        after = openQuestions(body);
+      }
+    }
+  }
+
   db.query("UPDATE intents SET body_md = ?, updated_at = ? WHERE id = ?").run(body, now(), intent.id);
-  record({ questions_before: before.length, questions_after: after.length, findings: inv.findings.length, graft });
+  record({ questions_before: before.length, questions_after: after.length, findings: inv.findings.length, graft, ...(typesafe ? { typesafe } : {}) });
   broadcast({ type: "intent", intent: getIntent(db, intent.id) });
   if (after.length === 0) {
     try {
