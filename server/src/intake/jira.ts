@@ -2914,30 +2914,11 @@ const clampText = (text: string, max: number): string =>
 // The reason hive itself recorded for reaching this Jira status. Sync-driven
 // state changes are excluded: their reason is "jira WEB-1 -> In Review", which
 // tells the reporter what they already did.
-function hiveStateReason(db: DB, taskId: string, jiraStatus: string): string | null {
-  const rows = db
-    .query(
-      `SELECT payload FROM events WHERE task_id = ? AND type = 'state_change'
-         AND source NOT IN ('jira-sync', 'jira') ORDER BY ts DESC, rowid DESC`
-    )
-    .all(taskId) as { payload: string }[];
-  for (const row of rows) {
-    let payload: { to?: string; reason?: string };
-    try {
-      payload = JSON.parse(row.payload);
-    } catch {
-      continue;
-    }
-    if (!sameStatus(stateToJiraStatus(String(payload.to ?? "")), jiraStatus)) continue;
-    return String(payload.reason ?? "").trim() || null;
-  }
-  return null;
-}
-
-function latestReviewSummary(db: DB, taskId: string): any {
+function latestReviewSummary(db: DB, taskIds: string[]): any {
+  const marks = taskIds.map(() => "?").join(",");
   const row = db
-    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY ts DESC, rowid DESC LIMIT 1")
-    .get(taskId) as { payload: string } | undefined;
+    .query(`SELECT payload FROM events WHERE task_id IN (${marks}) AND type = 'review_summary' ORDER BY ts DESC, rowid DESC LIMIT 1`)
+    .get(...taskIds) as { payload: string } | undefined;
   if (!row) return null;
   try {
     return JSON.parse(row.payload);
@@ -2951,21 +2932,32 @@ function latestReviewSummary(db: DB, taskId: string): any {
 // nothing to add (a human moved the issue themselves and hive never worked it),
 // because an empty "for your information" is worse than silence.
 export function reviewContextText(db: DB, task: any, jiraStatus: string): string | null {
-  const review = latestReviewSummary(db, task.id);
+  // A mirrored ticket's PR, evidence and review live on its WORK tasks, not on
+  // the mirror row: read them together, newest work first.
+  const work = db
+    .query("SELECT id, pr_url FROM tasks WHERE jira_mirror_task_id = ? ORDER BY updated_at DESC")
+    .all(task.id) as { id: string; pr_url: string | null }[];
+  const ids = [task.id, ...work.map((w) => w.id)];
+  const marks = ids.map(() => "?").join(",");
+  const review = latestReviewSummary(db, ids);
   const list = (value: unknown): any[] => (Array.isArray(value) ? value : []);
-  const pr = String(task.pr_url ?? "").trim();
+  const pr = String(task.pr_url ?? "").trim() || String(work.map((w) => w.pr_url).find(Boolean) ?? "").trim();
   const allEvidence = db
-    .query("SELECT kind, url, caption FROM evidence WHERE task_id = ? ORDER BY ts")
-    .all(task.id) as { kind: string; url: string | null; caption: string | null }[];
+    .query(`SELECT kind, url, caption FROM evidence WHERE task_id IN (${marks}) ORDER BY ts`)
+    .all(...ids) as { kind: string; url: string | null; caption: string | null }[];
   // #1249: the explanation page gets its own line rather than a slot in the
   // capped evidence list — it is the one link a reporter actually wants.
   const explain = resolveEvidenceUrl(allEvidence.filter((row) => row.kind === "explanation").at(-1)?.url ?? null);
   const evidence = allEvidence.filter((row) => row.kind !== "explanation");
 
-  const headline =
-    hiveStateReason(db, task.id, jiraStatus) ??
-    list(review?.done).map((item) => String(item ?? "").trim()).find(Boolean) ??
-    null;
+  // The headline is the review's own one-line summary of what was done. The
+  // internal state-change reason ("hive work for WEB-156 is in_review") is
+  // bookkeeping, never a headline: 27 of the last 27 context comments were that
+  // line and nothing else, which is exactly the noise a reporter mutes.
+  const headline = list(review?.done).map((item) => String(item ?? "").trim()).find(Boolean) ?? null;
+  // Nothing a reporter can act on (no PR, no explanation, no evidence, no
+  // summary) means no comment. The status transition itself is already visible
+  // on the ticket.
   if (!headline && !pr && !evidence.length && !explain) return null;
 
   const caveats = [
@@ -3003,8 +2995,19 @@ export function reviewContextText(db: DB, task: any, jiraStatus: string): string
     if (evidence.length > CONTEXT_EVIDENCE_LIMIT)
       lines.push(`- +${evidence.length - CONTEXT_EVIDENCE_LIMIT} more in Hive`);
   }
-  lines.push("", `Hive task: ${hiveBaseUrl()}/tasks/${task.id}`);
+  // A loopback URL is a dead link for everyone reading Jira; only a public
+  // hive (HIVE_PUBLIC_URL, e.g. the Tailscale address) is worth printing.
+  if (!isLoopbackUrl(hiveBaseUrl())) lines.push("", `Hive task: ${hiveBaseUrl()}/tasks/${task.id}`);
   return clampText(lines.join("\n"), JIRA_COMMENT_MAX_LENGTH);
+}
+
+export function isLoopbackUrl(value: string): boolean {
+  try {
+    const host = new URL(value).hostname;
+    return host === "127.0.0.1" || host === "localhost" || host === "::1" || host === "[::1]";
+  } catch {
+    return true;
+  }
 }
 
 // Queue the context comment at most once per Jira status. The event row itself
