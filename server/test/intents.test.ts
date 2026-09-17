@@ -284,9 +284,11 @@ test("the agent is told to read the accepted record first, and only once it exis
 test("a model that answers with nothing still yields a usable record", async () => {
   const empty = extractSections('{"problem":"","proposed_outcome":""}');
   expect(empty).toBeNull(); // nothing to map: the caller falls back to the raw text
-  const noQuestions = extractSections('{"problem":"p","proposed_outcome":"o","open_questions":[]}')!;
-  // A draft always asks something, so acceptance is always a deliberate act.
-  expect(noQuestions.open_questions.length).toBe(1);
+  // HIVE-643: an EXPLICIT empty list is the drafter saying the request settles
+  // everything, and is kept. A MISSING list is the drafter not answering, and
+  // still carries the default question so acceptance stays a deliberate act.
+  expect(extractSections('{"problem":"p","proposed_outcome":"o","open_questions":[]}')!.open_questions.length).toBe(0);
+  expect(extractSections('{"problem":"p","proposed_outcome":"o"}')!.open_questions.length).toBe(1);
   expect(openQuestions(fallbackBody({ title: "t", description: "d", comments: [] })).length).toBe(1);
   expect(intentSection(fallbackBody({ title: "t", description: "d", comments: [] }), "Problem")).toContain("d");
 });
