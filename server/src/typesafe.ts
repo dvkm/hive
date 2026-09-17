@@ -7,6 +7,13 @@
 // HIVE_TYPESAFE_MODE=shadow (default) records the judgment beside the existing
 // decision without changing it; =enforce lets callers act on it; =off skips
 // the call entirely.
+//
+// The key and mode can also be set from the Settings page; they live in the
+// `settings` table and are copied into process.env at boot and on every save,
+// so every gate keeps reading the env and nothing else changes.
+
+import type { DB } from "./db.ts";
+import { getSetting, setSetting } from "./db.ts";
 
 export type NoulQ = { type: "noul"; instructions: string; criteria?: { true: string; false: string } };
 export type ChoiceQ = { type: "choice"; instructions: string; criteria: Record<string, string | null> };
@@ -26,6 +33,77 @@ export function typesafeMode(env: NodeJS.ProcessEnv = process.env): TypesafeMode
   if (!env.TYPESAFE_API_KEY) return "off";
   const m = env.HIVE_TYPESAFE_MODE;
   return m === "enforce" || m === "off" ? m : "shadow";
+}
+
+const KEY_SETTING = "typesafe_api_key";
+const MODE_SETTING = "typesafe_mode";
+
+// Settings-table values win over whatever the process was launched with, so a
+// key typed into the page takes effect without touching the launchd plist.
+export function applyTypesafeSettings(db: DB, env: NodeJS.ProcessEnv = process.env): void {
+  const key = getSetting(db, KEY_SETTING);
+  const mode = getSetting(db, MODE_SETTING);
+  if (key) env.TYPESAFE_API_KEY = key;
+  if (mode === "off" || mode === "shadow" || mode === "enforce") env.HIVE_TYPESAFE_MODE = mode;
+}
+
+export function saveTypesafeSettings(db: DB, body: { api_key?: unknown; mode?: unknown }, env: NodeJS.ProcessEnv = process.env): void {
+  if (typeof body.api_key === "string") {
+    const key = body.api_key.trim();
+    setSetting(db, KEY_SETTING, key);
+    if (key) env.TYPESAFE_API_KEY = key;
+    else delete env.TYPESAFE_API_KEY;
+  }
+  if (body.mode === "off" || body.mode === "shadow" || body.mode === "enforce") {
+    setSetting(db, MODE_SETTING, body.mode);
+    env.HIVE_TYPESAFE_MODE = body.mode;
+  }
+}
+
+export type TypesafeStatus = {
+  configured: boolean;
+  key_hint: string | null; // last 4 characters, never the key
+  key_source: "settings" | "env" | null;
+  mode: TypesafeMode;
+};
+
+export function typesafeStatus(db: DB, env: NodeJS.ProcessEnv = process.env): TypesafeStatus {
+  const key = env.TYPESAFE_API_KEY ?? "";
+  return {
+    configured: !!key,
+    key_hint: key ? key.slice(-4) : null,
+    key_source: key ? (getSetting(db, KEY_SETTING) === key ? "settings" : "env") : null,
+    mode: typesafeMode(env),
+  };
+}
+
+// One round trip with a fixed question, reporting the HTTP status instead of
+// failing open, so the Settings page can tell a bad key from a dead network.
+export async function probeTypesafe(
+  opts: { fetch?: typeof fetch; env?: NodeJS.ProcessEnv } = {}
+): Promise<{ ok: boolean; status: number | null; ms: number; model: string | null; error: string | null }> {
+  const env = opts.env ?? process.env;
+  if (!env.TYPESAFE_API_KEY) return { ok: false, status: null, ms: 0, model: null, error: "no API key set" };
+  const f = opts.fetch ?? fetch;
+  const started = Date.now();
+  try {
+    const res = await f(ENDPOINT, {
+      method: "POST",
+      headers: { authorization: `Bearer ${env.TYPESAFE_API_KEY}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        state: { command: "ls -la" },
+        model: env.TYPESAFE_MODEL || "jev-latest",
+        questions: { read_only: { type: "noul", instructions: "Is this shell command read-only?" } },
+      }),
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+    const ms = Date.now() - started;
+    if (!res.ok) return { ok: false, status: res.status, ms, model: null, error: (await res.text()).slice(0, 200) };
+    const body: any = await res.json();
+    return { ok: true, status: res.status, ms, model: String(body?.model ?? ""), error: null };
+  } catch (e: any) {
+    return { ok: false, status: null, ms: Date.now() - started, model: null, error: String(e?.message ?? e) };
+  }
 }
 
 // Per-project tuning under `config.typesafe`, e.g.
