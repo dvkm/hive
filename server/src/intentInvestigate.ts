@@ -106,7 +106,6 @@ or after. Shape:
 {"problem":"what is wrong or missing today","proposed_outcome":"what is true once this is done","affected":"the people, pages, services and FILES this touches — paths you verified","constraints":"hard limits, including what the code already settles: the function that owns the behaviour, the pattern the change must follow","findings":["one line each: what you found that answers a draft question or narrows the work, with file:line"],"open_questions":["ONLY what a person must decide: a product choice, a scope call, two requirements that conflict. Empty array when nothing remains."]}
 
 Rules:
-- Write every field in the SAME LANGUAGE the draft is written in.
 - Only what the request and the code support. Never invent.
 - A question the code or the ticket answers is not a question: answer it under
   findings and, if it is a limit on the work, under constraints.

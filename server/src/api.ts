@@ -7020,8 +7020,8 @@ function queueIntentWriteBack(db: DB, intent: Intent): void {
     .query("SELECT 1 FROM events WHERE task_id = ? AND type = 'jira_comment' AND json_extract(payload, '$.intent_id') = ? LIMIT 1")
     .get(mirror.id, intent.id);
   if (already) return;
-  // The intent body is drafted in the ticket's own language, so quoting its two
-  // decision sections keeps the comment in that language without translating.
+  // Everything hive writes is English (PLAIN_ENGLISH), the ticket's language
+  // included: the two decision sections are quoted as drafted.
   const text = [
     `Hive accepted the intent record for ${intent.source_ref}. Work starts from this.`,
     "",

@@ -123,6 +123,27 @@ test("a draft the director edited while hive was looking is left alone", async (
   expect(f.events()[0].skipped).toContain("edited");
 });
 
+test("every prompt that writes for the director writes in English, whatever language the ticket is in", async () => {
+  const { buildDraftPrompt, buildChecksPrompt } = await import("../src/intentDraft.ts");
+  const { PLAIN_ENGLISH } = await import("../src/plainEnglish.ts");
+  const f = fixture();
+  const prompts = [
+    await buildInvestigatePromptOf(f.intent),
+    buildDraftPrompt({ title: "자산 상세화면 칩", description: "진행단계 칩이 비활성으로 남는다", comments: [] }),
+    buildChecksPrompt(f.intent),
+  ];
+  expect(PLAIN_ENGLISH).toContain("Write in English");
+  for (const prompt of prompts) {
+    expect(prompt).toContain("Write in English");
+    expect(prompt).not.toMatch(/same language/i);
+  }
+});
+
+async function buildInvestigatePromptOf(intent: any): Promise<string> {
+  const { buildInvestigatePrompt } = await import("../src/intentInvestigate.ts");
+  return buildInvestigatePrompt(intent, null, true);
+}
+
 test("argv pins the read-only tool list and the JSON envelope", () => {
   const argv = investigateArgv("look", "sonnet");
   expect(argv.slice(1, 6)).toEqual(["-p", "--model", "sonnet", "look", "--output-format"]);
