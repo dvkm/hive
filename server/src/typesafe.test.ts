@@ -32,3 +32,19 @@ describe("typesafe", () => {
     expect(await judge({}, q, { fetch: (async () => { throw new Error("down"); }) as unknown as typeof fetch, env })).toBeNull();
   });
 });
+
+import { typesafeSettings, DEFAULT_THRESHOLDS } from "./typesafe.ts";
+
+describe("typesafeSettings", () => {
+  test("no key: off regardless of project config", () => {
+    expect(typesafeSettings({ typesafe: { mode: "enforce" } }, {}).mode).toBe("off");
+  });
+  test("project overrides mode and thresholds; bad values fall back", () => {
+    const s = typesafeSettings({ typesafe: { mode: "enforce", refute_at: 0.2, risk_max: 1.5, confirm_at: 7, needs_person_at: "x" } }, env);
+    expect(s.mode).toBe("enforce");
+    expect(s.thresholds).toEqual({ ...DEFAULT_THRESHOLDS, refute_at: 0.2, risk_max: 1.5 });
+  });
+  test("no block: env mode and defaults", () => {
+    expect(typesafeSettings({}, env)).toEqual({ mode: "shadow", thresholds: DEFAULT_THRESHOLDS });
+  });
+});

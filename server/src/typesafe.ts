@@ -28,6 +28,48 @@ export function typesafeMode(env: NodeJS.ProcessEnv = process.env): TypesafeMode
   return m === "enforce" || m === "off" ? m : "shadow";
 }
 
+// Per-project tuning under `config.typesafe`, e.g.
+//   { "mode": "enforce", "refute_at": 0.05, "confirm_at": 0.95,
+//     "needs_person_at": 0.5, "risk_max": 1.5, "triage_mechanical_at": 0.9 }
+// Every field is optional; a project without the block gets the defaults, and
+// no project can turn Jev on without TYPESAFE_API_KEY in the server env.
+export interface TypesafeThresholds {
+  refute_at: number; // reviewer: risk_real at or below this → refuted without opus
+  confirm_at: number; // reviewer: risk_real at or above this → confirmed without opus
+  needs_person_at: number; // intent: needs_person at or above this holds the draft
+  risk_max: number | null; // inbox: Jev risk score (0 low … 3 high) a card may carry and still auto-approve; null keeps the explicit low/normal text bar
+  triage_mechanical_at: number; // intake: P(mechanical) at or above this skips the sonnet triage
+}
+export const DEFAULT_THRESHOLDS: TypesafeThresholds = {
+  refute_at: 0.05,
+  confirm_at: 0.95,
+  needs_person_at: 0.5,
+  risk_max: null,
+  triage_mechanical_at: 0.9,
+};
+
+export function typesafeSettings(
+  projectConfig: unknown,
+  env: NodeJS.ProcessEnv = process.env
+): { mode: TypesafeMode; thresholds: TypesafeThresholds } {
+  const raw: any = projectConfig && typeof projectConfig === "object" ? (projectConfig as any).typesafe : null;
+  const envMode = typesafeMode(env);
+  const mode: TypesafeMode =
+    envMode === "off" ? "off" : raw?.mode === "enforce" || raw?.mode === "shadow" || raw?.mode === "off" ? raw.mode : envMode;
+  const num = (v: unknown, max: number): number | undefined =>
+    typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= max ? v : undefined;
+  return {
+    mode,
+    thresholds: {
+      refute_at: num(raw?.refute_at, 1) ?? DEFAULT_THRESHOLDS.refute_at,
+      confirm_at: num(raw?.confirm_at, 1) ?? DEFAULT_THRESHOLDS.confirm_at,
+      needs_person_at: num(raw?.needs_person_at, 1) ?? DEFAULT_THRESHOLDS.needs_person_at,
+      risk_max: raw?.risk_max === null ? null : num(raw?.risk_max, 3) ?? DEFAULT_THRESHOLDS.risk_max,
+      triage_mechanical_at: num(raw?.triage_mechanical_at, 1) ?? DEFAULT_THRESHOLDS.triage_mechanical_at,
+    },
+  };
+}
+
 const ENDPOINT = "https://api.typesafe.ai/v1/systemone";
 const TIMEOUT_MS = 5000;
 

@@ -31,6 +31,7 @@ import { now } from "../db.ts";
 import { writeEvent, getTask } from "../state.ts";
 import { claudeBin, defaultPlannerExec, type PlannerExec } from "../planner.ts";
 import { createDecision } from "../api.ts";
+import { judge, choice, typesafeSettings, type Question } from "../typesafe.ts";
 
 // Stamped on every triage card. Automation refuses to answer a classed card.
 export const TRIAGE_DECISION_CLASS = "intake_triage";
@@ -52,30 +53,76 @@ export interface Interpretation {
   label: string;
   detail?: string;
 }
+// What Jev said, carried out to the intake_triage event and nowhere else.
+export interface TriageTypesafe {
+  bucket: string;
+  p_mechanical: number;
+  category: string;
+  category_confidence: number;
+  model: string;
+  ms: number;
+}
 export interface Triage {
   bucket: "mechanical" | "decision_required";
   question?: string;
   interpretations?: Interpretation[];
   recommendation?: string;
   reasoning?: string;
+  typesafe?: TriageTypesafe;
 }
 
 export interface TriageDeps {
   exec?: PlannerExec; // the claude -p classifier (injectable in tests)
+  judge?: typeof judge; // the typed pre-judgment (injectable in tests)
 }
+
+// A 'noise' verdict this certain is not a work request at all, so there is
+// nothing for the director to choose between.
+const NOISE_CONFIDENCE_AT = 0.9;
+
+// Same rubric as triagePrompt below, as typed criteria instead of prose.
+const TYPESAFE_QUESTIONS: Record<string, Question> = {
+  bucket: {
+    type: "choice",
+    instructions:
+      "Which bucket does this incoming work request belong in? Product ambiguity only — ordinary implementation choices an engineer makes on the way are not a decision. When in doubt, answer mechanical.",
+    criteria: {
+      mechanical: "The request has ONE sensible reading. An engineer could start now and nobody would be surprised by what they built.",
+      decision_required:
+        "The request has TWO OR MORE reasonable readings that lead to genuinely different work, and a human has to pick.",
+    },
+  },
+  category: {
+    type: "choice",
+    instructions: "What kind of request is this?",
+    criteria: {
+      bug: "Something that worked now does not.",
+      feature: "New behavior is asked for.",
+      chore: "Maintenance, config, cleanup or an upgrade.",
+      question: "Asks for information, not a change.",
+      scope_change: "Alters an existing agreed plan or brief.",
+      needs_credential: "Cannot start without a secret, account or file from a person.",
+      noise: "Not a work request at all: chatter, an acknowledgement, or a duplicate.",
+    },
+  },
+};
 
 // The sources this runs on: ambient intake connectors and watched documents.
 export function isTriageSource(source: string | null | undefined): boolean {
   return !!source && (source.startsWith("intake_") || source === "watch");
 }
 
-function triageEnabled(db: DB, projectId: string): boolean {
+function projectConfig(db: DB, projectId: string): any {
   const row = db.query("SELECT config FROM projects WHERE id = ?").get(projectId) as { config: string } | undefined;
   try {
-    return JSON.parse(row?.config ?? "{}").intake_triage === true;
+    return JSON.parse(row?.config ?? "{}");
   } catch {
-    return false;
+    return {};
   }
+}
+
+function triageEnabled(db: DB, projectId: string): boolean {
+  return projectConfig(db, projectId).intake_triage === true;
 }
 
 export function triagePrompt(task: any): string {
@@ -158,7 +205,11 @@ export function extractTriage(raw: string): Triage | null {
 // One classifier run. NEVER throws and never returns decision_required unless the
 // model said so in a shape we could use.
 export async function classifyIntake(db: DB, task: any, deps: TriageDeps = {}): Promise<Triage> {
-  const open = (reasoning: string): Triage => ({ bucket: "mechanical", reasoning });
+  const ts = await preJudge(db, task, deps);
+  // Enforce only, and only towards mechanical: a decision card needs the
+  // interpretations only the sonnet call generates, so Jev can never raise one.
+  if (ts?.enforce) return { bucket: "mechanical", reasoning: ts.enforce, typesafe: ts.typesafe };
+  const open = (reasoning: string): Triage => ({ bucket: "mechanical", reasoning, typesafe: ts?.typesafe });
   try {
     const exec = deps.exec ?? defaultPlannerExec;
     const res = await exec([claudeBin(), "-p", "--model", "sonnet", NO_TOOLS, triagePrompt(task), "--output-format", "json"], {
@@ -166,10 +217,43 @@ export async function classifyIntake(db: DB, task: any, deps: TriageDeps = {}): 
     });
     if (res.timedOut) return open(`triage timed out after ${TIMEOUT_MS}ms — treated as mechanical`);
     if (res.code !== 0) return open(`triage exited ${res.code}: ${(res.stderr || res.stdout).trim().slice(0, 200)} — treated as mechanical`);
-    return extractTriage(res.stdout) ?? open("triage produced unusable output — treated as mechanical");
+    const v = extractTriage(res.stdout);
+    return v ? { ...v, typesafe: ts?.typesafe } : open("triage produced unusable output — treated as mechanical");
   } catch (e: any) {
     return open(`triage failed: ${String(e?.message ?? e).slice(0, 200)} — treated as mechanical`);
   }
+}
+
+// One typed Jev judgment in front of the sonnet call. Null (no key, mode off,
+// network trouble, junk answer) means "carry on as before".
+async function preJudge(
+  db: DB,
+  task: any,
+  deps: TriageDeps
+): Promise<{ typesafe: TriageTypesafe; enforce?: string } | null> {
+  const { mode, thresholds } = typesafeSettings(projectConfig(db, task.project_id));
+  if (mode === "off") return null;
+  const j = await (deps.judge ?? judge)(
+    { title: task.title ?? "", request: String(task.brief ?? "").slice(0, BRIEF_LIMIT), source: task.source ?? "" },
+    TYPESAFE_QUESTIONS
+  );
+  const b = j?.answers.bucket;
+  const c = j?.answers.category;
+  if (!j || b?.type !== "choice" || c?.type !== "choice") return null;
+  const typesafe: TriageTypesafe = {
+    bucket: choice(b) ?? "",
+    p_mechanical: b.probabilities?.mechanical ?? 0,
+    category: choice(c) ?? "",
+    category_confidence: c.confidence ?? 0,
+    model: j.model,
+    ms: j.ms,
+  };
+  if (mode !== "enforce") return { typesafe };
+  if (typesafe.p_mechanical >= thresholds.triage_mechanical_at)
+    return { typesafe, enforce: `typesafe p(mechanical)=${typesafe.p_mechanical} category=${typesafe.category}` };
+  if (typesafe.category === "noise" && typesafe.category_confidence >= NOISE_CONFIDENCE_AT)
+    return { typesafe, enforce: `typesafe category=noise confidence=${typesafe.category_confidence}` };
+  return { typesafe };
 }
 
 // The wiring point. Config-gated, source-gated, and safe to call and forget: it
@@ -196,7 +280,11 @@ export async function triageIntake(db: DB, task: any, deps: TriageDeps = {}): Pr
     task_id: task.id,
     source: "system",
     type: "intake_triage",
-    payload: { bucket: verdict.bucket, reasoning: verdict.reasoning ?? "" },
+    payload: {
+      bucket: verdict.bucket,
+      reasoning: verdict.reasoning ?? "",
+      ...(verdict.typesafe ? { typesafe: verdict.typesafe } : {}),
+    },
   });
 
   if (verdict.bucket === "mechanical") {
