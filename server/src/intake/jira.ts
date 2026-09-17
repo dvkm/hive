@@ -48,8 +48,10 @@
 //   skips them (dispatcher.ts), the reconciler's stale sweep skips them
 //   (reconciler.ts), and the done-gate evidence requirement is skipped
 //   (state.ts), since a ticket a human closed in Jira will never have a hive PR.
+import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
+import { basename, join } from "node:path";
 import type { DB } from "../db.ts";
-import { isOffline, newId, now } from "../db.ts";
+import { hiveHome, isOffline, newId, now } from "../db.ts";
 import { writeEvent, mutateWithEvent, getTask, transition, TERMINAL, queueJiraCancellationComment, type State } from "../state.ts";
 import { broadcastTask } from "../health.ts";
 import { resolveProjectSecrets } from "../secrets.ts";
@@ -1021,6 +1023,22 @@ export class JiraClient {
     return new Set(list.map((a: any) => String(a?.filename ?? "")).filter(Boolean));
   }
 
+  // Attachment BYTES. Not call()/json(): the body is a PNG, not JSON, so it
+  // never goes near the JSON parser. The URL comes off the issue JSON, which is
+  // external input, so it is followed ONLY when it points at this Jira site —
+  // otherwise a crafted issue could aim hive's Basic auth at any host.
+  // Returns null for a file that is too big to be worth a brief.
+  async attachmentBytes(contentUrl: string): Promise<Uint8Array | null> {
+    if (!contentUrl.startsWith(`${this.cfg.site}/`)) throw new Error(`refusing to fetch an attachment off-site: ${contentUrl}`);
+    const res = await this.fetchImpl(contentUrl, {
+      signal: AbortSignal.timeout(this.requestTimeoutMs()),
+      headers: { Authorization: this.auth(), Accept: "*/*" },
+    });
+    if (!res.ok) throw new JiraHttpError(`jira GET ${contentUrl} -> ${res.status}`, res.status);
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    return bytes.byteLength > ATTACHMENT_MAX_BYTES ? null : bytes;
+  }
+
   // One file, one request. `X-Atlassian-Token: no-check` is required by Jira for
   // every attachment upload; without it the request is refused as XSRF.
   async addAttachment(key: string, filename: string, bytes: Uint8Array, contentType: string): Promise<{ id: string; filename: string }> {
@@ -1293,12 +1311,91 @@ export function decideStatusSync(args: {
 // constant so the format cannot drift on one side only.
 export const BRIEF_PRIORITY_PREFIX = "Priority: ";
 
-export function briefFor(issue: any, site: string): string {
+// ------------------------------------------------------- attachment download
+// A brief that only NAMES a mockup is useless: WEB-163 said "시안: 이미지 3" and
+// carried three PNGs, and not one of them reached the agent. Every attachment
+// hive can read is downloaded once, and its LOCAL PATH rides next to the name
+// in the brief and the intent so the agent can just Read it.
+export const ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024;
+const ATTACHMENT_MIME = /^(image\/|application\/pdf$|text\/)/i;
+const ATTACHMENT_EXT = /\.(png|jpe?g|gif|webp|svg|pdf|txt|md|csv|json)$/i;
+
+export function attachmentDir(key: string): string {
+  return join(hiveHome(), "briefs", "attachments", key);
+}
+
+// A Jira filename is whatever the uploader typed, so it is never joined onto a
+// path as-is: only the basename survives, and nothing that would write outside
+// the issue's own directory or land as a dotfile.
+export function safeAttachmentName(filename: unknown): string | null {
+  const base = basename(String(filename ?? "").trim()).replace(/[/\\]/g, "");
+  if (!base || base.startsWith(".")) return null;
+  return base.slice(0, 120);
+}
+
+// filename AND attachment id -> local path, because the description's
+// `[attachment: …]` marker carries whichever of the two ADF had.
+export type AttachmentPaths = Record<string, string>;
+
+// Download what is not already on disk. Never throws: an attachment hive cannot
+// fetch is a far smaller problem than an import that stops. One log line for
+// the whole issue, so a ticket with no attachment permission is not a per-cycle
+// wall of noise.
+export async function downloadAttachments(ctx: Ctx, key: string, issue: any): Promise<AttachmentPaths> {
+  // Once per issue per cycle: a fresh import reconciles on the same cycle, so
+  // without this the same files are looked at twice and a permission failure is
+  // logged twice.
+  const cached = ctx.attachments.get(key);
+  if (cached) return cached;
+  const list = Array.isArray(issue?.fields?.attachment) ? issue.fields.attachment : [];
+  const paths: AttachmentPaths = {};
+  const dir = attachmentDir(key);
+  let failed = "";
+  for (const a of list) {
+    const name = safeAttachmentName(a?.filename);
+    const url = String(a?.content ?? "").trim();
+    if (!name || !url) continue;
+    const mime = String(a?.mimeType ?? "").trim();
+    if (!(mime ? ATTACHMENT_MIME.test(mime) : ATTACHMENT_EXT.test(name))) continue;
+    const size = Number(a?.size);
+    if (Number.isFinite(size) && size > ATTACHMENT_MAX_BYTES) continue;
+    const path = join(dir, name);
+    const have = existsSync(path) && (!Number.isFinite(size) || statSync(path).size === size);
+    if (!have) {
+      try {
+        const bytes = await ctx.client.attachmentBytes(url);
+        if (!bytes) continue;
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(path, bytes);
+      } catch (e) {
+        failed ||= String(e instanceof Error ? e.message : e);
+        continue;
+      }
+    }
+    paths[name] = path;
+    if (a?.id != null) paths[String(a.id)] = path;
+  }
+  if (failed) ctx.log(`[hive] jira ${key}: attachment download skipped (${failed})`);
+  ctx.attachments.set(key, paths);
+  return paths;
+}
+
+// The local path written next to every `[attachment: …]` marker adfToText left
+// in the description, so the agent reading the brief has the file, not a name.
+export function withAttachmentPaths(text: string, paths: AttachmentPaths): string {
+  return text.replace(/\[attachment: ([^\]]+)\]/g, (whole, name) => {
+    const path = paths[String(name).trim()];
+    return path ? `[attachment: ${String(name).trim()} -> ${path}]` : whole;
+  });
+}
+
+export function briefFor(issue: any, site: string, paths: AttachmentPaths = {}): string {
   const f = issue.fields ?? {};
-  const description = adfToText(f.description).trim();
+  const description = withAttachmentPaths(adfToText(f.description).trim(), paths);
   const attachments = (Array.isArray(f.attachment) ? f.attachment : [])
     .map((a: any) => ({ filename: String(a?.filename ?? "").trim(), content: String(a?.content ?? "").trim() }))
     .filter((a: { filename: string }) => !!a.filename);
+  const localCount = attachments.filter((a: { filename: string }) => paths[a.filename]).length;
   // An agent cannot guess a layout from prose when the answer is in a mockup, so
   // say plainly that one exists. Decided from the structured facts only — an
   // embedded image, a real attachment, or a URL that came out of a card or a
@@ -1318,10 +1415,15 @@ export function briefFor(issue: any, site: string): string {
     "",
     description || "(no description)",
     ...(attachments.length
-      ? ["", "Attachments:", ...attachments.map((a: { filename: string; content: string }) => `- ${a.filename}${a.content ? ` ${a.content}` : ""}`)]
+      ? ["", "Attachments:", ...attachments.map((a: { filename: string; content: string }) =>
+          `- ${a.filename}${a.content ? ` ${a.content}` : ""}${paths[a.filename] ? ` -> ${paths[a.filename]}` : ""}`)]
       : []),
     ...(visual
-      ? ["", "This ticket carries visual material. Look at it before you build: fetch the attachments above (Jira auth required), and render any Figma link with the Figma REST API or the repo's scripts/figma-frame.sh."]
+      ? ["", "This ticket carries visual material. Look at it before you build: " +
+          (localCount
+            ? "the attachments above are already downloaded, so Read them at the local paths shown"
+            : "fetch the attachments above (Jira auth required)") +
+          ", and render any Figma link with the Figma REST API or the repo's scripts/figma-frame.sh."]
       : []),
   ].join("\n");
 }
@@ -1996,6 +2098,7 @@ interface Ctx {
   exec: Exec; // reads the task's diff, to tell UI work from everything else
   model?: PlannerExec; // drafts the intent record for a newly imported ticket
   diffs: Map<string, TaskDiff>; // one diff read per task per cycle (see cycleDiff)
+  attachments: Map<string, AttachmentPaths>; // one attachment pass per issue per cycle
   log: (msg: string, err?: unknown) => void;
   projectScope?: boolean;
 }
@@ -2180,7 +2283,9 @@ async function reconcileIssue(ctx: Ctx, read: IssueRead, task: any): Promise<voi
 
   // ---- JIRA-owned fields always flow JIRA -> hive (hive never rewrites them)
   const title = titleFor(read.issue);
-  const brief = briefFor(read.issue, cfg.site);
+  // Attachments first: a new mockup on an existing ticket is a brief change, so
+  // it has to be on disk before the brief that names its path is written.
+  const brief = briefFor(read.issue, cfg.site, await downloadAttachments(ctx, key, read.issue));
   // Priority is one of those Jira-owned fields, and this is the ONLY place hive
   // writes it for a mirror — a fresh import reaches here on the same cycle
   // (importAndReconcile), so there is one rule and no second copy to drift.
@@ -3063,7 +3168,7 @@ export function receiptText(
 // worse than one whose sections were never mapped, so a failed model call still
 // writes the draft with the ticket text under "## Problem" (draftIntentBody
 // falls back on its own) and only a thrown error skips the record entirely.
-async function draftIssueIntent(ctx: Ctx, projectId: string, read: IssueRead, mirror: any): Promise<Intent | null> {
+async function draftIssueIntent(ctx: Ctx, projectId: string, read: IssueRead, mirror: any, paths: AttachmentPaths = {}): Promise<Intent | null> {
   const { db } = ctx;
   try {
     const repoPath = (db.query("SELECT repo_path FROM projects WHERE id = ?").get(projectId) as { repo_path: string | null } | undefined)?.repo_path ?? null;
@@ -3071,11 +3176,14 @@ async function draftIssueIntent(ctx: Ctx, projectId: string, read: IssueRead, mi
       db,
       {
         title: titleFor(read.issue),
-        description: adfToText(read.issue?.fields?.description).trim(),
+        description: withAttachmentPaths(adfToText(read.issue?.fields?.description).trim(), paths),
         comments: (read.comments ?? []).map((c: any) => ({
           author: String(c?.author?.displayName ?? c?.author?.accountId ?? "Jira"),
-          text: adfToText(c?.body).trim(),
+          text: withAttachmentPaths(adfToText(c?.body).trim(), paths),
         })),
+        // Deduped: the map is keyed by filename AND attachment id, so the same
+        // file is in it twice.
+        attachments: [...new Set(Object.values(paths))],
       },
       { model: ctx.model, repoPath }
     );
@@ -3111,11 +3219,14 @@ async function importAndReconcile(ctx: Ctx, projectId: string, read: IssueRead):
   const jiraState = jiraStatusToState(read.statusName);
   const id = newId();
   const t = now();
+  // Downloaded before the mirror row exists, so the very first brief — and the
+  // intent drafted below — already names the local mockup.
+  const paths = await downloadAttachments(ctx, read.key, read.issue);
   const task = mutateWithEvent(db, () => {
     db.query(
       `INSERT INTO tasks (id, project_id, title, brief, state, kind, source, source_ref, jira_key, jira_link_kind, created_at, updated_at)
        VALUES (?,?,?,?,?, 'ship', 'external', ?, ?, 'mirror', ?, ?)`
-    ).run(id, projectId, titleFor(read.issue), briefFor(read.issue, cfg.site), jiraState ?? "queued", ref, read.key, t, t);
+    ).run(id, projectId, titleFor(read.issue), briefFor(read.issue, cfg.site, paths), jiraState ?? "queued", ref, read.key, t, t);
     return getTask(db, id);
   }, {
     task_id: id,
@@ -3137,7 +3248,7 @@ async function importAndReconcile(ctx: Ctx, projectId: string, read: IssueRead):
   // task follows: the intent IS the record of the ask, and a project that keeps
   // a human in the filing loop still wants it. Drafted from the ticket's title,
   // description and every comment it arrived with.
-  const intent = await draftIssueIntent(ctx, projectId, read, task);
+  const intent = await draftIssueIntent(ctx, projectId, read, task, paths);
 
   // The work task, filed from the mirror row that was just written (HIVE-631).
   // Before reconcileIssue, not after: reconcileIssue pushes status and comments
@@ -3194,7 +3305,7 @@ export async function syncProjectOnce(
 ): Promise<SyncStats> {
   assertJiraTargetOwner(db, projectId, cfg);
   const log = deps.log ?? defaultLog;
-  const ctx: Ctx = { db, cfg, client, stats: emptyStats(), exec: deps.exec ?? defaultExec, model: deps.model, diffs: new Map(), log };
+  const ctx: Ctx = { db, cfg, client, stats: emptyStats(), exec: deps.exec ?? defaultExec, model: deps.model, diffs: new Map(), attachments: new Map(), log };
 
   const budgetMs = deps.budgetMs ?? jiraIntervalMs(deps) * CYCLE_BUDGET_MULTIPLIER;
   const deadline = Date.now() + budgetMs;

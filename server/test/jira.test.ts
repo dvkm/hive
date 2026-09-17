@@ -11,7 +11,7 @@
 //   * time moves BETWEEN calls (`onRead` fires per per-issue read, so a test can
 //     have a human move an issue mid-cycle).
 import { test, expect } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -54,7 +54,7 @@ interface FakeIssue {
   priority?: string | null; // Jira priority NAME; null = no priority set
   history?: { at: string; to: string }[]; // status transitions, oldest first
   rawHistory?: any[] | null;
-  attachments?: { id: string; filename: string }[];
+  attachments?: { id: string; filename: string; body?: string; mimeType?: string }[];
   comments?: { id?: string; author?: string; text?: string; created?: string; properties?: { key: string; value: unknown }[]; raw?: any }[];
 }
 
@@ -78,6 +78,7 @@ interface FakeOpts {
   missingComments?: string[];
   failCommentPosts?: number;
   failAttachmentPosts?: boolean;
+  failAttachmentReads?: boolean;
   rejectCommentPosts?: number;
   rejectCommentStatus?: number;
   commentPostResponse?: any;
@@ -126,6 +127,14 @@ function fakeJira(opts: FakeOpts) {
     if (path === "/rest/api/3/myself") {
       if (opts.myself === "fail") return new Response("boom", { status: 500 });
       return json(opts.myself === "missing" ? {} : { accountId: SELF });
+    }
+
+    const att = path.match(/^\/rest\/api\/3\/attachment\/content\/(.+)$/);
+    if (att) {
+      const found = [...byKey.values()].flatMap((i) => i.attachments).find((a) => a.id === decodeURIComponent(att[1]));
+      if (!found || found.body === undefined) return new Response("not found", { status: 404 });
+      if (opts.failAttachmentReads) return new Response("no permission", { status: 403 });
+      return new Response(found.body, { status: 200 });
     }
 
     if (path === "/rest/api/3/issue" && method === "POST") {
@@ -200,7 +209,12 @@ function fakeJira(opts: FakeOpts) {
             priority: iss.priority == null ? null : { name: iss.priority }, issuetype: { name: "Story" },
             project: iss.projectKey == null ? undefined : { key: iss.projectKey },
             parent: iss.parentKey ? { key: iss.parentKey } : null,
-            attachment: iss.attachments.map((a) => ({ id: a.id, filename: a.filename })),
+            // `content` is how real Jira hands over the bytes: an absolute URL
+            // on the same site, behind the same Basic auth.
+            attachment: iss.attachments.map((a) => ({
+              id: a.id, filename: a.filename,
+              ...(a.body === undefined ? {} : { content: `${SITE}/rest/api/3/attachment/content/${a.id}`, size: a.body.length, mimeType: a.mimeType ?? "image/png" }),
+            })),
           };
           for (const field of opts.omitIssueFields ?? []) delete fields[field];
           return json({ key, id: iss.id, fields, properties: iss.properties });
@@ -2214,6 +2228,81 @@ test("briefFor names the ticket's attachments and flags visual material", () => 
   expect(brief).toContain("- notes.txt");
   expect(brief).toContain("[attachment: mockup.png]");
   expect(brief).toContain("visual material");
+});
+
+// HIVE-643: WEB-163 carried three PNGs and the agent got three filenames. The
+// bytes are downloaded on import and the brief names the local path, so the
+// mockup is something an agent can open rather than something it is told about.
+test("intake downloads the ticket's attachments and the brief names the local paths", async () => {
+  const { db, projectId } = freshDb(CFG);
+  const f = fakeJira({
+    issues: [{
+      key: "WEB-163", id: "1", status: "To Do", summary: "탭 추가",
+      description: {
+        type: "doc", version: 1,
+        content: [
+          { type: "paragraph", content: [{ type: "text", text: "시안: 이미지 3" }] },
+          { type: "mediaSingle", content: [{ type: "media", attrs: { id: "a3", alt: "mockup.png" } }] },
+        ],
+      },
+      attachments: [
+        { id: "a1", filename: "current.png", body: "PNG-ONE" },
+        { id: "a2", filename: "home.png", body: "PNG-TWO" },
+        { id: "a3", filename: "mockup.png", body: "PNG-THREE" },
+      ],
+    }],
+  });
+  await run(db, projectId, f.fetchImpl);
+
+  const dir = join(HOME, "briefs", "attachments", "WEB-163");
+  expect(J.attachmentDir("WEB-163")).toBe(dir);
+  expect(readFileSync(join(dir, "current.png"), "utf8")).toBe("PNG-ONE");
+  expect(readFileSync(join(dir, "home.png"), "utf8")).toBe("PNG-TWO");
+  expect(readFileSync(join(dir, "mockup.png"), "utf8")).toBe("PNG-THREE");
+
+  const mirror = tasks(db).find((t) => t.jira_key === "WEB-163")!;
+  // The path rides next to the marker in the description AND in the list.
+  expect(mirror.brief).toContain(`[attachment: mockup.png -> ${join(dir, "mockup.png")}]`);
+  expect(mirror.brief).toContain(`-> ${join(dir, "current.png")}`);
+  expect(mirror.brief).toContain("Read them at the local paths shown");
+
+  // A second cycle re-reads the issue but not the bytes: the files are on disk
+  // with the size Jira reported, so only a NEW attachment costs a download.
+  const downloads = () => f.calls.filter((c) => c.path.startsWith("/rest/api/3/attachment/content/")).length;
+  expect(downloads()).toBe(3);
+  await run(db, projectId, f.fetchImpl);
+  expect(downloads()).toBe(3);
+
+  f.byKey.get("WEB-163")!.attachments.push({ id: "a4", filename: "later.png", body: "PNG-FOUR" });
+  await run(db, projectId, f.fetchImpl);
+  expect(downloads()).toBe(4);
+  expect(readFileSync(join(dir, "later.png"), "utf8")).toBe("PNG-FOUR");
+});
+
+test("an attachment hive cannot read is one log line, never a failed import", async () => {
+  const { db, projectId } = freshDb(CFG);
+  const logged: string[] = [];
+  const f = fakeJira({
+    failAttachmentReads: true,
+    issues: [{ key: "WEB-164", id: "2", status: "To Do", summary: "no permission", attachments: [{ id: "b1", filename: "secret.png", body: "X" }] }],
+  });
+  await run(db, projectId, f.fetchImpl, CFG, { log: (m: string) => logged.push(m) });
+
+  const mirror = tasks(db).find((t) => t.jira_key === "WEB-164")!;
+  expect(mirror).toBeTruthy();
+  expect(mirror.brief).toContain("- secret.png");
+  expect(mirror.brief).not.toContain("attachments/WEB-164");
+  expect(logged.filter((m) => m.includes("attachment download skipped")).length).toBe(1);
+});
+
+// A Jira filename is whatever the uploader typed. It is never joined onto a
+// path as-is.
+test("an attachment filename cannot escape the issue's own directory", () => {
+  expect(J.safeAttachmentName("../../../.ssh/authorized_keys")).toBe("authorized_keys");
+  expect(J.safeAttachmentName("a/b/c.png")).toBe("c.png");
+  expect(J.safeAttachmentName("..")).toBeNull();
+  expect(J.safeAttachmentName(".bashrc")).toBeNull();
+  expect(J.safeAttachmentName("  ")).toBeNull();
 });
 
 test("briefFor reads visual material off the structure, not the prose", () => {
