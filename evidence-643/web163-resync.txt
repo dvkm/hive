@@ -1,0 +1,18 @@
+Real WEB-163 read from https://corebeat.atlassian.net with the branch code (GETs only, scratch HIVE_HOME).
+
+total 6584
+-rw-r--r--@ 1 david  wheel   439038 Sep 16 19:49 image-20260917-013001.png
+-rw-r--r--@ 1 david  wheel  1168480 Sep 16 19:49 image-20260917-013009.png
+-rw-r--r--@ 1 david  wheel  1757090 Sep 16 19:49 image-20260917-013017.png
+
+/tmp/hive-643-NTri/briefs/attachments/WEB-163/image-20260917-013001.png: PNG image data, 3056 x 1916, 8-bit/color RGB, non-interlaced
+/tmp/hive-643-NTri/briefs/attachments/WEB-163/image-20260917-013009.png: PNG image data, 3041 x 1374, 8-bit/color RGB, non-interlaced
+/tmp/hive-643-NTri/briefs/attachments/WEB-163/image-20260917-013017.png: PNG image data, 1536 x 1024, 8-bit/color RGB, non-interlaced
+
+brief markers:
+[attachment: image-20260917-013001.png -> /tmp/hive-643-NTri/briefs/attachments/WEB-163/image-20260917-013001.png]
+[attachment: image-20260917-013009.png -> /tmp/hive-643-NTri/briefs/attachments/WEB-163/image-20260917-013009.png]
+[attachment: image-20260917-013017.png -> /tmp/hive-643-NTri/briefs/attachments/WEB-163/image-20260917-013017.png]
+- image-20260917-013001.png https://corebeat.atlassian.net/rest/api/3/attachment/content/10141 -> /tmp/hive-643-NTri/briefs/attachments/WEB-163/image-20260917-013001.png
+- image-20260917-013009.png https://corebeat.atlassian.net/rest/api/3/attachment/content/10142 -> /tmp/hive-643-NTri/briefs/attachments/WEB-163/image-20260917-013009.png
+- image-20260917-013017.png https://corebeat.atlassian.net/rest/api/3/attachment/content/10140 -> /tmp/hive-643-NTri/briefs/attachments/WEB-163/image-20260917-013017.png

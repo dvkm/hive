@@ -1,0 +1,19 @@
+820 |       throw new JiraHttpError(`jira ${init.method ?? "GET"} ${path} -> ${res.status} ${detail}`, res.status);
+                  ^
+error: jira GET /rest/api/3/issue/WEB-1/comment?startAt=0&maxResults=100&orderBy=created&expand=properties -> 500 nope
+ status: 500,
+
+      at call (/Users/david/.herdr/worktrees/hive/hive-fb73c1e51f74/server/src/intake/jira.ts:820:13)
+      at async json (/Users/david/.herdr/worktrees/hive/hive-fb73c1e51f74/server/src/intake/jira.ts:839:29)
+
+
+server/test/intents.test.ts:
+
+ 233 pass
+ 0 fail
+ 1200 expect() calls
+Ran 233 tests across 3 files. [4.34s]
+ 2175 pass
+ 0 fail
+ 1 snapshots, 8952 expect() calls
+Ran 2175 tests across 164 files. [38.62s]

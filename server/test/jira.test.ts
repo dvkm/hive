@@ -2256,14 +2256,14 @@ test("intake downloads the ticket's attachments and the brief names the local pa
 
   const dir = join(HOME, "briefs", "attachments", "WEB-163");
   expect(J.attachmentDir("WEB-163")).toBe(dir);
-  expect(readFileSync(join(dir, "current.png"), "utf8")).toBe("PNG-ONE");
-  expect(readFileSync(join(dir, "home.png"), "utf8")).toBe("PNG-TWO");
-  expect(readFileSync(join(dir, "mockup.png"), "utf8")).toBe("PNG-THREE");
+  expect(readFileSync(join(dir, "a1-current.png"), "utf8")).toBe("PNG-ONE");
+  expect(readFileSync(join(dir, "a2-home.png"), "utf8")).toBe("PNG-TWO");
+  expect(readFileSync(join(dir, "a3-mockup.png"), "utf8")).toBe("PNG-THREE");
 
   const mirror = tasks(db).find((t) => t.jira_key === "WEB-163")!;
   // The path rides next to the marker in the description AND in the list.
-  expect(mirror.brief).toContain(`[attachment: mockup.png -> ${join(dir, "mockup.png")}]`);
-  expect(mirror.brief).toContain(`-> ${join(dir, "current.png")}`);
+  expect(mirror.brief).toContain(`[attachment: mockup.png -> ${join(dir, "a3-mockup.png")}]`);
+  expect(mirror.brief).toContain(`-> ${join(dir, "a1-current.png")}`);
   expect(mirror.brief).toContain("Read them at the local paths shown");
 
   // A second cycle re-reads the issue but not the bytes: the files are on disk
@@ -2276,7 +2276,36 @@ test("intake downloads the ticket's attachments and the brief names the local pa
   f.byKey.get("WEB-163")!.attachments.push({ id: "a4", filename: "later.png", body: "PNG-FOUR" });
   await run(db, projectId, f.fetchImpl);
   expect(downloads()).toBe(4);
-  expect(readFileSync(join(dir, "later.png"), "utf8")).toBe("PNG-FOUR");
+  expect(readFileSync(join(dir, "a4-later.png"), "utf8")).toBe("PNG-FOUR");
+});
+
+// Two uploads can carry the same filename, and a revision can carry the same
+// name AND the same size. A per-name file would hand one attachment's bytes to
+// the other and skip the revision as already-downloaded, so the id is in the
+// local filename.
+test("same-named attachments get their own files and a same-size revision is downloaded", async () => {
+  const { db, projectId } = freshDb(CFG);
+  const f = fakeJira({
+    issues: [{
+      key: "WEB-165", id: "3", status: "To Do", summary: "revisions",
+      attachments: [
+        { id: "c1", filename: "mockup.png", body: "PNG-ONE" },
+        { id: "c2", filename: "mockup.png", body: "PNG-TWO" },
+      ],
+    }],
+  });
+  await run(db, projectId, f.fetchImpl);
+
+  const dir = join(HOME, "briefs", "attachments", "WEB-165");
+  expect(readFileSync(join(dir, "c1-mockup.png"), "utf8")).toBe("PNG-ONE");
+  expect(readFileSync(join(dir, "c2-mockup.png"), "utf8")).toBe("PNG-TWO");
+
+  const downloads = () => f.calls.filter((c) => c.path.startsWith("/rest/api/3/attachment/content/")).length;
+  expect(downloads()).toBe(2);
+  f.byKey.get("WEB-165")!.attachments.push({ id: "c3", filename: "mockup.png", body: "PNG-SIX" });
+  await run(db, projectId, f.fetchImpl);
+  expect(downloads()).toBe(3);
+  expect(readFileSync(join(dir, "c3-mockup.png"), "utf8")).toBe("PNG-SIX");
 });
 
 test("an attachment hive cannot read is one log line, never a failed import", async () => {

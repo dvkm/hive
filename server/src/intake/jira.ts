@@ -1359,7 +1359,12 @@ export async function downloadAttachments(ctx: Ctx, key: string, issue: any): Pr
     if (!(mime ? ATTACHMENT_MIME.test(mime) : ATTACHMENT_EXT.test(name))) continue;
     const size = Number(a?.size);
     if (Number.isFinite(size) && size > ATTACHMENT_MAX_BYTES) continue;
-    const path = join(dir, name);
+    // The attachment id goes in the LOCAL filename, not just the map key: two
+    // attachments can share a filename, and a revision can share the name AND
+    // the size Jira reports, so a per-name file would serve one attachment's
+    // bytes for the other and skip the revision as already downloaded.
+    const id = a?.id == null ? "" : String(a.id).replace(/[^A-Za-z0-9_-]/g, "").slice(0, 40);
+    const path = join(dir, id ? `${id}-${name}` : name);
     const have = existsSync(path) && (!Number.isFinite(size) || statSync(path).size === size);
     if (!have) {
       try {
@@ -1372,8 +1377,10 @@ export async function downloadAttachments(ctx: Ctx, key: string, issue: any): Pr
         continue;
       }
     }
+    // A marker that carries only the name cannot say WHICH upload it meant, so
+    // the last attachment with that name wins: the newest revision.
     paths[name] = path;
-    if (a?.id != null) paths[String(a.id)] = path;
+    if (id) paths[id] = path;
   }
   if (failed) ctx.log(`[hive] jira ${key}: attachment download skipped (${failed})`);
   ctx.attachments.set(key, paths);
