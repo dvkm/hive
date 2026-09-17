@@ -82,8 +82,106 @@ const DEFAULT_ARGV = [claudeBin(), "-p", NO_CUSTOMIZATIONS, "--model", "sonnet"]
 // default implementation kills the process on timeout (hard cap, no runaway).
 export type PlannerExec = (
   argv: string[],
-  opts: { timeoutMs: number; cwd?: string; env?: Record<string, string> }
+  opts: { timeoutMs: number; cwd?: string; env?: Record<string, string>; taskId?: string; site?: string }
 ) => Promise<{ code: number; stdout: string; stderr: string; timedOut?: boolean }>;
+
+// ------------------------------------------------------- one-shot spend
+// Every server-side model call (reviewer, drift, planCritic, triage, intentDraft,
+// explain, playbook, explainDiff, planner, intentInvestigate…) runs through
+// defaultPlannerExec, and the `--output-format json` envelope it throws away
+// carries the tokens and the cost. Read them once here, so the one-shot spend is
+// visible without touching 14 call sites.
+export interface ModelUsageRow {
+  taskId?: string;
+  site?: string;
+  model: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  cost_usd: number | null;
+}
+
+// Pull usage out of a `claude -p` result. Whole-stdout JSON first; with
+// --output-format stream-json the envelope is the final line.
+export function parseUsageEnvelope(stdout: string, argv: string[] = []): ModelUsageRow | null {
+  const text = (stdout ?? "").trim();
+  if (!text) return null;
+  const int = (v: any) => {
+    const n = Math.round(Number(v));
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  };
+  const mi = argv.indexOf("--model");
+  const argvModel = mi >= 0 ? argv[mi + 1] : undefined;
+  for (const c of [text, text.split("\n").filter((l) => l.trim()).pop() ?? ""]) {
+    let env: any;
+    try {
+      env = JSON.parse(c);
+    } catch {
+      continue;
+    }
+    const u = env?.usage;
+    if (!u || typeof u !== "object") continue;
+    const cost = Number(env.total_cost_usd);
+    return {
+      model: Object.keys(env.modelUsage ?? {})[0] || argvModel || "unknown",
+      input_tokens: int(u.input_tokens),
+      output_tokens: int(u.output_tokens),
+      cache_read_tokens: int(u.cache_read_input_tokens),
+      cache_write_tokens: int(u.cache_creation_input_tokens),
+      cost_usd: Number.isFinite(cost) ? cost : null,
+    };
+  }
+  return null;
+}
+
+// ponytail: in-memory ring, no table for the un-attributed rows. A call with no
+// task id has nowhere to go (usage.task_id is NOT NULL, FK to tasks), so it is
+// logged and kept for a debug endpoint; add persistence when someone needs it
+// across restarts.
+const RING_MAX = 200;
+const usageRing: (ModelUsageRow & { ts: string })[] = [];
+let usageSink: ((row: ModelUsageRow) => void) | null = null;
+
+export function setUsageSink(fn: ((row: ModelUsageRow) => void) | null): void {
+  usageSink = fn;
+}
+
+export function lastModelUsage(n = 50): (ModelUsageRow & { ts: string })[] {
+  return usageRing.slice(-n);
+}
+
+export function recordModelUsage(row: ModelUsageRow): void {
+  usageRing.push({ ...row, ts: now() });
+  if (usageRing.length > RING_MAX) usageRing.splice(0, usageRing.length - RING_MAX);
+  console.error(
+    `[hive] model usage site=${row.site ?? "-"} task=${row.taskId ?? "-"} model=${row.model} in=${row.input_tokens} out=${row.output_tokens} cache_r=${row.cache_read_tokens} cache_w=${row.cache_write_tokens} cost=${row.cost_usd ?? "-"}`
+  );
+  try {
+    usageSink?.(row);
+  } catch (e) {
+    console.error("[hive] model usage sink:", e);
+  }
+}
+
+// The db-backed sink index.ts registers. No-op without a task id: the FK.
+export function insertOneshotUsage(db: DB, row: ModelUsageRow): void {
+  if (!row.taskId) return;
+  db.query(
+    `INSERT INTO usage (id, task_id, ts, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, source)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'server_oneshot')`
+  ).run(
+    newId("use"),
+    row.taskId,
+    now(),
+    row.model,
+    row.input_tokens,
+    row.output_tokens,
+    row.cache_read_tokens,
+    row.cache_write_tokens,
+    row.cost_usd
+  );
+}
 
 // Pick the env a `claude -p` subprocess runs with.
 //
@@ -125,6 +223,10 @@ export const defaultPlannerExec: PlannerExec = async (argv, opts) => {
       new Response(proc.stderr).text(),
       proc.exited,
     ]);
+    if (code === 0) {
+      const usage = parseUsageEnvelope(stdout, argv);
+      if (usage) recordModelUsage({ ...usage, taskId: opts.taskId, site: opts.site });
+    }
     return { code, stdout, stderr, timedOut };
   } finally {
     clearTimeout(timer);
