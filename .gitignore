@@ -13,3 +13,6 @@ web/dist
 
 # graft's local graph cache — regenerable, not committed (run `graft build`).
 /graft/
+
+# per-task scratch evidence, attached through the hive API, never committed
+evidence-*/
