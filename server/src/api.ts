@@ -4568,9 +4568,11 @@ export async function spawnAgent(
       model: modelForTask(config, task.kind),
       agentMcp: config?.agent_mcp === "inherit" ? "inherit" : "none",
       agentArgv: agentArgvFor(config, task.kind, brief),
-      // Per-project driver switch (phase 1: claude over stream-json, no pane).
-      // config.agent_argv overrides are pane-only and are ignored on the protocol driver.
-      driver: agent === "claude" && config.agent_driver === "protocol" ? "protocol" : "pane",
+      // Per-project driver switch: no pane, the agent's own JSON stream instead.
+      // Claude takes config.agent_argv overrides on the pane path only; codex's
+      // protocol runtime uses the same argv, with `exec --json` spliced in.
+      agent,
+      driver: config.agent_driver === "protocol" ? "protocol" : "pane",
       // Seed the worktree BEFORE the agent starts: agent hook wiring
       // (structural Stop/SubagentStop/PostToolUse reporting), then the
       // per-project spawn hook (config.setup_argv, e.g. wt.sh up {worktree}) so
