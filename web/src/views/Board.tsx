@@ -172,7 +172,7 @@ export function Card({ task }: { task: Task }) {
         {/* The column holds every task in review; the chip says whether it is
             the director's turn or what still holds it (a confirmed risk sat
             under "Ready to Merge" before this). */}
-        {task.state === "in_review" && task.review_gate && REVIEW_GATE_CHIP[task.review_gate] && (
+        {task.state === "in_review" && !trackingOnly && task.review_gate && REVIEW_GATE_CHIP[task.review_gate] && (
           <span className={REVIEW_GATE_CHIP[task.review_gate]!.className} title={REVIEW_GATE_CHIP[task.review_gate]!.title}>
             {REVIEW_GATE_CHIP[task.review_gate]!.label}
           </span>
