@@ -1127,9 +1127,20 @@ export function reviewActionable(
     // A null or 'unavailable' rollup means a repo (or check run) that never
     // reports, and holding the review there would hide mergeable work forever.
     if (task.ci_status === "failing" || task.ci_status === "pending") return false;
-    return reviewPipelineSettled(db, task);
+    // A confirmed risk on this head is the agent's to clear (the land queue
+    // holds it and the review card says so); it is not the director's yet.
+    return reviewPipelineSettled(db, task) && confirmedRisks(db, task.id, task.head_sha).length === 0;
   }
   return hasDirectorReport(db, task.id);
+}
+
+function hasConfirmedRisk(raw: string): boolean {
+  try {
+    const p = JSON.parse(raw);
+    return Array.isArray(p?.verdicts) && p.verdicts.some((v: any) => v?.verdict === "confirmed");
+  } catch {
+    return false;
+  }
 }
 
 export interface ReviewActionableTask {
@@ -1210,7 +1221,7 @@ export function reviewActionableBatch(db: DB, tasks: ReviewActionableTask[]): Se
   const floors = recheckFloors(db, ids);
   const verdictRows = new Map<string, { rid: number; payload: string }[]>();
   for (const row of db
-    .query(`SELECT rowid AS rid, task_id, payload FROM events WHERE type = 'risk_verdicts' AND task_id IN (${ph})`)
+    .query(`SELECT rowid AS rid, task_id, payload FROM events WHERE type = 'risk_verdicts' AND task_id IN (${ph}) ORDER BY ts DESC, rowid DESC`)
     .all(...ids) as { rid: number; task_id: string; payload: string }[]) {
     const list = verdictRows.get(row.task_id);
     if (list) list.push({ rid: row.rid, payload: row.payload });
@@ -1225,11 +1236,22 @@ export function reviewActionableBatch(db: DB, tasks: ReviewActionableTask[]): Se
       actionable.add(t.id);
       continue;
     }
-    const rows = verdictRows.get(t.id) ?? [];
-    if (rows.some((r) => !setAside(floors, t.id, t.head_sha, r.rid) && coversReview(r.payload, t.head_sha!, expected)))
-      actionable.add(t.id);
+    const rows = (verdictRows.get(t.id) ?? []).filter((r) => !setAside(floors, t.id, t.head_sha, r.rid));
+    if (!rows.some((r) => coversReview(r.payload, t.head_sha!, expected))) continue;
+    // Newest verdicts for this head, the row riskVerdictsFor reads: a confirmed
+    // risk there keeps the review with the agent.
+    const newest = rows.find((r) => headOf(r.payload) === t.head_sha);
+    if (!newest || !hasConfirmedRisk(newest.payload)) actionable.add(t.id);
   }
   return actionable;
+}
+
+function headOf(raw: string): unknown {
+  try {
+    return JSON.parse(raw)?.reviewed_head_sha;
+  } catch {
+    return null;
+  }
 }
 
 // Something the director can actually read: the agent's own review summary, or
