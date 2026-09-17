@@ -120,6 +120,8 @@ export interface CardText {
 
 export interface CardClass {
   risk: RiskLevel;
+  /** Jev's continuous risk score (0 low … 3 high); null on the regex path. */
+  risk_score: number | null;
   blast: BlastRadius;
   reversible: boolean;
   needs_input: boolean;
@@ -151,6 +153,7 @@ export function classifyCardTextSync(c: CardText): CardClass {
   const blastText = String(c.blast_radius ?? "").trim() || prose;
   return {
     risk: riskLevel(c.risk),
+    risk_score: null,
     blast: PROD_RE.test(blastText) ? "prod" : SHARED_RE.test(blastText) ? "shared" : "local",
     reversible: !IRREVERSIBLE_RE.test(prose),
     needs_input: cardOptions(c).some(optionNeedsDirectorInput),
@@ -209,6 +212,7 @@ export async function classifyCardText(
   const inp = noul(j.answers.needs_input);
   const ts: Omit<CardClass, "shadow"> = {
     risk: RISK_ORDER[Math.min(RISK_ORDER.length - 1, Math.max(0, Math.round(s ?? 3)))] ?? base.risk,
+    risk_score: s,
     blast: BLAST_ORDER.includes(b as BlastRadius) ? (b as BlastRadius) : base.blast,
     reversible: rev == null ? base.reversible : rev >= 0.5,
     needs_input: inp == null ? base.needs_input : inp >= 0.5,
@@ -225,6 +229,7 @@ export async function classifyCardText(
     rank(ts.risk) > rank(base.risk) ? ts.risk : base.risk === "high" && riskUnparseable(c.risk) ? ts.risk : base.risk;
   return {
     risk,
+    risk_score: ts.risk_score,
     blast: BLAST_ORDER.indexOf(ts.blast) > BLAST_ORDER.indexOf(base.blast) ? ts.blast : base.blast,
     reversible: base.reversible && ts.reversible,
     needs_input: base.needs_input || ts.needs_input,

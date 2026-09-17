@@ -22,7 +22,7 @@ import { getTask, writeEvent } from "./state.ts";
 import { broadcast } from "./bus.ts";
 import { getIntent, intentSection, openQuestions, INTENT_SECTIONS, type Intent } from "./intents.ts";
 import { DEFAULT_OPEN_QUESTION, renderIntentBody, sourceText, type IntentSourceText } from "./intentDraft.ts";
-import { judge as typesafeJudge, noul, typesafeMode, type Question } from "./typesafe.ts";
+import { judge as typesafeJudge, noul, typesafeSettings, type Question } from "./typesafe.ts";
 import { claudeBin, defaultPlannerExec, parseModelJson, type PlannerExec } from "./planner.ts";
 import { claudeProfileEnvForRepo } from "./claudeProfiles.ts";
 import { modelFailure, noteModelCall } from "./modelCall.ts";
@@ -39,8 +39,8 @@ export const READ_ONLY_TOOLS = ["Read", "Grep", "Glob", "Bash(graft:*)", "Bash(g
 
 // A draft the investigator emptied of questions was emptied by the same model
 // that rewrote it. Before hive accepts on that word alone, a typed second
-// opinion says whether anything is still a person's call. >= this is "yes".
-const NEEDS_PERSON = 0.5;
+// opinion says whether anything is still a person's call. At or above the
+// project's `config.typesafe.needs_person_at` the answer is "yes".
 
 const NEEDS_PERSON_Q: Record<string, Question> = {
   needs_person: {
@@ -224,7 +224,11 @@ async function investigateIntent(db: DB, intent: Intent, deps: InvestigatorDeps)
       type: "intent_investigated",
       payload: { intent_id: intent.id, model, ms: Date.now() - started, ...payload },
     });
-  const repoPath = (db.query("SELECT repo_path FROM projects WHERE id = ?").get(intent.project_id) as { repo_path: string | null } | undefined)?.repo_path;
+  const project = db.query("SELECT repo_path, config FROM projects WHERE id = ?").get(intent.project_id) as
+    | { repo_path: string | null; config: string | null }
+    | undefined;
+  const repoPath = project?.repo_path;
+  const typesafeCfg = typesafeSettings(JSON.parse(project?.config ?? "{}"));
   if (!repoPath || !existsSync(repoPath)) {
     record({ error: "project has no checkout to investigate in" });
     return;
@@ -268,7 +272,7 @@ async function investigateIntent(db: DB, intent: Intent, deps: InvestigatorDeps)
   // Nothing left to ask, per the model that just rewrote the draft. Get an
   // independent read before hive accepts on its own say-so.
   let typesafe: { needs_person: number; model: string; ms: number } | undefined;
-  const mode = typesafeMode();
+  const mode = typesafeCfg.mode;
   if (after.length === 0 && mode !== "off") {
     const state = {
       request: src ? sourceText(src) : "",
@@ -281,7 +285,7 @@ async function investigateIntent(db: DB, intent: Intent, deps: InvestigatorDeps)
       typesafe = { needs_person: p, model: j.model, ms: j.ms };
       // Shadow only records; enforce holds the draft in the inbox with the
       // question every draft carries by default.
-      if (mode === "enforce" && p >= NEEDS_PERSON) {
+      if (mode === "enforce" && p >= typesafeCfg.thresholds.needs_person_at) {
         body = investigatedBody({ ...inv, open_questions: [...(inv.open_questions ?? []), DEFAULT_OPEN_QUESTION] }, current.body_md);
         after = openQuestions(body);
       }

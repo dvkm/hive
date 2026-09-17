@@ -122,6 +122,7 @@ import { startRace, raceView, pickWinner, resolveRaceForDecision } from "./race.
 import { resolveScopeDriftForDecision } from "./drift.ts";
 import { evaluateAutoApprove, evaluateAutopilotApprove, riskLevel, NO_AUTO_ANSWER_REASON } from "./autoapprove.ts";
 import { classifyCardText } from "./policy.ts";
+import { typesafeSettings } from "./typesafe.ts";
 import { decisionAnswerTokenOk, vapidPublicKey, saveSubscription, removeSubscription, type PushSub } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
 import { confirmedRisks, unfinishedRiskCheck, cautionCleared, latestAutoReviewVerdict, reviewPipelineSettled, livePrHead } from "./reviewer.ts";
@@ -9030,7 +9031,12 @@ export async function apiAutoAnswerDecision(db: DB, herdr: Herdr, id: string, bo
     return json({ effect: "escalate", category: "autonomy", reason: "project autonomy is conservative; decision requires the director" }, 403);
   }
 
-  const verdict = evaluateAutoApprove(db, r, answerKey, await classifyCardText(r));
+  const typesafeCfg = typesafeSettings(
+    JSON.parse(
+      ((db.query("SELECT config FROM projects WHERE id = ?").get(task?.project_id ?? "") as { config: string | null } | undefined)?.config) ?? "{}"
+    )
+  );
+  const verdict = evaluateAutoApprove(db, r, answerKey, await classifyCardText(r), { riskMax: typesafeCfg.thresholds.risk_max });
   const typesafe = verdict.typesafe_shadow ?? null;
   if (!verdict.allow) {
     writeEvent(db, {

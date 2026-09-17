@@ -333,3 +333,77 @@ test("shadow mode hands the caller a typesafe_shadow to log on its existing even
   expect(v.allow).toBe(false); // shadow changes no decision
   expect(v.typesafe_shadow).toMatchObject({ risk: "high", blast: "prod", source: "typesafe" });
 });
+
+// ---- the configurable numeric risk bar --------------------------------------
+
+const jevFetch = (score: number) =>
+  (async () =>
+    new Response(
+      JSON.stringify({
+        model: "jev-test",
+        answers: {
+          risk: { type: "score", score, legend: {}, probabilities: {}, confidence: 1 },
+          blast: { type: "choice", choice: "local", probabilities: {}, confidence: 1 },
+          reversible: { type: "noul", noul: 1 },
+          needs_input: { type: "noul", noul: 0 },
+        },
+        usage: { input_tokens: 1, output_tokens: 1 },
+      })
+    )) as any;
+
+test("risk_max lets a low-scored prose-risk card through, and still refuses a high-scored one", async () => {
+  const { classifyCardText } = await import("../src/policy.ts");
+  const env = { TYPESAFE_API_KEY: "k", HIVE_TYPESAFE_MODE: "enforce" } as any;
+  const id = seedDecision({
+    title: "Save recurring link as a project reference? https://x.io",
+    risk: "worst case the link rots and someone edits it",
+    options: [REC("save")],
+  });
+  const row = db.query("SELECT * FROM decisions WHERE id=?").get(id);
+
+  const lowCls = await classifyCardText(row as any, { env, fetch: jevFetch(1.2) });
+  expect(lowCls).toMatchObject({ source: "typesafe", risk_score: 1.2 });
+  expect(evaluateAutoApprove(db, row, "save", lowCls, { riskMax: 1.5 })).toMatchObject({ allow: true, category: "ref_capture" });
+  // Without a configured ceiling the explicit low/normal text bar still rules.
+  expect(evaluateAutoApprove(db, row, "save", lowCls).allow).toBe(false);
+
+  const highCls = await classifyCardText(row as any, { env, fetch: jevFetch(2.5) });
+  expect(highCls.risk_score).toBe(2.5);
+  expect(evaluateAutoApprove(db, row, "save", highCls, { riskMax: 1.5 }).allow).toBe(false);
+});
+
+// Nothing a project writes into config.typesafe reaches Jev without a key in
+// the server env: both runs give the same response and fetch is never called.
+test("without TYPESAFE_API_KEY a project config.typesafe=enforce changes nothing", async () => {
+  const key = process.env.TYPESAFE_API_KEY, mode = process.env.HIVE_TYPESAFE_MODE;
+  delete process.env.TYPESAFE_API_KEY;
+  delete process.env.HIVE_TYPESAFE_MODE;
+  const realFetch = globalThis.fetch;
+  let fetched = 0;
+  globalThis.fetch = (async (...a: any[]) => {
+    fetched++;
+    return realFetch(...(a as [any]));
+  }) as any;
+  try {
+    const run = async (config: Record<string, unknown>) => {
+      db.query("UPDATE projects SET config = ? WHERE id = ?").run(JSON.stringify(config), projectId);
+      const d = createDecision(db, {
+        task_id: taskId,
+        title: "Task #12 passed its cost cap ($5) — wrap up or keep spending?",
+        risk: "worst case the link rots and someone edits it",
+        options: [{ key: "wrap_up", label: "Wrap up", recommended: true }, { key: "continue", label: "continue" }],
+      });
+      const res = await apiAutoAnswerDecision(db, herdr as any, d.id, { answer_key: "wrap_up" });
+      return { status: res.status, body: await res.json(), state: (db.query("SELECT status FROM decisions WHERE id=?").get(d.id) as any).status };
+    };
+    const off = await run({});
+    const enforce = await run({ typesafe: { mode: "enforce", risk_max: 3 } });
+    expect(fetched).toBe(0);
+    expect(enforce).toEqual(off);
+  } finally {
+    globalThis.fetch = realFetch;
+    db.query("UPDATE projects SET config = '{}' WHERE id = ?").run(projectId);
+    if (key !== undefined) process.env.TYPESAFE_API_KEY = key;
+    if (mode !== undefined) process.env.HIVE_TYPESAFE_MODE = mode;
+  }
+});

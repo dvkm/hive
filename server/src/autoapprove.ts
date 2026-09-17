@@ -74,7 +74,12 @@ function isStaleAgentDialog(db: DB, decisionId: string): boolean {
 // nothing and get the regex baseline; an ALREADY-async caller can await
 // policy.classifyCardText(d) first and hand the result in, which is how the Jev
 // judgment reaches this bar without turning a sync hot path async.
-function safetyBar(db: DB, d: any, answerKey: string, cls?: CardClass): AutoApproveVerdict | null {
+export interface AutoApproveOpts {
+  /** project `config.typesafe.risk_max`: the Jev risk score a card may carry and still clear the risk-text bar. */
+  riskMax?: number | null;
+}
+
+function safetyBar(db: DB, d: any, answerKey: string, cls?: CardClass, opts?: AutoApproveOpts): AutoApproveVerdict | null {
   const options: any[] = Array.isArray(d.options) ? d.options : JSON.parse(d.options || "[]");
   const chosen = options.find((o) => o.key === answerKey);
   const c = cls ?? classifyCardTextSync(d);
@@ -96,17 +101,25 @@ function safetyBar(db: DB, d: any, answerKey: string, cls?: CardClass): AutoAppr
   // Stricter than riskLevel() on purpose: this bar wants an EXPLICIT low/normal
   // rating, so an unrated (null) card escalates rather than inheriting the
   // "normal" default. Prose like "high — leaked prod key" fails it too.
+  //
+  // A project that set `typesafe.risk_max` gets a second way past THIS check
+  // only: Jev's numeric score, on the enforce path (source "typesafe"), at or
+  // under the configured ceiling. Shadow never reaches here (its class stays
+  // source "regex"), and every other refusal below is untouched.
   const risk = String(d.risk ?? "").toLowerCase();
-  if (risk !== "low" && risk !== "normal") return no("*", `risk '${d.risk ?? "(none)"}' is above the auto-approve bar`);
+  const scoreOk =
+    c.source === "typesafe" && opts?.riskMax != null && c.risk_score != null && c.risk_score <= opts.riskMax;
+  if (risk !== "low" && risk !== "normal" && !scoreOk)
+    return no("*", `risk '${d.risk ?? "(none)"}' is above the auto-approve bar`);
   if (c.blast !== "local") return no("*", "prod/shared blast radius — always the director's call");
   return null;
 }
 
 // `d` is a raw decisions row (options is a JSON string) OR a parsed decision
 // (options is an array) — handle both so callers don't have to normalize.
-export function evaluateAutoApprove(db: DB, d: any, answerKey: string, cls?: CardClass): AutoApproveVerdict {
+export function evaluateAutoApprove(db: DB, d: any, answerKey: string, cls?: CardClass, opts?: AutoApproveOpts): AutoApproveVerdict {
   const no = (category: string, reason: string): AutoApproveVerdict => ({ allow: false, category, reason, typesafe_shadow: cls?.shadow });
-  const blocked = safetyBar(db, d, answerKey, cls);
+  const blocked = safetyBar(db, d, answerKey, cls, opts);
   if (blocked) return blocked;
 
   // Refusing an unexecuted guarded command is fail-closed. Let the supervisor
@@ -137,8 +150,8 @@ export function evaluateAutoApprove(db: DB, d: any, answerKey: string, cls?: Car
 
 // Autopilot may resolve an uncategorized technical decision, but it still must
 // clear the same structural risk bar as the closed balanced allow-list.
-export function evaluateAutopilotApprove(db: DB, d: any, answerKey: string, cls?: CardClass): AutoApproveVerdict {
-  return safetyBar(db, d, answerKey, cls) ?? {
+export function evaluateAutopilotApprove(db: DB, d: any, answerKey: string, cls?: CardClass, opts?: AutoApproveOpts): AutoApproveVerdict {
+  return safetyBar(db, d, answerKey, cls, opts) ?? {
     allow: true,
     category: "autopilot_reasoned",
     reason: "recommended low/normal-risk choice with no authority or production blast radius",

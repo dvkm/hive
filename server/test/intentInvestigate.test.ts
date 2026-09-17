@@ -203,6 +203,48 @@ test("a null judgment fails open: enforce accepts exactly as today", async () =>
   expect(f.events()[0].typesafe).toBeUndefined();
 });
 
+const setConfig = (f: ReturnType<typeof fixture>, config: Record<string, unknown>) =>
+  f.db.query("UPDATE projects SET config = ? WHERE id = 'proj'").run(JSON.stringify(config));
+
+// Nothing a project writes into config.typesafe reaches Jev without a key in
+// the server env: both runs produce the same outcome and the judge never runs.
+test("without TYPESAFE_API_KEY a project config.typesafe=enforce changes nothing", async () => {
+  let judged = 0;
+  const spy = (async () => {
+    judged++;
+    return judgeStub(0.9)();
+  }) as any;
+  const run = async (config: Record<string, unknown>) => {
+    const f = fixture();
+    setConfig(f, config);
+    await investigateOnce(f.db, { exec: f.stub(() => ({ code: 0, stdout: answered })), accept: f.accept, judge: spy });
+    const after = getIntent(f.db, f.intent.id)!;
+    return { status: after.status, questions: openQuestions(after.body_md), event: f.events()[0] };
+  };
+  const off = await run({});
+  const enforce = await run({ typesafe: { mode: "enforce", needs_person_at: 0.1 } });
+  expect(judged).toBe(0);
+  expect(enforce.status).toBe(off.status);
+  expect(enforce.questions).toEqual(off.questions);
+  expect(enforce.event.typesafe).toBeUndefined();
+  expect(off.event.typesafe).toBeUndefined();
+});
+
+test("a project needs_person_at holds a draft the default threshold would accept", async () => {
+  const held = fixture();
+  setConfig(held, { typesafe: { needs_person_at: 0.3 } });
+  await withMode("enforce", () =>
+    investigateOnce(held.db, { exec: held.stub(() => ({ code: 0, stdout: answered })), accept: held.accept, judge: judgeStub(0.35) as any })
+  );
+  expect(getIntent(held.db, held.intent.id)!.status).toBe("draft");
+
+  const dflt = fixture();
+  await withMode("enforce", () =>
+    investigateOnce(dflt.db, { exec: dflt.stub(() => ({ code: 0, stdout: answered })), accept: dflt.accept, judge: judgeStub(0.35) as any })
+  );
+  expect(getIntent(dflt.db, dflt.intent.id)!.status).toBe("accepted");
+});
+
 test("argv pins the read-only tool list and the JSON envelope", () => {
   const argv = investigateArgv("look", "sonnet");
   expect(argv.slice(1, 6)).toEqual(["-p", "--model", "sonnet", "look", "--output-format"]);

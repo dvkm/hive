@@ -24,7 +24,7 @@ import { supervisedSql } from "./supervision.ts";
 import { PLAIN_ENGLISH } from "./plainEnglish.ts";
 import { parseUnifiedDiff } from "./diff.ts";
 import { startLoop } from "./loop.ts";
-import { judge, noul, typesafeMode, type Question } from "./typesafe.ts";
+import { judge, noul, typesafeSettings, type Question } from "./typesafe.ts";
 
 const TIMEOUT_MS = Number(process.env.HIVE_REVIEWER_TIMEOUT_MS || 180_000);
 // How many tasks one pass reviews at the same time. One-at-a-time made the
@@ -595,8 +595,9 @@ export interface QuestionVerdict {
 // refuted risk are re-checked by a human reading the card. A question does not:
 // "machine" CLEARS a merge veto, and the opus prompt's own rule is "if you are
 // unsure, say human" — so Jev may only push a question TOWARDS the human.
-const TYPESAFE_REFUTE_AT = 0.05;
-const TYPESAFE_CONFIRM_AT = 0.95;
+//
+// Both cut-offs come from the project's `config.typesafe` (refute_at /
+// confirm_at), resolved once per verification run.
 
 const RISK_JEV: Record<string, Question> = {
   risk_real: {
@@ -1022,7 +1023,10 @@ async function runVerification(
     ...todoRisks.map((risk) => ({ kind: "risk" as const, text: risk, prompt: verifyPrompt(task, risk, input.diff, settled) })),
     ...todoQuestions.map((q) => ({ kind: "question" as const, text: q, prompt: answerPrompt(task, q, input.diff, evidenceBlock(evidence, QUESTION_USE_EVIDENCE)) })),
   ];
-  const mode = typesafeMode();
+  const projectConfig = JSON.parse(
+    ((db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id) as { config: string | null } | undefined)?.config) ?? "{}"
+  );
+  const { mode, thresholds } = typesafeSettings(projectConfig);
   const judgeFn = deps.judge ?? judge;
   const jevState = (job: { kind: "risk" | "question"; text: string }) => ({
     task: { number: task.number, title: task.title },
@@ -1044,9 +1048,9 @@ async function runVerification(
     const p = pre ? noul(pre.answers[job.kind === "risk" ? "risk_real" : "answerable_by_code"]) : null;
     const typesafe: TypesafeNote | undefined = pre ? { p, model: pre.model, ms: pre.ms } : undefined;
     if (mode === "enforce" && p !== null) {
-      if (job.kind === "risk" && (p <= TYPESAFE_REFUTE_AT || p >= TYPESAFE_CONFIRM_AT))
-        return { job, value: { verdict: p <= TYPESAFE_REFUTE_AT ? "refuted" : "confirmed", why: `typesafe p=${p}`, typesafe } as any };
-      if (job.kind === "question" && p <= TYPESAFE_REFUTE_AT)
+      if (job.kind === "risk" && (p <= thresholds.refute_at || p >= thresholds.confirm_at))
+        return { job, value: { verdict: p <= thresholds.refute_at ? "refuted" : "confirmed", why: `typesafe p=${p}`, typesafe } as any };
+      if (job.kind === "question" && p <= thresholds.refute_at)
         return { job, value: { answerable: "human", answer: `typesafe p=${p}`, typesafe } as any };
     }
     const res = await run(job.prompt);
