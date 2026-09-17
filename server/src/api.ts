@@ -57,7 +57,7 @@ import {
 import { Herdr, herdr as defaultHerdr, sendFailure, isHerdrUnreachable, HerdrError, heldNameRetryAt } from "./runtime/herdr.ts";
 import { queuedSteers, markSteersDelivered, resumeReviewForDeliveredSteers, steerPreamble, queueSteerEvent, type Delivery } from "./steer.ts";
 import { cleanupTask, runStackCmd } from "./cleanup.ts";
-import { seedWorktree, type SeedResult } from "./worktreeSeed.ts";
+import { seedWorktree, excludeGraftIgnore, type SeedResult } from "./worktreeSeed.ts";
 import {
   INTENT_SECTIONS,
   INTENT_SOURCES,
@@ -4616,6 +4616,10 @@ export async function spawnAgent(
             type: built.code === 0 ? "graft_built" : "graft_build_failed",
             payload: { ms: Date.now() - graftStarted, ...(built.code === 0 ? {} : { error: (built.stderr || built.stdout).trim().slice(-300) }) },
           });
+          // HIVE-649: graft's untracked .ignore otherwise rides an agent's
+          // `git add -A` straight into scope creep. Best-effort like the rest
+          // of this step.
+          await excludeGraftIgnore(worktreePath, opts.exec ?? defaultExec);
         }
         // A project with no seed config at all is the deliberate default and stays
         // quiet. A project that NAMED something we could not find is a different
