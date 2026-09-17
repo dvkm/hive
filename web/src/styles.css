@@ -4419,6 +4419,24 @@ a.dbundle-fact:hover {
   font-size: var(--t-sm);
   line-height: 1.5;
 }
+/* The caveats and judgment calls a reviewer weighs, under the recommendation. */
+.review-watch ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  font-size: var(--t-sm);
+}
+.review-watch li {
+  margin: 2px 0;
+  line-height: 1.45;
+}
+.verify-mirror-note {
+  margin: 0 0 var(--s3);
+  font-size: var(--t-sm);
+}
+.review-mechanical {
+  margin: var(--s2) 0;
+  font-size: var(--t-eyebrow);
+}
 .review-recommendation-open {
   border-color: color-mix(in srgb, var(--yellow) 45%, var(--border-soft));
 }

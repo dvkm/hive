@@ -87,6 +87,18 @@ test("a stuck/dead task blocked on an unmerged dependency is 'waiting', not 'att
   ]);
 });
 
+// A mirror rides one column behind its work, so both reached `verifying` and
+// the inbox showed two cards for one ticket, the mirror's carrying nothing.
+test("a verifying Jira mirror waits its turn while its work task is still live", () => {
+  const mirror = task("mirror", "verifying", { source: "external", source_ref: "jira:WEB-165", jira_key: "WEB-165" });
+  const work = task("work", "verifying", { jira_mirror_task_id: "mirror" });
+  const during = getNeedsYouItems([], [mirror, work], [], []).filter((item) => item.kind === "verify");
+  expect(during.map((item) => item.id)).toEqual(["work"]);
+  // Once the work is done the mirror is the one thing left to close.
+  const after = getNeedsYouItems([], [mirror, { ...work, state: "done" }], [], []).filter((item) => item.kind === "verify");
+  expect(after.map((item) => item.id)).toEqual(["mirror"]);
+});
+
 test("a dependency landing (verifying/done) moves its dependent from 'waiting' back to 'attention'", () => {
   const items = getNeedsYouItems(
     [],

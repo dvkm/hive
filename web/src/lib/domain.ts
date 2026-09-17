@@ -65,6 +65,7 @@ export interface Task {
   source_ref: string | null;
   jira_key: string | null;
   jira_link_kind: "mirror" | "subtask" | null;
+  jira_mirror_task_id?: string | null; // the ticket's mirror row this work task sits under
   parent_task_id: string | null;
   race_id?: string | null; // best-of-N: the group of attempts this task is one of
   duplicate_of: string | null; // survivor id when cancelled as a duplicate

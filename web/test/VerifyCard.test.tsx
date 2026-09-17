@@ -95,3 +95,58 @@ test("the verify card names the task and captions every screenshot", async () =>
   expect(captions).toEqual([before.caption, after.caption]);
   expect(renderer.root.findAll((n) => n.type === "button" && String(n.children).includes("Verified")).length).toBe(1);
 });
+
+// A Jira mirror carries no review of its own. Its card used to be the heading,
+// "Check it, then close it" and a button: zero context. It now reads the
+// finished work under it and leads with what was asked.
+test("a Jira mirror's verify card reads the work under it and says what was asked and what to check", async () => {
+  const mirror: Task = { ...task, id: "mirror-1", number: 2, title: "[WEB-165] sector badges", source: "external", source_ref: "jira:WEB-165", jira_key: "WEB-165", jira_link_kind: "mirror", pr_url: null };
+  const work: Task = { ...task, id: "work-1", number: 3, title: "[WEB-165] sector badges", state: "done", jira_mirror_task_id: "mirror-1" };
+  const intent = {
+    id: "int_1",
+    status: "accepted",
+    task_id: "work-1",
+    source_ref: "WEB-165",
+    body_md: "## Problem\nNo sector on the rows.\n\n## Proposed outcome\nEvery row shows its sector badge.\n\n## Affected users and systems\n(not stated)\n\n## Constraints\n(not stated)\n\n## Open questions\n(none)\n",
+  };
+  const store = { ...fakeStore, tasks: [mirror, work], intents: [intent] } as unknown as Store;
+  const fetched: string[] = [];
+  api.task = (async (id: string) => {
+    fetched.push(id);
+    const review = {
+      id: "ev-1", task_id: "work-1", ts: "2026-01-01T00:00:00.000Z", source: "agent", type: "review_summary",
+      payload: {
+        done: ["Grouped the rows by sector."],
+        iffy: [{ what: "Multi-Family rows have no tab filter", why: "the map tabs only know four sectors" }],
+        understanding: {
+          essence: "The list is re-ordered so rows of the same sector sit together.",
+          participate: "Open a player on the map search and check the list groups by sector.",
+        },
+      },
+    };
+    return { ...work, events: [review], evidence: [after], decisions: [] } as unknown as TaskDetail;
+  }) as typeof api.task;
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(
+      <MemoryRouter>
+        <Ctx.Provider value={store}>
+          <LightboxProvider>
+            <VerifyCard task={mirror} />
+          </LightboxProvider>
+        </Ctx.Provider>
+      </MemoryRouter>
+    );
+  });
+  const json = JSON.stringify(renderer.toJSON());
+  expect(fetched).toEqual(["work-1"]);
+  expect(json).toContain("What was asked");
+  expect(json).toContain("Every row shows its sector badge.");
+  expect(json).toContain("What shipped");
+  expect(json).toContain("The list is re-ordered so rows of the same sector sit together.");
+  expect(json).toContain("Confirm WEB-165 is done, then close it");
+  expect(json).toContain("Open a player on the map search and check the list groups by sector.");
+  expect(json).toContain("Watch out for");
+  expect(json).toContain("Multi-Family rows have no tab filter");
+  expect(json).not.toContain("Nothing else moves it");
+});

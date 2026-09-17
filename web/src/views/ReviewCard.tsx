@@ -14,8 +14,10 @@ import { DecisionCard } from "./DecisionCard";
 import { ReportView } from "./ReportView";
 import { UnderstandingQuiz } from "./UnderstandingQuiz";
 import { PrReference, TaskRef, TaskReference, prLabel, taskLabel } from "../lib/references";
-import { oneLine, stateChanges, whyItWasNeeded, withoutPromoted } from "../lib/reviewFocus";
-import type { StateChange } from "../lib/reviewFocus";
+import { oneLine, whyItWasNeeded, withoutPromoted } from "../lib/reviewFocus";
+import { intentSection } from "../lib/intent";
+import { isJiraMirror } from "../lib/needsYou";
+import { RequestChanges } from "./RequestChanges";
 
 // Staleness marker: captured-at time always shows; the commit SHA (recorded
 // by the CLI from the agent's worktree at capture time) compares against the
@@ -493,51 +495,24 @@ export function explainStateOf(evidence: Evidence[], events: Event[], headSha: s
   return page?.url ? { status: "ready", url: page.url, stale: true } : null;
 }
 
-function ReviewFocus({
-  changed,
-  paths,
-  stat,
-  changes,
-  why,
-}: {
-  changed: string;
-  paths: string[];
-  stat: { files: number; add: number; del: number } | undefined;
-  changes: StateChange[];
-  why: string;
-}) {
-  if (!changed && !changes.length && !why) return null;
+// The lead is the agent's own plain-English essence of the change and the
+// reason it was needed. The diff-stat and the before/after table that used to
+// sit here were engineer readouts (the table fired on 1.4% of review lines);
+// counts live in the trail now.
+function ReviewFocus({ changed, why, changedLabel = "What changed", asked }: { changed: string; why: string; changedLabel?: string; asked?: string }) {
+  if (!changed && !why && !asked) return null;
   return (
     <div className="review-focus">
-      {changed && (
+      {asked && (
         <div className="focus-block">
-          <span className="focus-eyebrow">What changed</span>
-          <p className="focus-lead">{changed}</p>
-          {stat && stat.files > 0 && (
-            <p className="focus-stat">
-              {paths.length ? `${paths.join(", ")} · ` : ""}
-              {stat.files} file{stat.files === 1 ? "" : "s"} <span className="diff-add">+{stat.add}</span>{" "}
-              <span className="diff-del">−{stat.del}</span>
-            </p>
-          )}
+          <span className="focus-eyebrow">What was asked</span>
+          <p className="focus-lead">{asked}</p>
         </div>
       )}
-      {changes.length > 0 && (
+      {changed && (
         <div className="focus-block">
-          <span className="focus-eyebrow">Before → after</span>
-          <table className="focus-state">
-            <tbody>
-              {changes.map((c, i) => (
-                <tr key={i} className={c.before === c.after ? "focus-state-same" : ""}>
-                  <th>{c.label}</th>
-                  <td className="focus-before">{c.before}</td>
-                  <td className="focus-arrow">→</td>
-                  <td className="focus-after">{c.after}</td>
-                  {c.before === c.after && <td className="focus-note">unchanged</td>}
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <span className="focus-eyebrow">{changedLabel}</span>
+          <p className="focus-lead">{changed}</p>
         </div>
       )}
       {why && (
@@ -548,6 +523,29 @@ function ReviewFocus({
       )}
     </div>
   );
+}
+
+// What a reviewer weighs before the button: the agent's caveats and the calls
+// it made on its own. Up to three on the card, the rest in the trail, none twice.
+function WatchOut({ items }: { items: ReviewItem[] }) {
+  if (!items.length) return null;
+  return (
+    <div className="focus-block review-watch">
+      <span className="focus-eyebrow">Watch out for</span>
+      <ul>
+        {items.map((it, i) => (
+          <li key={i}>
+            {reviewItemText(it)}
+            {typeof it !== "string" && it.why && <span className="rs-why"> — {it.why}</span>}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+export function watchOutsOf(review: ReviewSummary | null | undefined, max = 3): ReviewItem[] {
+  return [...(review?.iffy ?? []), ...(review?.decisions ?? [])].slice(0, max);
 }
 
 function ReviewSection({
@@ -981,19 +979,27 @@ export function ReviewCard({
   // fallback, and its first Completed line the last resort. Capped either way.
   const autoReviewSummary = [...events].reverse().find((e) => e.type === "auto_review" && !e.payload.skipped)?.payload
     ?.summary as string | undefined;
-  const whatChangedSource = autoReviewSummary || review?.understanding?.essence || review?.done?.[0] || "";
+  // The agent's own plain-English essence leads. The pre-review's summary is
+  // written from the diff in engineer voice, so it is the fallback, not the lead.
+  const whatChangedSource = review?.understanding?.essence || autoReviewSummary || review?.done?.[0] || "";
   const whatChanged = oneLine(whatChangedSource);
-  const changes = stateChanges([...(review?.done ?? []), ...(review?.testing ?? [])]);
   const why = whyItWasNeeded(review?.understanding?.background, review?.done ?? []);
   // A sentence promoted into the lead is not repeated in the collapsed audit.
-  const promoted = [why.source, whatChangedSource, ...changes.map((c) => c.source)].filter(Boolean);
+  const promoted = [why.source, whatChangedSource].filter(Boolean);
+  const watchOuts = watchOutsOf(review);
   const auditReview = review
     ? {
         ...review,
         done: withoutPromoted(review.done, promoted, (d) => d),
         testing: withoutPromoted(review.testing, promoted, (t) => t),
+        iffy: (review.iffy ?? []).filter((item) => !watchOuts.includes(item)),
+        decisions: (review.decisions ?? []).filter((item) => !watchOuts.includes(item)),
       }
     : null;
+  // Screenshots are the evidence a person judges at a glance; everything else is
+  // a chip in the trail, counted in the summary line.
+  const screenshots = evidence.filter((e) => e.kind === "screenshot");
+  const attachments = evidence.filter((e) => e.kind !== "screenshot" && e.kind !== "explanation");
   // The mental model repeats itself too: whatever the lead already said is
   // dropped from the packet rather than printed a second time lower down.
   const packet = review?.understanding
@@ -1003,7 +1009,6 @@ export function ReviewCard({
         background: promoted.includes(review.understanding.background ?? "") || why.text ? undefined : review.understanding.background,
       }
     : undefined;
-  const diffPaths = diff && diff.files.length > 0 && diff.files.length <= 2 ? diff.files.map((f) => f.path) : [];
   // An unanswered question addressed to the director IS a blocking issue: the
   // card used to recommend "approve and merge" six lines above one (HIVE-557).
   const openRisks = riskVerdictSplit(events, task.head_sha)?.open ?? [];
@@ -1147,20 +1152,17 @@ export function ReviewCard({
           <div className="review-card-meta">
             <TaskRef task={task} className="card-num" />
             {project && <span>{project.name}</span>}
-            <span>{task.kind}</span>
           </div>
           <h3 className="review-card-title">
             <Link to={`/tasks/${task.id}`}>{task.title}</Link>
           </h3>
         </div>
         <div className="review-status">
-          {task.pr_url ? (
-            <PrReference className="pr" url={task.pr_url} label={`${prLabel(task.pr_url)} ↗`} />
-          ) : (
-            <span className="muted mono-sm">branch {task.branch || "?"}</span>
-          )}
-          <SidecarChip sidecar={task.sidecar} />
-          <CiBadge status={task.ci_status} />
+          {task.pr_url && <PrReference className="pr" url={task.pr_url} label={`${prLabel(task.pr_url)} ↗`} />}
+          {/* Green is the default and says nothing; only a warning, a red run or
+              a CI that never ran earns a chip. */}
+          {task.sidecar && !task.sidecar.ok && <SidecarChip sidecar={task.sidecar} />}
+          {task.ci_status !== "passing" && <CiBadge status={task.ci_status} />}
         </div>
       </div>
 
@@ -1200,10 +1202,10 @@ export function ReviewCard({
 
       <PreviewPanel task={task} screenshots={evidence.filter((e) => e.kind === "screenshot")} />
 
-      <ReviewFocus changed={whatChanged} paths={diffPaths} stat={stat} changes={changes} why={why.text} />
+      <ReviewFocus changed={whatChanged} why={why.text} />
 
-      {/* What needs the director, and the recommendation that has to agree with
-          it. Caveats are NOT repeated here — they live in the audit below, once. */}
+      {/* What needs the director, the recommendation that has to agree with it,
+          then the caveats and judgment calls a reviewer weighs (once). */}
       <div className={`review-recommendation ${openRisks.length ? "review-recommendation-open" : ""}`}>
         <span className="review-recommendation-label">{openRisks.length ? "Needs you" : "Hive recommends"}</span>
         <strong>{recommendation}</strong>
@@ -1211,9 +1213,11 @@ export function ReviewCard({
         <RiskVerdicts events={events} headSha={task.head_sha} />
       </div>
 
+      <WatchOut items={watchOuts} />
+
       <VerificationChecklist items={verification} evidence={evidence} />
 
-      <EvidenceStrip evidence={evidence.filter((e) => e.kind !== "explanation")} task={task} />
+      <EvidenceStrip evidence={screenshots} task={task} />
 
       <details className="review-details" open={quizRequired && quizStatus === "required"}>
         <summary>
@@ -1222,8 +1226,8 @@ export function ReviewCard({
             {reportOnly && review?.understanding
               ? `finding · impact · risk`
               : review?.understanding
-              ? `mental model · ${evidence.length} evidence`
-              : `${auditReview?.done?.length ?? 0} completed · ${caveats.length} caveat${caveats.length === 1 ? "" : "s"} · ${evidence.length} evidence`}
+              ? `how it works · ${evidence.length} evidence`
+              : `${auditReview?.done?.length ?? 0} completed · ${evidence.length} evidence`}
           </small>
         </summary>
         <div className="review-details-body">
@@ -1238,6 +1242,8 @@ export function ReviewCard({
             </summary>
             <div className="report-audit-body">
               <ChangesThread events={events} />
+
+              <EvidenceStrip evidence={attachments} task={task} />
 
               <CheckpointList events={events} />
 
@@ -1320,27 +1326,15 @@ export function ReviewCard({
         </div>
       )}
       {!quizRequired && confirmedRisks.length === 0 && (
-        <div className="understanding-quiz-status deferred">
-          Mechanical change: no understanding check needed.{" "}
-          <button className="btn btn-mini" onClick={requireQuiz} disabled={busy}>Quiz me on this one</button>
-        </div>
+        <p className="muted review-mechanical">
+          Mechanical change, no understanding check.{" "}
+          <button className="link-btn" onClick={requireQuiz} disabled={busy}>Quiz me anyway</button>
+        </p>
       )}
 
-      <div className="review-actions">
-        <button className="btn btn-primary" onClick={() => merge(undefined, riskOverride || undefined)} disabled={busy || !!mergeBlocked} title={mergeBlocked}>
-          {busy ? "Working…" : reportOnly ? "Accept report" : surface === "focus" ? "Ship" : "Approve & merge"}
-        </button>
-        {!task.never_dispatched && (
-          <button className="btn" onClick={() => setMode(mode === "changes" ? null : "changes")}>
-            Request changes
-          </button>
-        )}
-        <button className="btn btn-danger" onClick={() => setMode(mode === "reject" ? null : "reject")}>
-          Reject
-        </button>
-      </div>
-      {/* A confirmed risk outranks a missing quiz: asking the agent to write
-          questions about a change that cannot merge is the wrong next step. */}
+      {/* Why the button is off comes BEFORE the button, so the eye meets the
+          reason first. A confirmed risk outranks a missing quiz: asking the agent
+          to write questions about a change that cannot merge is the wrong next step. */}
       {!riskBlocked && quizRequired && missingQuiz && !task.never_dispatched ? (
         <div className="review-blocked review-blocked-action">
           <button className="btn btn-mini" disabled={busy} onClick={refreshUnderstandingCheck}>
@@ -1366,6 +1360,20 @@ export function ReviewCard({
           )}
         </div>
       ) : null}
+
+      <div className="review-actions">
+        <button className="btn btn-primary" onClick={() => merge(undefined, riskOverride || undefined)} disabled={busy || !!mergeBlocked} title={mergeBlocked}>
+          {busy ? "Working…" : reportOnly ? "Accept report" : surface === "focus" ? "Ship" : "Approve & merge"}
+        </button>
+        {!task.never_dispatched && (
+          <button className="btn" onClick={() => setMode(mode === "changes" ? null : "changes")}>
+            Request changes
+          </button>
+        )}
+        <button className="btn btn-danger" onClick={() => setMode(mode === "reject" ? null : "reject")}>
+          Reject
+        </button>
+      </div>
       {mergeErr && (
         <div className="review-merge-error">
           Merge failed: {mergeErr}
@@ -1441,11 +1449,33 @@ export function ReviewCard({
 // it used to render as nothing but a row of unlabelled thumbnails. It reads in
 // the same order the review card established (HIVE-557): what shipped, the
 // before → after, why it was needed, then what needs you.
+// A Jira mirror has no work of its own: its context is the finished work task
+// under it. The most advanced one is what the director looks at.
+const WORK_RANK: Record<string, number> = { done: 4, verifying: 3, in_review: 2, in_progress: 1 };
+export function mirrorWorkOf(mirror: Task, tasks: Task[]): Task | null {
+  return (
+    [...tasks.filter((t) => t.jira_mirror_task_id === mirror.id)].sort(
+      (a, b) => (WORK_RANK[b.state] ?? 0) - (WORK_RANK[a.state] ?? 0) || String(b.updated_at).localeCompare(String(a.updated_at))
+    )[0] ?? null
+  );
+}
+
+const NOT_STATED = "(not stated)";
+
+// The verify queue's card. hive stops every merge at `verifying` and waits for
+// the director (HIVE-604), so this is the surface he uses most. It answers, in
+// order: what was asked, what shipped and why, what to check, then the button.
+// It used to open with "Check it, then close it" and nothing else when the
+// task was a Jira mirror, which carries no review of its own.
 export function VerifyCard({ task, onDone, surface }: { task: Task; onDone?: () => void; surface?: "focus" }) {
-  const { projects } = useStore();
+  const { projects, tasks = [], intents = [] } = useStore();
   const project = projects.find((p) => p.id === task.project_id);
+  const mirror = isJiraMirror(task);
+  const work = mirror ? mirrorWorkOf(task, tasks) : null;
+  const subject = work ?? task;
   const [evidence, setEvidence] = useState<Evidence[]>([]);
   const [events, setEvents] = useState<Event[]>([]);
+  const [verification, setVerification] = useState<VerificationItem[]>([]);
   const [review, setReview] = useState<ReviewSummary | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -1453,13 +1483,15 @@ export function VerifyCard({ task, onDone, surface }: { task: Task; onDone?: () 
     let live = true;
     setEvidence([]);
     setEvents([]);
+    setVerification([]);
     setReview(null);
     api
-      .task(task.id)
+      .task(subject.id)
       .then((t) => {
         if (!live) return;
         setEvidence(t.evidence ?? []);
         setEvents(t.events ?? []);
+        setVerification(t.verification ?? []);
         const ev = latestReviewSummaryEvent(t.events ?? []);
         if (ev) setReview(ev.payload as ReviewSummary);
       })
@@ -1467,23 +1499,45 @@ export function VerifyCard({ task, onDone, surface }: { task: Task; onDone?: () 
     return () => {
       live = false;
     };
-  }, [task.id]);
+  }, [subject.id]);
 
+  // The accepted ask, when the work carries one: the outcome the director
+  // signed off on is the yardstick the check is measured against.
+  const intent = intents.find(
+    (i) => i.status === "accepted" && (i.task_id === task.id || (work != null && i.task_id === work.id) || (!!task.jira_key && i.source_ref === task.jira_key))
+  );
+  const askedText = intent ? intentSection(intent.body_md, "Proposed outcome") : "";
+  const asked = askedText && askedText !== NOT_STATED ? oneLine(askedText, 260) : "";
   const autoReviewSummary = [...events].reverse().find((e) => e.type === "auto_review" && !e.payload.skipped)?.payload
     ?.summary as string | undefined;
-  const whatChangedSource = autoReviewSummary || review?.understanding?.essence || review?.done?.[0] || task.summary || "";
-  const whatChanged = oneLine(whatChangedSource);
-  const changes = stateChanges([...(review?.done ?? []), ...(review?.testing ?? [])]);
+  const shippedSource = review?.understanding?.essence || autoReviewSummary || review?.done?.[0] || subject.summary || "";
+  const shipped = oneLine(shippedSource);
   const why = whyItWasNeeded(review?.understanding?.background, review?.done ?? []);
-  const promoted = [why.source, whatChangedSource, ...changes.map((c) => c.source)].filter(Boolean);
+  // The agent's own "what to do with this" is the check instruction; it used to
+  // be the last paragraph of the collapsed panel.
+  const check = String(review?.understanding?.participate ?? "").trim();
+  const watchOuts = watchOutsOf(review);
+  const screenshots = evidence.filter((e) => e.kind === "screenshot");
+  const attachments = evidence.filter((e) => e.kind !== "screenshot" && e.kind !== "explanation");
+  const promoted = [why.source, shippedSource].filter(Boolean);
   const packet = review?.understanding
     ? {
         ...review.understanding,
         essence: promoted.includes(review.understanding.essence ?? "") ? undefined : review.understanding.essence,
         background: promoted.includes(review.understanding.background ?? "") || why.text ? undefined : review.understanding.background,
+        participate: undefined,
       }
     : undefined;
-  const explain = explainStateOf(evidence, events, task.head_sha);
+  const auditReview = review
+    ? {
+        ...review,
+        done: withoutPromoted(review.done, promoted, (d) => d),
+        iffy: (review.iffy ?? []).filter((item) => !watchOuts.includes(item)),
+        decisions: (review.decisions ?? []).filter((item) => !watchOuts.includes(item)),
+      }
+    : null;
+  const explain = explainStateOf(evidence, events, subject.head_sha);
+  const hasDetails = !!(packet || explain || attachments.length || auditReview);
 
   const markDone = async () => {
     if (busy) return;
@@ -1509,44 +1563,68 @@ export function VerifyCard({ task, onDone, surface }: { task: Task; onDone?: () 
           <div className="review-card-meta">
             <TaskRef task={task} className="card-num" />
             {project && <span>{project.name}</span>}
-            <span>{task.kind}</span>
+            {mirror && task.jira_key && <span>{task.jira_key}</span>}
           </div>
           <h3 className="review-card-title">
             <Link to={`/tasks/${task.id}`}>{task.title}</Link>
           </h3>
         </div>
         <div className="review-status">
-          {task.pr_url && <PrReference className="pr" url={task.pr_url} label={`${prLabel(task.pr_url)} ↗`} />}
+          {subject.pr_url && <PrReference className="pr" url={subject.pr_url} label={`${prLabel(subject.pr_url)} ↗`} />}
         </div>
       </div>
 
-      <ReviewFocus changed={whatChanged} paths={[]} stat={undefined} changes={changes} why={why.text} />
+      {mirror && (
+        <p className="muted verify-mirror-note">
+          {work
+            ? <>This is the ticket. The work was <TaskRef task={work} className="card-num" /> ({work.state}); closing this closes the ticket's row on the board.</>
+            : "This is the ticket, and no hive work is filed under it. Check the ticket itself."}
+        </p>
+      )}
 
-      <EvidenceStrip evidence={evidence.filter((e) => e.kind !== "explanation")} task={task} />
+      <ReviewFocus asked={asked} changed={shipped} changedLabel="What shipped" why={why.text} />
 
-      {(packet || explain) && (
+      <div className="review-recommendation">
+        <span className="review-recommendation-label">Check this</span>
+        <strong>{mirror && task.jira_key ? `Confirm ${task.jira_key} is done, then close it` : "Confirm it works, then close it"}</strong>
+        <p>
+          {check ||
+            (asked
+              ? "Open the result and confirm it does what was asked. Nothing else moves this."
+              : "This merged and is waiting on you. Nothing else moves it.")}
+        </p>
+      </div>
+
+      <WatchOut items={watchOuts} />
+
+      <VerificationChecklist items={verification} evidence={evidence} />
+
+      <PreviewPanel task={subject} screenshots={screenshots} />
+
+      <EvidenceStrip evidence={screenshots} task={subject} />
+
+      {hasDetails && (
         <details className="review-details">
           <summary>
             <span>Understand this change</span>
             <small>{evidence.length} evidence</small>
           </summary>
           <div className="review-details-body">
-            <ReviewUnderstanding packet={packet ?? {}} caveats={review?.iffy ?? []} explain={explain} />
+            {(packet || explain) && <ReviewUnderstanding packet={packet ?? {}} caveats={review?.iffy ?? []} explain={explain} />}
+            <EvidenceStrip evidence={attachments} task={subject} />
+            {auditReview && <ReviewAudit r={auditReview} />}
           </div>
         </details>
       )}
-
-      <div className="review-recommendation">
-        <span className="review-recommendation-label">Needs you</span>
-        <strong>Check it, then close it</strong>
-        <p>This merged and is waiting on you. Nothing else moves it.</p>
-      </div>
 
       <div className="review-actions">
         <button className="btn btn-primary" onClick={markDone} disabled={busy}>
           {busy ? "Working…" : "Verified — mark done"}
         </button>
-        <Link className="btn" to={`/tasks/${task.id}`}>Open task</Link>
+        {/* Looked, and it is not right: the note becomes a follow-up task that
+            carries this change's context. This one still closes. */}
+        <RequestChanges taskId={subject.id} compact />
+        <Link className="btn" to={`/tasks/${subject.id}`}>Open task</Link>
       </div>
     </section>
   );

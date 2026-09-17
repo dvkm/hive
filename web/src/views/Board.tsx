@@ -529,8 +529,9 @@ export function AttentionBudgetBanner({ count }: { count: number }) {
   return (
     <div className="attn-budget" role="status">
       <strong>{count} things need you.</strong>{" "}
-      That is over your budget of {budget.threshold}, so hive paused {budget.paused.join(" and ")}.
-      Nothing already running was stopped. {heldLine(budget.held)}
+      That is over your budget of {budget.threshold}.
+      {budget.paused.length > 0 && ` Hive paused ${budget.paused.join(" and ")}; nothing already running was stopped.`}
+      {(budget.held?.scouts ?? 0) + (budget.held?.watchers ?? 0) > 0 && ` ${heldLine(budget.held)}`}
     </div>
   );
 }

@@ -117,6 +117,16 @@ export function isTrackingOnly(task: Pick<Task, "source" | "source_ref">): boole
   return task.source === "external" || isJiraMirror(task);
 }
 
+// A Jira mirror rides one column behind its work (advanceJiraMirror): while any
+// work task under it is still live, the work task's own card is the one to act
+// on, and a second card for the ticket carried nothing. The mirror gets its own
+// turn once all its work is finished, with that work's context on the card.
+const LIVE_WORK = new Set(["queued", "in_progress", "needs_decision", "in_review", "verifying"]);
+export function mirrorStillWorking(task: Task, tasks: Task[]): boolean {
+  if (!isJiraMirror(task)) return false;
+  return tasks.some((t) => t.jira_mirror_task_id === task.id && LIVE_WORK.has(t.state));
+}
+
 // Work hive is actually moving right now — what "N in motion" counts. A
 // tracking-only row (a mirrored ticket, another agent's board entry) parked in a
 // work column is deliberate: the real work runs under its children, and hive
@@ -235,7 +245,7 @@ export function getNeedsYouItems(decisions: Decision[], tasks: Task[], checkpoin
     // second notion of pending. Tracking-only rows are included: a mirrored
     // ticket has no PR to smoke, but the issue behind it still needs a person.
     ...tasks
-      .filter((task) => task.state === "verifying")
+      .filter((task) => task.state === "verifying" && !mirrorStillWorking(task, tasks))
       .map((task): NeedsYouItem => ({ kind: "verify", id: task.id, task })),
     ...tasks
       .filter((task) => task.state === "in_review" && !isTrackingOnly(task))

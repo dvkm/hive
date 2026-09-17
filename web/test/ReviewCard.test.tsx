@@ -871,9 +871,9 @@ test("the card leads with what changed and its recommendation agrees with the op
     // 1. what changed, from hive's own pre-review of the diff
     expect(text).toContain("What changed");
     expect(text).toContain("Adds migration v45");
-    // 2. before → after, as a table
-    expect(text).toContain("Before → after");
-    expect(text).toContain("stranded-row count");
+    // 2. the caveat the agent flagged sits on the card, not two expanders deep
+    expect(text).toContain("Watch out for");
+    expect(text).toContain("Applied the migration SQL directly to the live database.");
     // 3. why, pulled from the line that explains the cause
     expect(text).toContain("Why it was needed");
     // 4. the recommendation cannot say "approve and merge" over an open question
