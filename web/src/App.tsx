@@ -17,6 +17,7 @@ import {
   faHeart,
   faRocket,
   faTriangleExclamation,
+  faGear,
 } from "@fortawesome/free-solid-svg-icons";
 import { useStore } from "./lib/store";
 import { actionableItems } from "./lib/needsYou";
@@ -34,6 +35,7 @@ import Decisions from "./views/Decisions";
 import Review from "./views/Review";
 import Catchup from "./views/Catchup";
 import Policies from "./views/Policies";
+import Settings from "./views/Settings";
 import Monitors from "./views/Monitors";
 import Learnings from "./views/Learnings";
 import Terminals from "./views/Terminals";
@@ -92,6 +94,7 @@ const SECONDARY_NAV: { label: string; items: [string, string, IconDefinition][] 
     items: [
       ["/projects", "Projects", faFolder],
       ["/policies", "Policies", faScaleBalanced],
+      ["/settings", "Settings", faGear],
     ],
   },
 ];
@@ -449,6 +452,7 @@ export default function App() {
           <Route path="/analytics" element={<Analytics />} />
           <Route path="/projects" element={<Projects />} />
           <Route path="/policies" element={<Policies />} />
+          <Route path="/settings" element={<Settings />} />
           <Route path="/monitors" element={<Monitors />} />
           <Route path="/deployments" element={<Deployments />} />
         </Routes>

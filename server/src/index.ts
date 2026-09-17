@@ -20,6 +20,7 @@ import { startGchatPoll } from "./intake/gchat.ts";
 import { startJiraSync } from "./intake/jira.ts";
 import { startWatchers } from "./watch.ts";
 import { startAutoReviewer } from "./reviewer.ts";
+import { applyTypesafeSettings } from "./typesafe.ts";
 import { startDriftWatch } from "./drift.ts";
 import { startPromoter } from "./promoter.ts";
 import { selfAuditOnce, startSelfAudit } from "./selfAudit.ts";
@@ -38,6 +39,7 @@ import { setUsageSink, insertOneshotUsage } from "./planner.ts";
 const port = Number(process.env.HIVE_PORT || 4700);
 const dbPath = defaultDbPath();
 const db = openDb(dbPath);
+applyTypesafeSettings(db);
 
 // Refuse to be the second server on the live fleet database. A custom port with
 // the default DB is the signature of a throwaway/test server that forgot

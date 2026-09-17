@@ -121,6 +121,20 @@ function promptForToken(): Promise<boolean> {
 // Mirrors server/src/diff.ts MAX_DIFF_LINES (used only for the truncation notice).
 export const MAX_DIFF_LINES = 20000;
 
+export interface TypesafeStatus {
+  configured: boolean;
+  key_hint: string | null;
+  key_source: "settings" | "env" | null;
+  mode: "off" | "shadow" | "enforce";
+}
+export interface TypesafeProbe {
+  ok: boolean;
+  status: number | null;
+  ms: number;
+  model: string | null;
+  error: string | null;
+}
+
 async function req<T>(path: string, init?: RequestInit, retried = false): Promise<T> {
   // A FormData body must set its own Content-Type: the browser adds the
   // multipart boundary, which we cannot write by hand.
@@ -461,6 +475,12 @@ export const api = {
     const qs = q.toString();
     return req<Brief>(`/api/brief${qs ? "?" + qs : ""}`);
   },
+
+  // TypeSafe (Jev) key and mode, from the Settings page.
+  typesafeSettings: () => req<TypesafeStatus>("/api/settings/typesafe"),
+  saveTypesafeSettings: (b: { api_key?: string; mode?: TypesafeStatus["mode"] }) =>
+    req<TypesafeStatus>("/api/settings/typesafe", { method: "POST", body: JSON.stringify(b) }),
+  testTypesafe: () => req<TypesafeProbe>("/api/settings/typesafe/test", { method: "POST", body: "{}" }),
 
   // Director chat (persistent project supervisor or global Chief of Staff session).
   chatThreads: (project_id?: string) =>

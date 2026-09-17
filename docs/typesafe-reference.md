@@ -16,7 +16,9 @@ judgments embedded in it.
 Dashboard: https://console.typesafe.ai/settings/keys — "Get your API key from the
 dashboard." Playground for interactive testing: https://console.typesafe.ai/playground.
 Client reads the key from the `TYPESAFE_API_KEY` environment variable by default (both
-Python and JS SDKs).
+Python and JS SDKs). In hive, paste it on the web Settings page (`/settings`) instead of the
+server environment: it is stored in the `settings` table, applied to the running server on
+save, and re-applied at boot, with a Test button that reports the HTTP status.
 
 ## HTTP API
 

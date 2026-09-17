@@ -122,7 +122,7 @@ import { startRace, raceView, pickWinner, resolveRaceForDecision } from "./race.
 import { resolveScopeDriftForDecision } from "./drift.ts";
 import { evaluateAutoApprove, evaluateAutopilotApprove, riskLevel, NO_AUTO_ANSWER_REASON } from "./autoapprove.ts";
 import { classifyCardText } from "./policy.ts";
-import { typesafeSettings } from "./typesafe.ts";
+import { typesafeSettings, typesafeStatus, saveTypesafeSettings, probeTypesafe } from "./typesafe.ts";
 import { decisionAnswerTokenOk, vapidPublicKey, saveSubscription, removeSubscription, type PushSub } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
 import { confirmedRisks, unfinishedRiskCheck, cautionCleared, latestAutoReviewVerdict, reviewPipelineSettled, livePrHead } from "./reviewer.ts";
@@ -577,6 +577,14 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
 
       // ---- braindump intake ----
       if (pathname === "/api/intake" && method === "POST") return intake(db, await req.json(), deps);
+
+      // ---- TypeSafe (Jev) key and mode, editable from the Settings page ----
+      if (pathname === "/api/settings/typesafe" && method === "GET") return json(typesafeStatus(db));
+      if (pathname === "/api/settings/typesafe" && method === "POST") {
+        saveTypesafeSettings(db, (await req.json()) as { api_key?: unknown; mode?: unknown });
+        return json(typesafeStatus(db));
+      }
+      if (pathname === "/api/settings/typesafe/test" && method === "POST") return json(await probeTypesafe());
 
       // ---- director chat (persistent supervisor session over hive) ----
       if (pathname === "/api/chat/supervisor" && method === "GET")
