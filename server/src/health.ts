@@ -14,7 +14,7 @@ import { isSupervisedTask, neverDispatched } from "./supervision.ts";
 import { isDeferred, unmetDeps, lastAgentActivity, SKIP_REASONS, TERMINAL, type State } from "./state.ts";
 import { taskIdentifier } from "./taskIdentifier.ts";
 import { latestSidecar, latestSidecarBatch, type SidecarReport } from "./sidecar.ts";
-import { reviewActionable, reviewActionableBatch } from "./reviewer.ts";
+import { reviewGate, reviewGateBatch, type ReviewGate } from "./reviewer.ts";
 import { isReviewed } from "./dispatcher.ts";
 
 export type HealthStatus = "healthy" | "deferred" | "silent" | "stuck" | "dead";
@@ -292,7 +292,8 @@ export function sessionUtilization(
 // A task row enriched with its computed health, for API responses + SSE.
 // Failed tasks also carry `requeued_to` (their auto-requeue successor's id, if
 // any) so the attention rule can tell "awaiting triage" from "already retried".
-export function taskWithHealth(db: DB, task: any, sidecar?: SidecarReport | null, actionable?: Set<string>): any {
+export function taskWithHealth(db: DB, task: any, sidecar?: SidecarReport | null, gates?: Map<string, ReviewGate>): any {
+  const review_gate = gates ? gates.get(task.id) ?? null : reviewGate(db, task);
   const requeued_to =
     task.state === "failed"
       ? ((db.query("SELECT id FROM tasks WHERE parent_task_id = ? AND source = 'requeue' LIMIT 1").get(task.id) as any)?.id ?? null)
@@ -340,7 +341,7 @@ export function taskWithHealth(db: DB, task: any, sidecar?: SidecarReport | null
       } catch {}
     }
   }
-  return { ...task, display_id: taskIdentifier(db, task), health: computeHealth(db, task), requeued_to, needs_you_since, never_dispatched: neverDispatched(db, task), review_actionable: actionable ? actionable.has(task.id) : reviewActionable(db, task), reviewed, skip, deferred_note, sidecar: sidecar !== undefined ? sidecar : latestSidecar(db, task.id) };
+  return { ...task, display_id: taskIdentifier(db, task), health: computeHealth(db, task), requeued_to, needs_you_since, never_dispatched: neverDispatched(db, task), review_actionable: review_gate === "needs_you", review_gate, reviewed, skip, deferred_note, sidecar: sidecar !== undefined ? sidecar : latestSidecar(db, task.id) };
 }
 
 // Batched form of taskWithHealth for list endpoints (task HIVE-447): looks up
@@ -349,8 +350,8 @@ export function taskWithHealth(db: DB, task: any, sidecar?: SidecarReport | null
 // five tables.
 export function tasksWithHealth(db: DB, tasks: any[]): any[] {
   const sidecars = latestSidecarBatch(db, tasks.map((t) => t.id));
-  const actionable = reviewActionableBatch(db, tasks);
-  return tasks.map((task) => taskWithHealth(db, task, sidecars.get(task.id) ?? null, actionable));
+  const gates = reviewGateBatch(db, tasks);
+  return tasks.map((task) => taskWithHealth(db, task, sidecars.get(task.id) ?? null, gates));
 }
 
 // "Needs attention" tray eligibility (the single rule; the web mirrors it):

@@ -1335,6 +1335,33 @@ function headOf(raw: string): unknown {
 
 // Something the director can actually read: the agent's own review summary, or
 // a report attached as evidence (how scouts hand work over).
+// Why an in_review task is, or is not yet, the director's: the board's column
+// used to be labelled "Ready to Merge" for every card in it, risk-blocked ones
+// included. `needs_you` is exactly reviewActionable; the rest name the gate.
+export type ReviewGate = "needs_you" | "risk_confirmed" | "review_running" | "ci_failing" | "ci_pending" | "no_pr";
+
+function gateHolding(db: DB, t: ReviewActionableTask): ReviewGate {
+  if (!t.pr_url) return "no_pr";
+  if (t.ci_status === "failing") return "ci_failing";
+  if (t.ci_status === "pending") return "ci_pending";
+  return confirmedRisks(db, t.id, t.head_sha).length ? "risk_confirmed" : "review_running";
+}
+
+export function reviewGate(db: DB, task: ReviewActionableTask): ReviewGate | null {
+  if (task.state !== "in_review") return null;
+  return reviewActionable(db, task) ? "needs_you" : gateHolding(db, task);
+}
+
+export function reviewGateBatch(db: DB, tasks: ReviewActionableTask[]): Map<string, ReviewGate> {
+  const actionable = reviewActionableBatch(db, tasks);
+  const gates = new Map<string, ReviewGate>();
+  for (const t of tasks) {
+    if (t.state !== "in_review") continue;
+    gates.set(t.id, actionable.has(t.id) ? "needs_you" : gateHolding(db, t));
+  }
+  return gates;
+}
+
 export function hasDirectorReport(db: DB, taskId: string): boolean {
   if (db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'review_summary' LIMIT 1").get(taskId)) return true;
   return !!db.query("SELECT 1 FROM evidence WHERE task_id = ? AND kind = 'report' LIMIT 1").get(taskId);

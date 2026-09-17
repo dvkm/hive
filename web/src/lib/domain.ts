@@ -83,6 +83,8 @@ export interface Task {
   overlap_hold?: { number: number; files: string[] } | null; // list endpoint only; queued behind a live task that looks like it edits the same files
   requeued_to?: string | null; // successor id when failed + auto-requeued
   review_actionable?: boolean; // in_review AND the director can act on it now (server-computed, HIVE-500)
+  // Why an in_review task is or is not the director's yet; `needs_you` is exactly review_actionable.
+  review_gate?: "needs_you" | "risk_confirmed" | "review_running" | "ci_failing" | "ci_pending" | "no_pr" | null;
   skip?: { reason: string; label: string; permanent: boolean; since: string | null } | null; // queued only: why the dispatcher last skipped it
   never_dispatched?: boolean; // source=external, never spawned — no agent exists or ever will unless manually dispatched
   reviewed?: boolean; // intake tasks only: the director (or intake triage) signalled it is free to dispatch

@@ -30,9 +30,18 @@ const COLUMNS: { state: State; label: string }[] = [
   { state: "queued", label: "Queued" },
   { state: "in_progress", label: "Working" },
   { state: "needs_decision", label: "Blocked" },
-  { state: "in_review", label: "Ready to Merge" },
+  { state: "in_review", label: "In review" },
   { state: "done", label: "Done" },
 ];
+
+// What still holds an in_review card, from the server's review gate. CI chips
+// already render in the card foot, so those two gates draw nothing extra here.
+export const REVIEW_GATE_CHIP: Record<string, { label: string; title: string; className: string } | undefined> = {
+  needs_you: { label: "needs you", title: "The pre-review is done and nothing holds it: your turn.", className: "chip chip-kind" },
+  risk_confirmed: { label: "risk confirmed", title: "The risk check confirmed a finding on this commit; the agent has to clear it before this can merge.", className: "chip chip-error" },
+  review_running: { label: "pre-review running", title: "Hive's pre-review has not finished on this commit yet.", className: "chip" },
+  no_pr: { label: "no PR yet", title: "No pull request or report yet.", className: "chip" },
+};
 const BOARD_STATES = new Set<State>([...COLUMNS.map(({ state }) => state), "verifying"]);
 
 // What an empty column MEANS, and what puts a card in it. An empty column is
@@ -52,8 +61,8 @@ const COL_EMPTY: Record<string, { title: string; hint: string }> = {
     hint: "An agent that hits a call only you can make parks here and waits.",
   },
   in_review: {
-    title: "Nothing ready to merge",
-    hint: "Agents land here once the PR is open and CI is green. That's your cue to merge.",
+    title: "Nothing in review",
+    hint: "Agents land here once a PR is open. Each card says what still holds it; \"needs you\" means it is your turn.",
   },
   done: {
     title: "Nothing finished yet",
@@ -160,6 +169,14 @@ export function Card({ task }: { task: Task }) {
         {/* Only a FAILING check earns board space; a green one changes nothing
             the director would do. Both are always on the task page. */}
         {task.sidecar && !task.sidecar.ok && <SidecarChip sidecar={task.sidecar} />}
+        {/* The column holds every task in review; the chip says whether it is
+            the director's turn or what still holds it (a confirmed risk sat
+            under "Ready to Merge" before this). */}
+        {task.state === "in_review" && task.review_gate && REVIEW_GATE_CHIP[task.review_gate] && (
+          <span className={REVIEW_GATE_CHIP[task.review_gate]!.className} title={REVIEW_GATE_CHIP[task.review_gate]!.title}>
+            {REVIEW_GATE_CHIP[task.review_gate]!.label}
+          </span>
+        )}
         <BlockedBy depends_on={task.depends_on} tasks={tasks} />
         {/* A taken-over task is deferred too (that is how it is parked), so this
             comes first: "you are holding this one" beats "parked". */}

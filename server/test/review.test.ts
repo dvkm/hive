@@ -12,7 +12,7 @@ const { reconcileOnce, conflictNudgeMessage } = await import("../src/reconciler.
 const { queueSteerEvent, queuedSteers, markSteersDelivered, resumeReviewForDeliveredSteers } = await import("../src/steer.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
 const { writeEvent } = await import("../src/state.ts");
-const { reviewActionable, reviewActionableBatch } = await import("../src/reviewer.ts");
+const { reviewActionable, reviewActionableBatch, reviewGate, reviewGateBatch } = await import("../src/reviewer.ts");
 const { parseUnifiedDiff, taskDiff, MAX_DIFF_LINES } = await import("../src/diff.ts");
 import type { Exec, ExecResult } from "../src/exec.ts";
 
@@ -1391,6 +1391,23 @@ test("brief.to_review counts only reviews the director can act on", async () => 
   const rows = s.db.query("SELECT * FROM tasks").all() as any[];
   const batch = reviewActionableBatch(s.db, rows);
   for (const t of rows) expect(batch.has(t.id)).toBe(reviewActionable(s.db, t));
+
+  // The board column holds every one of these; the gate says why each card is
+  // or is not the director's yet, and it agrees with the single-task rule.
+  const gates = reviewGateBatch(s.db, rows);
+  expect(gates.get(ready)).toBe("needs_you");
+  expect(gates.get(refutedRisk)).toBe("needs_you");
+  expect(gates.get(noPrReport)).toBe("needs_you");
+  expect(gates.get(confirmedRisk)).toBe("risk_confirmed");
+  expect(gates.get(redCi)).toBe("ci_failing");
+  expect(gates.get(noReview)).toBe("review_running");
+  expect(gates.get(staleReview)).toBe("review_running");
+  expect(gates.get(unverified)).toBe("review_running");
+  expect(gates.get(noPrNoReport)).toBe("no_pr");
+  for (const t of rows) expect(gates.get(t.id) ?? null).toBe(reviewGate(s.db, t));
+  // and the list endpoint carries it, so the board can draw the chip
+  const listed = await get(s.handler, "/api/tasks");
+  expect(listed.json.find((t: any) => t.id === confirmedRisk).review_gate).toBe("risk_confirmed");
 
 });
 
