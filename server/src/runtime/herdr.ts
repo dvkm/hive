@@ -28,6 +28,8 @@ import type { Exec, ExecResult } from "../exec.ts";
 import { defaultExec, isSafeRef } from "../exec.ts";
 import { toShellPath } from "../platform.ts";
 import { ClaudeStreamRuntime } from "./claudeStream.ts";
+import { CodexStreamRuntime } from "./codexStream.ts";
+import type { Agent } from "../projectConfig.ts";
 
 // Absolute path to the hive CLI (…/repo/bin/hive from server/src/runtime/),
 // handed to every spawned agent as $HIVE_CLI so `"$HIVE_CLI" emit …` works from
@@ -90,7 +92,11 @@ export interface SpawnArgs {
   model?: string; // claude --model for the default argv (ignored when agentArgv overrides)
   agentMcp?: "none" | "inherit"; // project's config.agent_mcp; default "none" (see defaultAgentArgv)
   agentArgv?: string[]; // command run inside the agent; per-project override (verbatim)
-  // "protocol": drive claude over stream-json (runtime/claudeStream.ts), no pane.
+  // Which CLI to drive; selects the protocol runtime. Default "claude"
+  // ("teamclaude" is the same claude binary behind a proxy).
+  agent?: Agent;
+  // "protocol": drive the agent over its own JSON stream, no pane
+  // (runtime/claudeStream.ts for claude, runtime/codexStream.ts for codex).
   // Default "pane": the interactive agent inside a herdr tab.
   driver?: "pane" | "protocol";
   hiveCli?: string; // the hive CLI path handed to the agent (HIVE_CLI)
@@ -763,10 +769,20 @@ export class Herdr {
     private alive: (pid: number) => boolean = pidAlive
   ) {}
 
-  // Protocol-driven claude sessions (no pane). Every method below routes a
-  // target that lives here to the stream driver and everything else to herdr,
-  // so callers keep one runtime object and one status vocabulary.
+  // Protocol-driven sessions (no pane), one runtime per agent. Every method
+  // below routes a target that lives in either to its stream driver and
+  // everything else to herdr, so callers keep one runtime object and one status
+  // vocabulary.
   readonly stream = new ClaudeStreamRuntime();
+  readonly codexStream = new CodexStreamRuntime();
+
+  // The protocol runtime holding this target, or null when it is a pane agent.
+  private streamFor(target: string | null | undefined): ClaudeStreamRuntime | CodexStreamRuntime | null {
+    if (!target) return null;
+    if (this.stream.has(target)) return this.stream;
+    if (this.codexStream.has(target)) return this.codexStream;
+    return null;
+  }
 
   private run(argv: string[], opts?: { input?: string }): Promise<ExecResult> {
     return this.exec([this.bin, ...argv], opts);
@@ -791,16 +807,11 @@ export class Herdr {
     // Protocol driver: no tab, no pane. The worktree above is the same; the
     // agent is a stream-json subprocess addressed by the task id like any other.
     if (args.driver === "protocol") {
-      await this.stream.spawn({
-        taskId: args.taskId,
-        cwd: wt.path,
-        hiveUrl: args.hiveUrl,
-        hiveCli: args.hiveCli ?? HIVE_CLI,
-        brief: args.brief,
-        env: args.env,
-        model: args.model,
-        mcp: args.agentMcp,
-      });
+      const common = { taskId: args.taskId, cwd: wt.path, hiveUrl: args.hiveUrl, hiveCli: args.hiveCli ?? HIVE_CLI, brief: args.brief, env: args.env };
+      // Codex has no live stdin channel, so its runtime needs the pane argv
+      // (flags + brief) to rebuild the command for every turn.
+      if (args.agent === "codex") await this.codexStream.spawn({ ...common, argv: args.agentArgv });
+      else await this.stream.spawn({ ...common, model: args.model, mcp: args.agentMcp });
       return {
         agent_target: args.taskId,
         worktree_path: wt.path,
@@ -1036,7 +1047,8 @@ export class Herdr {
   // parseAgentProbe) or a failed send-keys therefore comes back as a FAILURE, so
   // callers queue the message instead of reporting it delivered.
   async send(target: string, message: string): Promise<ExecResult> {
-    if (this.stream.has(target)) return this.stream.send(target, message);
+    const protocol = this.streamFor(target);
+    if (protocol) return protocol.send(target, message);
     try {
       const got = await this.run(agentGetArgv(target));
       const probe = parseAgentProbe(got.stdout);
@@ -1059,8 +1071,11 @@ export class Herdr {
   }
 
   async focus(target: string): Promise<ExecResult> {
-    if (this.stream.has(target))
-      return { code: 1, stdout: "", stderr: `protocol agent has no pane. Resume it in a terminal: claude --resume ${this.stream.sessionId(target)}` };
+    const protocol = this.streamFor(target);
+    if (protocol) {
+      const resume = protocol === this.codexStream ? `codex exec resume ${protocol.sessionId(target)}` : `claude --resume ${protocol.sessionId(target)}`;
+      return { code: 1, stdout: "", stderr: `protocol agent has no pane. Resume it in a terminal: ${resume}` };
+    }
     return this.run(agentFocusArgv(target));
   }
 
@@ -1070,7 +1085,7 @@ export class Herdr {
   // requiring a human at the tmux pane (2026-07-11: three agents sat blocked on
   // dialogs for hours and were failed as "silent").
   async answerDialog(target: string, key: string): Promise<ExecResult> {
-    if (this.stream.has(target)) return { code: 0, stdout: "", stderr: "" }; // no dialogs on the protocol driver
+    if (this.streamFor(target)) return { code: 0, stdout: "", stderr: "" }; // no dialogs on the protocol driver
     try {
       const got = await this.run(agentGetArgv(target));
       const paneId = parsePaneId(got.stdout);
@@ -1085,7 +1100,8 @@ export class Herdr {
   }
 
   async wait(target: string, status: AgentStatus, timeoutMs: number): Promise<ExecResult> {
-    if (this.stream.has(target)) return this.stream.wait(target, status, timeoutMs);
+    const protocol = this.streamFor(target);
+    if (protocol) return protocol.wait(target, status, timeoutMs);
     return this.run(agentWaitArgv(target, status, timeoutMs));
   }
 
@@ -1096,7 +1112,8 @@ export class Herdr {
   // yields a pane-less agent record. All three are death; a transient/unparseable
   // result is treated as alive so a herdr hiccup never triggers a false requeue.
   async probe(target: string): Promise<{ alive: boolean; status: AgentStatus }> {
-    if (this.stream.has(target)) return this.stream.probe(target);
+    const protocol = this.streamFor(target);
+    if (protocol) return protocol.probe(target);
     let r: ExecResult;
     try {
       r = await this.run(agentGetArgv(target));
@@ -1118,7 +1135,7 @@ export class Herdr {
   // unregistered. An empty/unavailable pane list is NOT evidence of death
   // either — that is exactly what a down daemon looks like.
   async confirmGone(hint: { cwd?: string | null; tabId?: string | null; terminalId?: string | null }): Promise<boolean> {
-    const protocolGone = this.stream.goneByCwd(hint.cwd);
+    const protocolGone = this.stream.goneByCwd(hint.cwd) ?? this.codexStream.goneByCwd(hint.cwd);
     if (protocolGone !== null) return protocolGone; // a subprocess either runs or it does not
     if (!hint.cwd && !hint.tabId && !hint.terminalId) return false;
     const panes = await this.listPanes();
@@ -1152,7 +1169,8 @@ export class Herdr {
     terminalId?: string | null;
   }): Promise<{ readopted: boolean; paneId: string | null; terminalId: string | null; reason: string; agentGone?: boolean }> {
     const miss = (reason: string, agentGone = false) => ({ readopted: false, paneId: null, terminalId: null, reason, agentGone });
-    if (this.stream.has(hint.name)) return miss("protocol agent: nothing to re-adopt", !this.stream.probe(hint.name).alive);
+    const protocol = this.streamFor(hint.name);
+    if (protocol) return miss("protocol agent: nothing to re-adopt", !protocol.probe(hint.name).alive);
     const panes = await this.listPanes();
     if (!panes.length) return miss("herdr returned no panes"); // daemon down, not a wipe
 
@@ -1203,7 +1221,8 @@ export class Herdr {
   // match and produced JSON-headed decision cards (2026-07-11). Falls back to
   // the raw body when unparseable (an error body is itself useful evidence).
   async read(target: string, lines = 200): Promise<string> {
-    if (this.stream.has(target)) return this.stream.read(target, lines);
+    const protocol = this.streamFor(target);
+    if (protocol) return protocol.read(target, lines);
     try {
       const r = await this.run(agentReadArgv(target, lines));
       const raw = r.stdout || r.stderr || "";
@@ -1536,7 +1555,8 @@ export class Herdr {
     expectTerminalId?: string | null;
     expectCwd?: string | null;
   }): Promise<{ closed: boolean; via: string | null; refused?: string }> {
-    if (args.agentTarget && this.stream.has(args.agentTarget)) return this.stream.close(args.agentTarget);
+    const protocol = this.streamFor(args.agentTarget);
+    if (protocol) return protocol.close(args.agentTarget!);
     let refused: string | undefined;
     try {
       if (args.tabId) {
@@ -1584,7 +1604,7 @@ export class Herdr {
   // zero corresponding DB task). Never throws: an empty list degrades to "sweep
   // found nothing this cycle", not a crash.
   async listAgents(): Promise<{ name: string; tabId: string | null }[]> {
-    const protocol = this.stream.list();
+    const protocol = [...this.stream.list(), ...this.codexStream.list()];
     try {
       const r = await this.run(agentListArgv());
       return [...parseAgentList(r.stdout), ...protocol];
