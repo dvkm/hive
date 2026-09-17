@@ -1,5 +1,7 @@
 // Brief composition. Composed fresh at spawn time (Phase 2) and exposed at
 // GET /api/tasks/:id/brief. Pure function of DB state.
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import type { DB } from "./db.ts";
 import { getTask, isSelfAuditLineage } from "./state.ts";
 import { prTitlePrefix, prBodyFooter } from "./marker.ts";
@@ -349,6 +351,23 @@ function definitionOfDone(db: DB, task: { id: string; kind: string; source?: str
 
 // Compose the full agent brief. Stored knowledge stays behind `hive recall` so
 // the prompt cost does not grow with the project history.
+// The code map an agent starts from when the project's checkout carries a graft
+// index (the worktree gets a clone of it at spawn, rebuilt for the branch).
+// Silent for a project without one: an instruction the agent cannot follow is
+// worse than none.
+export function graftSection(repoPath: string | null | undefined): string | null {
+  if (!repoPath || !existsSync(join(repoPath, "graft", "INDEX.md"))) return null;
+  return `## Code map (graft)
+This repository is indexed by graft: a prebuilt graph of every symbol, its file:line span and who calls what. It answers faster and cheaper than grep and Read, so reach for it first:
+
+  graft ask "<what you need>"      ranked hits with the code inlined at each file:line
+  graft grep "<literal>"           every occurrence, grouped by enclosing symbol
+  graft skeleton <file>            a file's whole API in a few lines
+  graft callers <symbol>           who calls it; --direction out for what it calls; --depth all before a rename
+
+Read the exact spans it names; open a whole file only to edit it.`;
+}
+
 export function composeBrief(db: DB, taskId: string): string {
   const task = getTask(db, taskId);
   if (!task) throw new Error(`unknown task: ${taskId}`);
@@ -366,11 +385,13 @@ export function composeBrief(db: DB, taskId: string): string {
   const contract = verificationContract(task.id, task.verification_cmds);
   if (contract) parts.push(contract);
   parts.push(EMIT_PROTOCOL);
-  const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id);
+  const project: any = db.query("SELECT config, repo_path FROM projects WHERE id = ?").get(task.project_id);
   const projectConfig = JSON.parse(project?.config ?? "{}");
   // Only projects that can actually build a preview stack hear about the flag;
   // everywhere else it would be an instruction the agent cannot follow.
   if (previewConfig(projectConfig)) parts.push(PREVIEW_PATH);
+  const graft = graftSection(project?.repo_path);
+  if (graft) parts.push(graft);
   parts.push(PLAIN_ENGLISH);
   parts.push(CHECKPOINTS);
   if (planGateKinds(projectConfig).includes(task.kind))

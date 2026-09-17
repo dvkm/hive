@@ -180,6 +180,18 @@ export function eventText(e: EventLike): string {
       ].filter(Boolean);
       return did.length ? `worktree seeded: ${did.join(", ")}` : "worktree seeded: nothing to copy or reuse";
     }
+    case "graft_built":
+      return `code map rebuilt for this branch (graft, ${Math.round(Number(p.ms) || 0)}ms)`;
+    case "graft_build_failed":
+      return `code map rebuild failed, the agent falls back to grep${p.error ? `: ${s(p.error)}` : ""}`;
+    case "intent_investigated": {
+      if (p.error) return `hive could not investigate the draft: ${s(p.error)}`;
+      if (p.skipped) return `hive's investigation of the draft was set aside (${s(p.skipped)})`;
+      const before = Number(p.questions_before) || 0;
+      const after = Number(p.questions_after) || 0;
+      const found = Number(p.findings) || 0;
+      return `hive investigated the draft${p.graft ? " with graft" : ""}: ${found} finding${found === 1 ? "" : "s"}, ${before} question${before === 1 ? "" : "s"} → ${after === 0 ? "none left, accepted" : `${after} for you`}`;
+    }
     case "worktree_seed_failed": {
       // The spawn still worked; the project asked for something that is not there.
       const bad = list(p.misconfigured) as { path?: unknown; reason?: unknown }[];

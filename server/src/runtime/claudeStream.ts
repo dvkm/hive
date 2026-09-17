@@ -71,7 +71,9 @@ function bunSpawn(argv: string[], opts: { cwd: string; env: Record<string, strin
   };
 }
 
-async function* lines(stream: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+// Shared with the codex protocol driver (runtime/codexStream.ts): both agents
+// speak newline-delimited JSON on stdout.
+export async function* lines(stream: ReadableStream<Uint8Array>): AsyncGenerator<string> {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buf = "";

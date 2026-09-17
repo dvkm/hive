@@ -3449,6 +3449,9 @@ test("shadow mode logs the upload it WOULD make, and sends nothing", async () =>
 // nothing. Composition is at most once per JIRA STATUS and delivery rides the
 // ordinary outbound-comment ledger, so re-syncs stay silent.
 const reachReview = (db: DB, taskId: string, reason: string) => {
+  // A review with nothing behind it (no PR, no evidence, no summary) posts no
+  // comment at all, so every reviewed fixture carries its PR.
+  db.query("UPDATE tasks SET pr_url = COALESCE(pr_url, ?) WHERE id = ?").run("https://github.com/acme/x/pull/815", taskId);
   transition(db, taskId, "in_progress", { source: "director", reason: "starting" });
   transition(db, taskId, "in_review", { source: "director", reason });
 };
@@ -3469,7 +3472,9 @@ test("a mirror reaching In Review gets exactly ONE context comment, and re-syncs
   const s1 = await run(db, projectId, jira.fetchImpl);
   const context = jira.byKey.get("WEB-1")!.comments.filter((c: any) => String(c.text).includes("Hive moved this to In Review"));
   expect(context).toHaveLength(1);
-  expect(context[0].text).toContain("PR #815 (CI green): unified member list, counts conserved");
+  // The headline is the review's own summary; the transition reason is bookkeeping.
+  expect(context[0].text).toContain("Hive moved this to In Review: unified member list");
+  expect(context[0].text).not.toContain("counts conserved");
   expect(context[0].text).toContain("https://github.com/acme/x/pull/815");
   expect(context[0].text).toContain("deletion is soft-flagged: send suppression lands separately");
   expect(context[0].text).toContain(`${J.hiveBaseUrl()}/evidence/${task.id}/x.png`);
@@ -3509,11 +3514,12 @@ test("verifying shares In Review's comment, and Done gets its own", async () => 
   transition(db, task.id, "done", { source: "director", reason: "smoke checks pass" });
   await run(db, projectId, jira.fetchImpl);
   jiraClockBehind();
-  expect(
-    texts().filter((t) =>
-      t.includes("Hive finished this and the director verified it; please check the live result and move the ticket to Done: smoke checks pass")
-    )
-  ).toHaveLength(1);
+  const doneNotes = texts().filter((t) =>
+    t.includes("Hive finished this and the director verified it; please check the live result and move the ticket to Done")
+  );
+  expect(doneNotes).toHaveLength(1);
+  expect(doneNotes[0]).not.toContain("smoke checks pass"); // the transition reason stays internal
+  expect(doneNotes[0]).toContain("PR: https://github.com/acme/x/pull/815");
   // and the ticket itself is still In Review: hive never writes Done (HIVE-630)
   expect(jira.byKey.get("WEB-1")!.status).toBe("In Review");
   for (let i = 0; i < 2; i++) await run(db, projectId, jira.fetchImpl);

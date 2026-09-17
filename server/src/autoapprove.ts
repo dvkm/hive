@@ -17,6 +17,7 @@
 //   - a pending standing-authority grant can never be approved automatically;
 //     its recommended `deny` remains fail-closed and safe to clear.
 import type { DB } from "./db.ts";
+import { classifyCardTextSync, type CardClass } from "./policy.ts";
 
 // A decision row carrying a `decision_class` is off-limits to every automated
 // answer path: the balanced allow-list, autopilot, the standing CI ruling, and
@@ -34,25 +35,16 @@ export const NO_AUTO_ANSWER_REASON = "this card is reserved for the director and
 //   - a recognized level word at the start -> that level;
 //   - anything else (free prose) -> "high", because unrecognized text is not a
 //     licence to answer a card automatically.
-export type RiskLevel = "low" | "normal" | "medium" | "high";
-
-export function riskLevel(risk: unknown): RiskLevel {
-  const text = String(risk ?? "").trim().toLowerCase();
-  if (!text) return "normal";
-  const word = text.match(/^(low|normal|medium|high)\b/)?.[1];
-  return (word as RiskLevel) ?? "high";
-}
+// Both live in policy.ts now — one card-text classifier, one risk normalizer.
+export { riskLevel, type RiskLevel } from "./policy.ts";
 
 export interface AutoApproveVerdict {
   allow: boolean;
   category: string;
   reason: string;
+  /** shadow mode: what Jev would have said, for the caller's existing event payload. */
+  typesafe_shadow?: CardClass["shadow"];
 }
-
-// Blast-radius / target language that always forces a human, whatever the
-// category. Mirrors policy.ts's PROD_RE / SHARED_RE intent (task #260).
-const PROD_RE = /\b(prod|production|deploy|customer\s*data|live)\b/i;
-const SHARED_RE = /\b(migration|schema|infra|pipeline|shared)\b/i;
 
 function hasDecisionEvent(db: DB, type: string, decisionId: string): boolean {
   return (
@@ -78,10 +70,20 @@ function isStaleAgentDialog(db: DB, decisionId: string): boolean {
   return latest?.type === "agent_released" || latest?.status === "done";
 }
 
-function safetyBar(db: DB, d: any, answerKey: string): AutoApproveVerdict | null {
+// `cls` is an optional pre-computed classification. Synchronous callers pass
+// nothing and get the regex baseline; an ALREADY-async caller can await
+// policy.classifyCardText(d) first and hand the result in, which is how the Jev
+// judgment reaches this bar without turning a sync hot path async.
+export interface AutoApproveOpts {
+  /** project `config.typesafe.risk_max`: the Jev risk score a card may carry and still clear the risk-text bar. */
+  riskMax?: number | null;
+}
+
+function safetyBar(db: DB, d: any, answerKey: string, cls?: CardClass, opts?: AutoApproveOpts): AutoApproveVerdict | null {
   const options: any[] = Array.isArray(d.options) ? d.options : JSON.parse(d.options || "[]");
   const chosen = options.find((o) => o.key === answerKey);
-  const no = (category: string, reason: string): AutoApproveVerdict => ({ allow: false, category, reason });
+  const c = cls ?? classifyCardTextSync(d);
+  const no = (category: string, reason: string): AutoApproveVerdict => ({ allow: false, category, reason, typesafe_shadow: c.shadow });
   // A classed card exists precisely because a human has to choose. It sits in
   // front of every other rule so neither the balanced allow-list nor autopilot
   // can reach past it.
@@ -99,19 +101,25 @@ function safetyBar(db: DB, d: any, answerKey: string): AutoApproveVerdict | null
   // Stricter than riskLevel() on purpose: this bar wants an EXPLICIT low/normal
   // rating, so an unrated (null) card escalates rather than inheriting the
   // "normal" default. Prose like "high — leaked prod key" fails it too.
+  //
+  // A project that set `typesafe.risk_max` gets a second way past THIS check
+  // only: Jev's numeric score, on the enforce path (source "typesafe"), at or
+  // under the configured ceiling. Shadow never reaches here (its class stays
+  // source "regex"), and every other refusal below is untouched.
   const risk = String(d.risk ?? "").toLowerCase();
-  if (risk !== "low" && risk !== "normal") return no("*", `risk '${d.risk ?? "(none)"}' is above the auto-approve bar`);
-  const blast = String(d.blast_radius ?? "");
-  if (PROD_RE.test(blast) || SHARED_RE.test(blast))
-    return no("*", "prod/shared blast radius — always the director's call");
+  const scoreOk =
+    c.source === "typesafe" && opts?.riskMax != null && c.risk_score != null && c.risk_score <= opts.riskMax;
+  if (risk !== "low" && risk !== "normal" && !scoreOk)
+    return no("*", `risk '${d.risk ?? "(none)"}' is above the auto-approve bar`);
+  if (c.blast !== "local") return no("*", "prod/shared blast radius — always the director's call");
   return null;
 }
 
 // `d` is a raw decisions row (options is a JSON string) OR a parsed decision
 // (options is an array) — handle both so callers don't have to normalize.
-export function evaluateAutoApprove(db: DB, d: any, answerKey: string): AutoApproveVerdict {
-  const no = (category: string, reason: string): AutoApproveVerdict => ({ allow: false, category, reason });
-  const blocked = safetyBar(db, d, answerKey);
+export function evaluateAutoApprove(db: DB, d: any, answerKey: string, cls?: CardClass, opts?: AutoApproveOpts): AutoApproveVerdict {
+  const no = (category: string, reason: string): AutoApproveVerdict => ({ allow: false, category, reason, typesafe_shadow: cls?.shadow });
+  const blocked = safetyBar(db, d, answerKey, cls, opts);
   if (blocked) return blocked;
 
   // Refusing an unexecuted guarded command is fail-closed. Let the supervisor
@@ -142,10 +150,11 @@ export function evaluateAutoApprove(db: DB, d: any, answerKey: string): AutoAppr
 
 // Autopilot may resolve an uncategorized technical decision, but it still must
 // clear the same structural risk bar as the closed balanced allow-list.
-export function evaluateAutopilotApprove(db: DB, d: any, answerKey: string): AutoApproveVerdict {
-  return safetyBar(db, d, answerKey) ?? {
+export function evaluateAutopilotApprove(db: DB, d: any, answerKey: string, cls?: CardClass, opts?: AutoApproveOpts): AutoApproveVerdict {
+  return safetyBar(db, d, answerKey, cls, opts) ?? {
     allow: true,
     category: "autopilot_reasoned",
     reason: "recommended low/normal-risk choice with no authority or production blast radius",
+    typesafe_shadow: cls?.shadow,
   };
 }

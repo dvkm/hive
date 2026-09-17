@@ -13,7 +13,11 @@
 // global policy: that one decides WHAT is worth showing, this one decides HOW
 // each sentence is worded.
 export const PLAIN_ENGLISH = `## Plain English (required for every line a human reads)
-Write for a busy director on a phone. Lead with the point. Use everyday words,
-one idea per sentence, and spell out jargon once. Avoid nested clauses and noun
-piles. Keep paths, numbers, identifiers, and product strings exact. State each
-fact once. If a sentence needs a second comma, split it.`;
+Write in English, whatever language the ticket, its comments, or the code's
+strings are in: the director reads everything hive writes in English. Quote
+product strings, labels, and identifiers exactly as they appear, in their own
+language, and translate everything around them. Write for a busy director on a
+phone. Lead with the point. Use everyday words, one idea per sentence, and spell
+out jargon once. Avoid nested clauses and noun piles. Keep paths, numbers,
+identifiers, and product strings exact. State each fact once. If a sentence
+needs a second comma, split it.`;

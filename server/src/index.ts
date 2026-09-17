@@ -9,7 +9,8 @@ process.on("unhandledRejection", (e) => {
   console.error("[hive] unhandledRejection (survived):", e);
 });
 import { openDb, defaultDbPath } from "./db.ts";
-import { makeHandler, keepSupervisorWarm, notifyManagerOfEvent, repairDuplicateQuizPasses, deferShippedQuizzes, sweepManagerInboxes, wakeDueManagers, refreshOriginMain } from "./api.ts";
+import { makeHandler, keepSupervisorWarm, notifyManagerOfEvent, repairDuplicateQuizPasses, deferShippedQuizzes, sweepManagerInboxes, wakeDueManagers, refreshOriginMain, acceptIntent } from "./api.ts";
+import { startIntentInvestigator } from "./intentInvestigate.ts";
 import { startReconciler, reAdoptAgentsOnBoot } from "./reconciler.ts";
 import { startDispatcher } from "./dispatcher.ts";
 import { startReaper } from "./reaper.ts";
@@ -32,6 +33,7 @@ import { defaultExec } from "./exec.ts";
 import { claimLease, startLease, holdsLease, interloperReason, interloperAdvice, registerInstance, unregisterInstance, evictContenders, LEASE_MS } from "./lease.ts";
 import { enqueue } from "./notifications.ts";
 import { setSetting, now } from "./db.ts";
+import { setUsageSink, insertOneshotUsage } from "./planner.ts";
 
 const port = Number(process.env.HIVE_PORT || 4700);
 const dbPath = defaultDbPath();
@@ -156,6 +158,11 @@ const { instance, displaced } = claimLease(db);
     }
   }, LEASE_MS);
 
+// Every server-side one-shot `claude -p` reports its tokens and cost through
+// this sink. Rows that carry a task id land in `usage` (source
+// 'server_oneshot'); the rest are logged and kept in planner.ts's ring buffer.
+setUsageSink((row) => insertOneshotUsage(db, row));
+
 // Boot stamp: the teardown guard reads it so nothing is failed, requeued or
 // reaped in the first minutes after a restart/self-deploy, when herdr's agent
 // registry may still be cold and every live agent probes as gone.
@@ -240,6 +247,11 @@ startWatchers(db);
 // Hard no-op until a project sets enabled:true, and a second gate (write:false)
 // keeps it read-only until the director has read a shadow cycle.
 startJiraSync(db);
+// Every draft intent gets one read-only investigation in the project's checkout
+// before a person sees it; a draft with nothing left to decide is accepted by
+// hive and the work starts. HIVE_INTENT_INVESTIGATE=0 keeps drafts as written.
+if (process.env.HIVE_INTENT_INVESTIGATE !== "0")
+  startIntentInvestigator(db, { accept: (id) => acceptIntent(db, id, { accepted_by: "hive" }) });
 // Mirrors whose work finished while this server was down (and every ticket
 // shipped before the link existed) are advanced once, here — the same rule the
 // live path uses, so it closes nothing the live path would not have (HIVE-546).

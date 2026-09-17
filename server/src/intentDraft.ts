@@ -109,7 +109,6 @@ ELSE — no markdown fences, no prose before or after. Shape:
 {"problem":"what is wrong or missing today","proposed_outcome":"what is true once this is done","affected":"the people, pages, services and files this touches","constraints":"hard limits the work must respect","open_questions":["everything the request does not settle"]}
 
 Rules:
-- Write every field in the SAME LANGUAGE the request above is written in.
 - Only what the request supports. Leave a field as "" when it does not say.
 - READ ALL OF IT FIRST — the whole description, every comment, every attached
   file listed above. Most of what looks unanswered is answered further down.
@@ -270,7 +269,6 @@ or after. Shape:
 {"checks":[{"question":"...","options":[{"key":"a","label":"..."},{"key":"b","label":"..."},{"key":"c","label":"..."}],"answer_key":"a","explanation":"why that is the answer"}]}
 
 Rules:
-- Write in the SAME LANGUAGE the request above is written in.
 - Two to four options per question, each plainly different from the others, and
   exactly one right. answer_key must equal one option key.
 - Only what the request supports. Never invent a constraint or a scope limit it

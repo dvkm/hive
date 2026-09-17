@@ -204,7 +204,14 @@ export async function seedWorktree(
   if (patterns.length && unmatched.length === patterns.length)
     out.misconfigured.push({ path: patterns.join(", "), reason: "no worktree_seed pattern matched anything in the main checkout" });
 
-  for (const entry of warm) {
+  // graft's per-repo index (a gitignored local cache) is cloned whenever the
+  // main checkout has one, so the agent's first `graft ask` answers from the
+  // cache instead of parsing the tree. No config: the index's presence is the
+  // opt-in, and a project without one never hears about it.
+  const graftEntry = existsSync(join(repoPath, "graft", "INDEX.md")) && !warm.some((e: any) => String(e?.dir ?? "") === "graft")
+    ? [{ dir: "graft" }]
+    : [];
+  for (const entry of [...graftEntry, ...warm]) {
     const dir = String((entry as any)?.dir ?? "");
     const lock = (entry as any)?.lock ? String((entry as any).lock) : null;
     const src = insideTree(repoPath, dir);

@@ -1369,12 +1369,22 @@ test("brief.to_review counts only reviews the director can act on", async () => 
   review(redCi, "head1");
   const ready = await make("PR with green CI and a finished review", PR);
   review(ready, "head1");
+  // A verified review whose risk check CONFIRMED a finding stays the agent's
+  // (the land queue holds it); one whose finding was refuted is the director's.
+  const verdicts = (id: string, verdict: "confirmed" | "refuted") =>
+    writeEvent(s.db, { task_id: id, source: "system", type: "risk_verdicts", payload: { reviewed_head_sha: "head1", verdicts: [{ risk: "r", verdict, why: "w" }], question_verdicts: [], unverified: 0 } });
+  const confirmedRisk = await make("PR whose risk check confirmed a finding", PR);
+  review(confirmedRisk, "head1", ["a real risk"]);
+  verdicts(confirmedRisk, "confirmed");
+  const refutedRisk = await make("PR whose risk check refuted its finding", PR);
+  review(refutedRisk, "head1", ["a false alarm"]);
+  verdicts(refutedRisk, "refuted");
 
   const b = await get(s.handler, "/api/brief");
   const ids = (rows: any[]) => rows.map((t: any) => t.id).sort();
-  expect(ids(b.json.to_review)).toEqual([noPrReport, ready].sort());
+  expect(ids(b.json.to_review)).toEqual([noPrReport, ready, refutedRisk].sort());
   // Everything else stays visible, just uncounted.
-  expect(ids(b.json.in_review_pending)).toEqual([noReview, staleReview, unverified, noPrNoReport, redCi].sort());
+  expect(ids(b.json.in_review_pending)).toEqual([noReview, staleReview, unverified, noPrNoReport, redCi, confirmedRisk].sort());
 
   // The batched rule the list endpoints use must agree with the single-task one
   // on every bucket, or a board card and its brief row would disagree.

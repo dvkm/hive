@@ -362,6 +362,8 @@ async function judge(db: DB, task: any, fp: Footprint, config: any, deps: DriftD
       timeoutMs: TIMEOUT_MS,
       ...(task.worktree_path ? { cwd: task.worktree_path } : {}),
       env: claudeProfileEnvForProject(db, task.project_id),
+      taskId: task.id,
+      site: "drift",
     });
   } catch (e: any) {
     record({ error: String(e?.message ?? e) });
