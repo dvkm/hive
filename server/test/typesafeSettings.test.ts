@@ -25,15 +25,15 @@ test("settings page: key and mode round-trip, apply to the live env, and never e
     const set = await call("POST", "/api/settings/typesafe", { api_key: "  apikey_abcdef1234  ", mode: "enforce" });
     expect(set.json).toEqual({ configured: true, key_hint: "1234", key_source: "settings", mode: "enforce" });
     expect(JSON.stringify(set.json)).not.toContain("abcdef");
-    expect(process.env.TYPESAFE_API_KEY).toBe("apikey_abcdef1234");
+    expect(process.env.TYPESAFE_API_KEY as string | undefined).toBe("apikey_abcdef1234");
     expect(typesafeMode()).toBe("enforce");
 
     // a fresh process picks the saved values up from the table at boot
     delete process.env.TYPESAFE_API_KEY;
     delete process.env.HIVE_TYPESAFE_MODE;
     applyTypesafeSettings(db);
-    expect(process.env.TYPESAFE_API_KEY).toBe("apikey_abcdef1234");
-    expect(process.env.HIVE_TYPESAFE_MODE).toBe("enforce");
+    expect(process.env.TYPESAFE_API_KEY as string | undefined).toBe("apikey_abcdef1234");
+    expect(process.env.HIVE_TYPESAFE_MODE as string | undefined).toBe("enforce");
 
     // bad mode ignored, mode-only save keeps the key
     expect((await call("POST", "/api/settings/typesafe", { mode: "loud" })).json.mode).toBe("enforce");
