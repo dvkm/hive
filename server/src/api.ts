@@ -4599,6 +4599,20 @@ export async function spawnAgent(
         const seed = (timing.seed = await seedWorktree(project.repo_path, worktreePath, config, opts.exec ?? defaultExec));
         if (seed.seeded.length || seed.warmed.length || seed.skipped.length)
           writeEvent(db, { task_id: id, source: "herdr", type: "worktree_seeded", payload: { ...seed } });
+        // The graft index the seed cloned describes the main checkout; one
+        // incremental `graft build` (unchanged files replay from its cache, about
+        // a second) brings it to this branch before the agent's first `graft
+        // ask`. Best-effort: without it the agent still has grep.
+        if (existsSync(join(worktreePath, "graft", "INDEX.md")) && Bun.which("graft")) {
+          const graftStarted = Date.now();
+          const built = await (opts.exec ?? defaultExec)(["graft", "build"], { cwd: worktreePath, timeoutMs: 120_000 });
+          writeEvent(db, {
+            task_id: id,
+            source: "herdr",
+            type: built.code === 0 ? "graft_built" : "graft_build_failed",
+            payload: { ms: Date.now() - graftStarted, ...(built.code === 0 ? {} : { error: (built.stderr || built.stdout).trim().slice(-300) }) },
+          });
+        }
         // A project with no seed config at all is the deliberate default and stays
         // quiet. A project that NAMED something we could not find is a different
         // thing: the spawn still succeeds, so nothing else would ever report it,
@@ -6879,7 +6893,7 @@ function updateIntent(db: DB, id: string, body: any): Response {
 // The acceptance gate. An unchecked bullet under "## Open questions" is a
 // question nobody answered, and accepting over it is how an ask quietly loses
 // the part that was uncertain — resolve it, or move it into Constraints.
-async function acceptIntent(db: DB, id: string, body: any, deps: HandlerDeps = {}): Promise<Response> {
+export async function acceptIntent(db: DB, id: string, body: any, deps: HandlerDeps = {}): Promise<Response> {
   const intent = intentOr404(db, id);
   if (intent instanceof Response) return intent;
   if (intent.status !== "draft") return err(`intent ${id} is already ${intent.status}`, 409);
@@ -6910,7 +6924,7 @@ async function acceptIntent(db: DB, id: string, body: any, deps: HandlerDeps = {
     // an agent can never be working from words nobody signed off on.
     const brief = briefFromIntent(accepted);
     db.query("UPDATE tasks SET brief = ?, updated_at = ? WHERE id = ?").run(brief, t, accepted.task_id);
-    writeEvent(db, { task_id: accepted.task_id, source: "director", type: "intent_accepted", payload: { intent_id: id, brief_regenerated: true } });
+    writeEvent(db, { task_id: accepted.task_id, source: "director", type: "intent_accepted", payload: { intent_id: id, brief_regenerated: true, accepted_by: accepted.accepted_by } });
     broadcastTask(db, getTask(db, accepted.task_id));
   }
   queueIntentWriteBack(db, accepted);

@@ -9,7 +9,8 @@ process.on("unhandledRejection", (e) => {
   console.error("[hive] unhandledRejection (survived):", e);
 });
 import { openDb, defaultDbPath } from "./db.ts";
-import { makeHandler, keepSupervisorWarm, notifyManagerOfEvent, repairDuplicateQuizPasses, deferShippedQuizzes, sweepManagerInboxes, wakeDueManagers, refreshOriginMain } from "./api.ts";
+import { makeHandler, keepSupervisorWarm, notifyManagerOfEvent, repairDuplicateQuizPasses, deferShippedQuizzes, sweepManagerInboxes, wakeDueManagers, refreshOriginMain, acceptIntent } from "./api.ts";
+import { startIntentInvestigator } from "./intentInvestigate.ts";
 import { startReconciler, reAdoptAgentsOnBoot } from "./reconciler.ts";
 import { startDispatcher } from "./dispatcher.ts";
 import { startReaper } from "./reaper.ts";
@@ -240,6 +241,11 @@ startWatchers(db);
 // Hard no-op until a project sets enabled:true, and a second gate (write:false)
 // keeps it read-only until the director has read a shadow cycle.
 startJiraSync(db);
+// Every draft intent gets one read-only investigation in the project's checkout
+// before a person sees it; a draft with nothing left to decide is accepted by
+// hive and the work starts. HIVE_INTENT_INVESTIGATE=0 keeps drafts as written.
+if (process.env.HIVE_INTENT_INVESTIGATE !== "0")
+  startIntentInvestigator(db, { accept: (id) => acceptIntent(db, id, { accepted_by: "hive" }) });
 // Mirrors whose work finished while this server was down (and every ticket
 // shipped before the link existed) are advanced once, here — the same rule the
 // live path uses, so it closes nothing the live path would not have (HIVE-546).
