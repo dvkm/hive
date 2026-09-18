@@ -40,8 +40,10 @@ const MAX_DIFF_CHARS = 200_000;
 // the prompt asks the run to explore the checkout for background.
 const NO_WRITE_TOOLS = "--disallowed-tools=Write,Edit,NotebookEdit";
 
-// `${taskId}:${head}` currently being generated. In memory on purpose — a
-// server restart mid-run should simply try again on the next gate check.
+// Task ids currently generating. Keyed by task, NOT by task+head: the first
+// gate check usually runs before hive has stamped the PR's head commit, so a
+// head-keyed set let the next check (which has the sha) start a second opus run
+// on the same diff while the first was still going.
 const inFlight = new Set<string>();
 
 export interface ExplainDeps {
@@ -83,7 +85,7 @@ export function explanationGate(db: DB, task: any, deps: ExplainDeps = {}): "rea
   // Already tried and failed for this head: hand off without the page rather
   // than holding the task forever (or burning another model run every cycle).
   if (generationFailed(db, task.id, head)) return "ready";
-  const key = `${task.id}:${head ?? ""}`;
+  const key = task.id;
   if (!inFlight.has(key)) {
     inFlight.add(key);
     writeEvent(db, {
@@ -198,6 +200,18 @@ function extractHtml(raw: string): string | null {
   return end < 0 ? text : text.slice(0, end + 7);
 }
 
+// The PR's head commit, or null when gh cannot tell us.
+async function prHeadOid(exec: Exec, prUrl: string): Promise<string | null> {
+  const r = await exec(["gh", "pr", "view", prUrl, "--json", "headRefOid"]);
+  if (r.code !== 0) return null;
+  try {
+    const oid = String(JSON.parse(r.stdout || "{}").headRefOid ?? "");
+    return /^[0-9a-f]{7,40}$/.test(oid) ? oid : null;
+  } catch {
+    return null;
+  }
+}
+
 async function generateExplanation(db: DB, task: any, head: string | null, deps: ExplainDeps): Promise<void> {
   const exec = deps.exec ?? defaultExec;
   const plannerExec = deps.plannerExec ?? defaultPlannerExec;
@@ -212,6 +226,14 @@ async function generateExplanation(db: DB, task: any, head: string | null, deps:
   const d = await exec(["gh", "pr", "diff", task.pr_url]);
   const diff = d.code === 0 ? d.stdout : "";
   if (!diff.trim()) return fail(d.stderr?.trim() || "gh pr diff returned nothing");
+
+  // Stamp the page with the commit it actually explains. `head` is null on the
+  // first gate check, because hive stamps tasks.head_sha a reconciler cycle
+  // later. Storing that null meant the next check — which HAS the sha — could
+  // never match this page (null !== sha) and ran the same opus explanation a
+  // second time on the same diff, once per task. Ask GitHub for the head the
+  // diff above came from; keep the null on failure, which is the old behaviour.
+  const stamped = head ?? (await prHeadOid(exec, task.pr_url));
 
   const res = await plannerExec(
     [claudeBin(), "-p", NO_CUSTOMIZATIONS, "--model", MODEL, NO_WRITE_TOOLS, buildPrompt(task, diff.slice(0, MAX_DIFF_CHARS), reviewChecks(db, task.id)), "--output-format", "json"],
@@ -240,12 +262,12 @@ async function generateExplanation(db: DB, task: any, head: string | null, deps:
     path: join(dir, name),
     url: `/evidence/${task.id}/${name}`,
     caption: "Explanation of this change",
-    meta: JSON.stringify({ commit_sha: head, pr_url: task.pr_url }),
+    meta: JSON.stringify({ commit_sha: stamped, pr_url: task.pr_url }),
   };
   db.query("INSERT INTO evidence (id, task_id, ts, kind, path, url, caption, meta) VALUES (?,?,?,?,?,?,?,?)").run(
     ev.id, ev.task_id, ev.ts, ev.kind, ev.path, ev.url, ev.caption, ev.meta
   );
   broadcast({ type: "evidence", evidence: parseEvidence(ev) });
-  writeEvent(db, { task_id: task.id, source: "hive", type: "explanation_ready", payload: { evidence_id: ev.id, url: ev.url, head_sha: head } });
+  writeEvent(db, { task_id: task.id, source: "hive", type: "explanation_ready", payload: { evidence_id: ev.id, url: ev.url, head_sha: stamped } });
   if (handOffToReview(db, task.id, "hive")) broadcastTask(db, getTask(db, task.id));
 }
