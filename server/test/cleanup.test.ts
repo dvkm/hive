@@ -1068,3 +1068,59 @@ test("cleanupTask does not defer when the herdr probe itself fails (no outage-we
   expect(out.cleaned).toBe(true);
   expect(calls.some((c) => has(c, "worktree", "remove"))).toBe(true);
 });
+
+// ---- HIVE-652: never tear down a worktree a preview stack is still building in ----
+
+// A project that previews, plus a task whose stack is mid-`up`. The agent is
+// idle, so only the new preview gate can stop the teardown.
+function previewingTask(status: "preview_started" | "preview_queued" | "preview_ready") {
+  const { db, projectId } = freshDb();
+  db.query("UPDATE projects SET config = ? WHERE id = ?").run(
+    JSON.stringify({ preview: { up: "wt.sh up", down: "wt.sh down", urls: [{ label: "web", url: "https://{slug}.test" }] } }),
+    projectId
+  );
+  const branch = "hive/CT-prev";
+  const id = seedTask(db, projectId, { state: "done", branch, worktree_path: "/wt/hive-CT-prev" });
+  writeEvent(db, { task_id: id, source: "hive", type: status, payload: {} });
+  const { exec, calls } = livenessExec(branch, "idle");
+  return { db, id, exec, calls };
+}
+
+test("cleanupTask defers teardown while a preview stack is still building in the worktree", async () => {
+  for (const status of ["preview_started", "preview_queued"] as const) {
+    const { db, id, exec, calls } = previewingTask(status);
+
+    const out = await cleanupTask(db, new Herdr(exec, "herdr"), id, { force: true, exec });
+
+    expect(out.cleaned).toBe(false);
+    expect(calls.some((c) => has(c, "worktree", "remove"))).toBe(false);
+    const d = deferrals(db, id);
+    expect(d.length).toBe(1);
+    expect(JSON.parse(d[0].payload).preview_status).toBe(status === "preview_started" ? "building" : "queued");
+  }
+});
+
+test("a preview that never finishes cannot pin the worktree past the cap", async () => {
+  const { db, id, exec, calls } = previewingTask("preview_started");
+
+  expect((await cleanupTask(db, new Herdr(exec, "herdr"), id, { force: true, exec })).cleaned).toBe(false);
+  backdate(db, id, DEFER_CAP_MS / 60_000 + 1);
+
+  const out = await cleanupTask(db, new Herdr(exec, "herdr"), id, { force: true, exec });
+
+  expect(out.cleaned).toBe(true);
+  expect(calls.some((c) => has(c, "worktree", "remove"))).toBe(true);
+  // the stack came down first, while `down` could still run in the worktree
+  expect(calls.some((c) => c[0]!.endsWith("wt.sh") && c[1] === "down")).toBe(true);
+  expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'preview_down'").all(id).length).toBe(1);
+});
+
+test("a finished preview does not defer cleanup — only one that still needs the checkout does", async () => {
+  const { db, id, exec, calls } = previewingTask("preview_ready");
+
+  const out = await cleanupTask(db, new Herdr(exec, "herdr"), id, { force: true, exec });
+
+  expect(out.cleaned).toBe(true);
+  expect(calls.some((c) => has(c, "worktree", "remove"))).toBe(true);
+  expect(deferrals(db, id).length).toBe(0);
+});
