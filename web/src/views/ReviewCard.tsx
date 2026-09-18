@@ -1467,7 +1467,7 @@ const NOT_STATED = "(not stated)";
 // order: what was asked, what shipped and why, what to check, then the button.
 // It used to open with "Check it, then close it" and nothing else when the
 // task was a Jira mirror, which carries no review of its own.
-export function VerifyCard({ task, onDone, surface }: { task: Task; onDone?: () => void; surface?: "focus" }) {
+export function VerifyCard({ task, onDone, surface }: { task: Task; onDone?: () => void; surface?: "focus" | "task" }) {
   const { projects, tasks = [], intents = [] } = useStore();
   const project = projects.find((p) => p.id === task.project_id);
   const mirror = isJiraMirror(task);
@@ -1624,7 +1624,7 @@ export function VerifyCard({ task, onDone, surface }: { task: Task; onDone?: () 
         {/* Looked, and it is not right: the note becomes a follow-up task that
             carries this change's context. This one still closes. */}
         <RequestChanges taskId={subject.id} compact />
-        <Link className="btn" to={`/tasks/${subject.id}`}>Open task</Link>
+        {surface !== "task" && <Link className="btn" to={`/tasks/${subject.id}`}>Open task</Link>}
       </div>
     </section>
   );

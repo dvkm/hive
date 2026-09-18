@@ -390,7 +390,7 @@ export default function Brief() {
         <div className="brief-backlogs">
           <Section title="Decisions" count={openDecisions.length}>
             <ul className="brief-backlog-list">
-              {openDecisions.map((decision) => <li key={decision.id}><Link to={`/decisions#dcard-${decision.id}`}>{decision.title}</Link><span>{decision.risk || "decision"}</span><TaskEvidence taskId={decision.task_id} title={decision.title} compact /></li>)}
+              {openDecisions.map((decision) => <li key={decision.id}><Link to={`/tasks/${decision.task_id}#dcard-${decision.id}`}>{decision.title}</Link><span>{decision.risk || "decision"}</span><TaskEvidence taskId={decision.task_id} title={decision.title} compact /></li>)}
             </ul>
           </Section>
           <Section title="Checkpoints" count={checkpoints.length}>

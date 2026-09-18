@@ -3272,7 +3272,7 @@ function search(db: DB, url: URL): Response {
   const E = " ESCAPE '\\'";
   type Hit = {
     type: string; id: string; title: string; snippet: string;
-    task_state?: string; project_id?: string; display_id?: string; _rank: number;
+    task_state?: string; project_id?: string; display_id?: string; task_id?: string; _rank: number;
   };
   const hits: Hit[] = [];
   const bodySnippet = (title: string, ...bodies: (string | null)[]) => {
@@ -3288,9 +3288,9 @@ function search(db: DB, url: URL): Response {
     hits.push({ type: "task", id: r.id, title: r.title, snippet: bodySnippet(r.title, r.brief, r.summary), task_state: r.state, project_id: r.project_id, display_id: taskIdentifier(db, r), _rank: titleRank(r.title, q) });
   }
   for (const r of db.query(
-    `SELECT id, title, context FROM decisions WHERE title LIKE ?${E} OR context LIKE ?${E}`
+    `SELECT id, task_id, title, context FROM decisions WHERE title LIKE ?${E} OR context LIKE ?${E}`
   ).all(like, like) as any[]) {
-    hits.push({ type: "decision", id: r.id, title: r.title, snippet: bodySnippet(r.title, r.context), _rank: titleRank(r.title, q) });
+    hits.push({ type: "decision", id: r.id, task_id: r.task_id, title: r.title, snippet: bodySnippet(r.title, r.context), _rank: titleRank(r.title, q) });
   }
   for (const r of db.query(
     `SELECT id, title, body, project_id FROM learnings WHERE title LIKE ?${E} OR body LIKE ?${E}`
@@ -7685,7 +7685,10 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
       if (/\.(md|markdown)$/i.test(name)) return "report";
       return "log";
     };
-    const kind = fields.kind || (file ? inferKind(file.name) : fields.url ? "link" : "log");
+    // An image is a screenshot whatever --kind says: filed as "observation" it
+    // vanished from the review card's screenshot strip (CORE-1543).
+    const isImage = !!file && /\.(png|jpe?g|gif|webp|svg)$/i.test(file.name);
+    const kind = isImage ? "screenshot" : fields.kind || (file ? inferKind(file.name) : fields.url ? "link" : "log");
     let path: string | null = null;
     let servedUrl: string | null = fields.url ?? null;
     if (file) {

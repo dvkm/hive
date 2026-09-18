@@ -390,7 +390,7 @@ function focusRow(item: NeedsYouItem): { kind: string; to: string; label: string
     case "decision":
       return {
         kind: "Decision",
-        to: `/decisions#dcard-${item.decision.id}`,
+        to: `/tasks/${item.decision.task_id}#dcard-${item.decision.id}`,
         label: item.decision.title,
         detail: "Waiting on your answer",
         ts: item.decision.ts,
