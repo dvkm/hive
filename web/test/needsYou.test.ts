@@ -4,7 +4,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import type { Checkpoint, Decision, Task, UnderstandingQuiz } from "../src/lib/api";
 import { actionableItems, getNeedsYouItems, isInMotion, itemProject, orderFocusItems, trackedSubtasks } from "../src/lib/needsYou";
 import { inProjectFilter } from "../src/lib/projectFilter";
-import { JiraPanel, jiraMoveHint, jiraMoveSummary, jiraNextAutomaticText, jiraPanelNotice, trackingBindingNotice } from "../src/views/Task";
+import { JiraPanel, jiraMoveHint, jiraMoveSummary, jiraPanelNotice, trackingBindingNotice } from "../src/views/Task";
 
 const task = (id: string, state: Task["state"], extra: Partial<Task> = {}) => ({ id, state, ...extra }) as Task;
 
@@ -248,13 +248,6 @@ test("Jira panel copy distinguishes unavailable, paused, shadow, and live sync",
   expect(jiraPanelNotice({ linked: true, configured: true, enabled: true, write: true })).toBeNull();
 });
 
-test("Jira next-run copy uses the shared availability mode", () => {
-  expect(jiraNextAutomaticText(null)).toBe("sync state loading");
-  expect(jiraNextAutomaticText({ linked: true, configured: false })).toBe("not configured");
-  expect(jiraNextAutomaticText({ linked: true, configured: true, enabled: false })).toBe("paused (sync disabled)");
-  expect(jiraNextAutomaticText({ linked: true, configured: true, enabled: true, write: true })).toBe("—");
-});
-
 test("the Jira panel surfaces contained delivery uncertainty with one-click resolution", () => {
   const html = renderToStaticMarkup(createElement(JiraPanel, {
     task: { id: "jira-task", source_ref: "jira:WEB-1" } as any,
@@ -324,7 +317,6 @@ test("the Jira panel names an invalid config on the first read, before anything 
   expect(html).toContain("The automatic sync is off until this is fixed");
   expect(html).not.toContain("consecutive failure");
   expect(html).not.toContain("unconfigured or not allow-listed");
-  expect(jiraNextAutomaticText(jira)).toBe("off (config invalid)");
   expect(jiraPanelNotice(jira)).toBeNull();
   expect(jiraMoveHint("verifying", "done", jira)).toContain("the Jira config is invalid");
   expect(jiraMoveSummary("verifying", jira)).toContain("The Jira config is invalid");

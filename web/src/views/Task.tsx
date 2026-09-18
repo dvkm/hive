@@ -352,15 +352,6 @@ export function jiraPanelNotice(jira: JiraTaskState | null): string | null {
   return null;
 }
 
-export function jiraNextAutomaticText(jira: JiraTaskState | null): string {
-  const mode = jiraSyncMode(jira);
-  if (mode === "loading") return "sync state loading";
-  if (mode === "invalid") return "off (config invalid)";
-  if (mode === "unconfigured") return "not configured";
-  if (mode === "paused") return "paused (sync disabled)";
-  return jira?.sync?.next_due_at ? relTime(jira.sync.next_due_at) : "—";
-}
-
 export function trackingBindingNotice(task: TaskDetail): string | null {
   if (!isTrackingOnly(task) || (!task.agent_target && !task.worktree_path && !task.branch)) return null;
   const location = task.worktree_path ?? task.branch ?? task.agent_target;
@@ -429,20 +420,19 @@ export function JiraPanel({
         <dd>{jira?.assignee ?? <span className="muted">unassigned</span>}</dd>
         <dt>Last synced</dt>
         <dd>{sync?.last_success_at ? relTime(sync.last_success_at) : <span className="muted">never</span>}</dd>
-        <dt>Next automatic</dt>
-        <dd>{jiraNextAutomaticText(jira)}</dd>
-        <dt>Unresolved outbound</dt>
-        <dd>
-          {pendingTotal === 0 ? (
-            <span className="muted">nothing unresolved</span>
-          ) : (
-            <span className="chip chip-pending">
-              {pending?.comments ? `${pending.comments} comment${pending.comments > 1 ? "s" : ""}` : ""}
-              {pending?.comments && pending?.receipts ? ", " : ""}
-              {pending?.receipts ? `${pending.receipts} report/evidence` : ""}
-            </span>
-          )}
-        </dd>
+        {/* Only a signal when something is actually waiting on Jira. */}
+        {pendingTotal > 0 && (
+          <>
+            <dt>Unresolved outbound</dt>
+            <dd>
+              <span className="chip chip-pending">
+                {pending?.comments ? `${pending.comments} comment${pending.comments > 1 ? "s" : ""}` : ""}
+                {pending?.comments && pending?.receipts ? ", " : ""}
+                {pending?.receipts ? `${pending.receipts} report/evidence` : ""}
+              </span>
+            </dd>
+          </>
+        )}
       </dl>
 
       {(jira?.linked_subtasks?.length ?? 0) > 0 && (
@@ -515,8 +505,8 @@ export function JiraPanel({
       {/* Delivery receipts: proof hive's reports and comments reached Jira, so
           nobody re-sends something that already landed. */}
       {!!jira?.delivered?.length && (
-        <div className="jira-receipts">
-          <h3>Delivered to Jira</h3>
+        <details className="jira-receipts">
+          <summary className="muted">{jira.delivered.length} delivered to Jira</summary>
           <ul>
             {jira.delivered.map((d, i) => (
               <li key={i}>
@@ -526,7 +516,7 @@ export function JiraPanel({
               </li>
             ))}
           </ul>
-        </div>
+        </details>
       )}
     </section>
   );
@@ -854,7 +844,7 @@ export function TaskBody({ id }: { id: string }) {
           </div>
         )}
 
-        {codeReview && <ReviewCard task={t} onDone={refresh} />}
+        {codeReview && <ReviewCard task={t} surface="task" onDone={refresh} />}
         {verify && <VerifyCard task={t} surface="task" onDone={refresh} />}
 
         {/* The risk check's verdicts belong to the CHANGE, not to the land queue
@@ -1155,7 +1145,7 @@ export function TaskBody({ id }: { id: string }) {
               {/* Moving a linked ticket writes to Jira. Saying so on the control
                   itself is the difference between a deliberate action and a
                   surprise a colleague notices in their ticket feed. */}
-              {isJira && (
+              {isJira && !cardOwnsAction && (
                 <p className="muted jira-move-note">
                   {jiraMoveSummary(t.state, jira)}
                 </p>

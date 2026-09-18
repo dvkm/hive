@@ -792,7 +792,7 @@ export function ReviewCard({
 }: {
   task: Task;
   onDone?: () => void;
-  surface?: "focus";
+  surface?: "focus" | "task";
 }) {
   const { projects, tasks = [], quizzes: understandingQuizzes } = useStore();
   const project = projects.find((p) => p.id === task.project_id);
@@ -1148,7 +1148,8 @@ export function ReviewCard({
   return (
     <section className="review-card">
       <div className="review-card-head">
-        <div className="review-card-heading">
+        {/* On the task page the header above already names the task. */}
+        {surface !== "task" && <div className="review-card-heading">
           <div className="review-card-meta">
             <TaskRef task={task} className="card-num" />
             {project && <span>{project.name}</span>}
@@ -1156,7 +1157,7 @@ export function ReviewCard({
           <h3 className="review-card-title">
             <Link to={`/tasks/${task.id}`}>{task.title}</Link>
           </h3>
-        </div>
+        </div>}
         <div className="review-status">
           {task.pr_url && <PrReference className="pr" url={task.pr_url} label={`${prLabel(task.pr_url)} ↗`} />}
           {/* Green is the default and says nothing; only a warning, a red run or
@@ -1297,7 +1298,7 @@ export function ReviewCard({
           intentSlug={listedQuiz?.intent_slug}
           intentTaskId={task.id}
           allowDefer
-          surface={surface}
+          surface={surface === "focus" ? surface : undefined}
           onPassed={() => setQuizOverride("passed")}
           onDeferred={() => setQuizOverride("deferred")}
         />
@@ -1559,7 +1560,7 @@ export function VerifyCard({ task, onDone, surface }: { task: Task; onDone?: () 
   return (
     <section className="review-card verify-card">
       <div className="review-card-head">
-        <div className="review-card-heading">
+        {surface !== "task" && <div className="review-card-heading">
           <div className="review-card-meta">
             <TaskRef task={task} className="card-num" />
             {project && <span>{project.name}</span>}
@@ -1568,7 +1569,7 @@ export function VerifyCard({ task, onDone, surface }: { task: Task; onDone?: () 
           <h3 className="review-card-title">
             <Link to={`/tasks/${task.id}`}>{task.title}</Link>
           </h3>
-        </div>
+        </div>}
         <div className="review-status">
           {subject.pr_url && <PrReference className="pr" url={subject.pr_url} label={`${prLabel(subject.pr_url)} ↗`} />}
         </div>
