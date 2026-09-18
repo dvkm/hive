@@ -31,8 +31,6 @@ import Feed from "./views/Feed";
 import Evidence from "./views/Evidence";
 import TaskPage from "./views/Task";
 import TaskModal from "./views/TaskModal";
-import Decisions from "./views/Decisions";
-import Review from "./views/Review";
 import Catchup from "./views/Catchup";
 import Policies from "./views/Policies";
 import Settings from "./views/Settings";
@@ -443,8 +441,11 @@ export default function App() {
           <Route path="/feed" element={<Feed />} />
           <Route path="/evidence" element={<Evidence />} />
           <Route path="/tasks/:id" element={<TaskPage />} />
-          <Route path="/decisions" element={<Decisions />} />
-          <Route path="/review" element={<Review />} />
+          {/* Decisions and Review were the Needs-you inbox filtered by kind;
+              one queue is one place to look. A single decision opens on its
+              task page (#dcard-<id>), where the card is answerable. */}
+          <Route path="/decisions" element={<Navigate replace to="/inbox" />} />
+          <Route path="/review" element={<Navigate replace to="/inbox" />} />
           <Route path="/catchup" element={<Catchup />} />
           <Route path="/supervisors" element={<Supervisors />} />
           <Route path="/terminals" element={<Terminals />} />

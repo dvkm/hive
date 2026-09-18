@@ -579,6 +579,7 @@ export interface SearchHit {
   task_state?: State;
   project_id?: string;
   display_id?: string;
+  task_id?: string; // decision hits: the task whose page answers it
 }
 
 export interface UsageTotals {

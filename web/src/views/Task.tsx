@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useLocation, useParams } from "react-router-dom";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import { faDiamond } from "@fortawesome/free-solid-svg-icons";
 import { api } from "../lib/api";
@@ -9,7 +9,7 @@ import type { Decision, Evidence, JiraTaskState, TaskDetail, UsageTotals } from 
 import { useStore } from "../lib/store";
 import { splitAttachments } from "../lib/attachments";
 import { Attach, BlockedBy, CiBadge, HEALTH_LABEL, needsLook, NEXT, PriorityChip, STATE_LABEL, StatusDot, toast } from "../lib/ui";
-import { ReviewAudit, ReviewCard, ReviewUnderstanding, RiskVerdicts } from "./ReviewCard";
+import { ReviewAudit, ReviewCard, ReviewUnderstanding, RiskVerdicts, VerifyCard } from "./ReviewCard";
 import { CheckpointList } from "./Checkpoints";
 import { DecisionCard } from "./DecisionCard";
 import { IntentCard } from "./IntentCard";
@@ -23,7 +23,7 @@ import { buildTimeline, quietTimeline } from "../lib/timeline";
 import { ANSWERED_BY_LABEL } from "../lib/labels";
 import type { TimelineItem } from "../lib/timeline";
 import { eventText } from "../lib/eventText";
-import { isJiraMirror, isTrackingOnly, trackedSubtasks } from "../lib/needsYou";
+import { isJiraMirror, isTrackingOnly, mirrorStillWorking, trackedSubtasks } from "../lib/needsYou";
 import { PrReference, ReferenceText, TaskRef, prLabel } from "../lib/references";
 
 // Compact per-task usage line: tokens + estimated cost, only when usage exists.
@@ -123,7 +123,7 @@ function DecisionMini({ d }: { d: Decision }) {
           {d.answer_note && <> — {d.answer_note}</>}
         </div>
       ) : (
-        <Link className="btn btn-primary" to="/decisions">
+        <Link className="btn btn-primary" to="/inbox">
           Answer in inbox →
         </Link>
       )}
@@ -193,7 +193,7 @@ function TimelineRow({ it }: { it: TimelineItem }) {
           </ul>
         )}
         {it.open ? (
-          <Link className="btn btn-primary btn-mini" to="/decisions">Answer in inbox →</Link>
+          <Link className="btn btn-primary btn-mini" to="/inbox">Answer in inbox →</Link>
         ) : (
           <div className="tl-decision-answer">
             {d.answered_by && ANSWERED_BY_LABEL[d.answered_by] ? ANSWERED_BY_LABEL[d.answered_by] : "✓ You"}
@@ -352,15 +352,6 @@ export function jiraPanelNotice(jira: JiraTaskState | null): string | null {
   return null;
 }
 
-export function jiraNextAutomaticText(jira: JiraTaskState | null): string {
-  const mode = jiraSyncMode(jira);
-  if (mode === "loading") return "sync state loading";
-  if (mode === "invalid") return "off (config invalid)";
-  if (mode === "unconfigured") return "not configured";
-  if (mode === "paused") return "paused (sync disabled)";
-  return jira?.sync?.next_due_at ? relTime(jira.sync.next_due_at) : "—";
-}
-
 export function trackingBindingNotice(task: TaskDetail): string | null {
   if (!isTrackingOnly(task) || (!task.agent_target && !task.worktree_path && !task.branch)) return null;
   const location = task.worktree_path ?? task.branch ?? task.agent_target;
@@ -429,20 +420,19 @@ export function JiraPanel({
         <dd>{jira?.assignee ?? <span className="muted">unassigned</span>}</dd>
         <dt>Last synced</dt>
         <dd>{sync?.last_success_at ? relTime(sync.last_success_at) : <span className="muted">never</span>}</dd>
-        <dt>Next automatic</dt>
-        <dd>{jiraNextAutomaticText(jira)}</dd>
-        <dt>Unresolved outbound</dt>
-        <dd>
-          {pendingTotal === 0 ? (
-            <span className="muted">nothing unresolved</span>
-          ) : (
-            <span className="chip chip-pending">
-              {pending?.comments ? `${pending.comments} comment${pending.comments > 1 ? "s" : ""}` : ""}
-              {pending?.comments && pending?.receipts ? ", " : ""}
-              {pending?.receipts ? `${pending.receipts} report/evidence` : ""}
-            </span>
-          )}
-        </dd>
+        {/* Only a signal when something is actually waiting on Jira. */}
+        {pendingTotal > 0 && (
+          <>
+            <dt>Unresolved outbound</dt>
+            <dd>
+              <span className="chip chip-pending">
+                {pending?.comments ? `${pending.comments} comment${pending.comments > 1 ? "s" : ""}` : ""}
+                {pending?.comments && pending?.receipts ? ", " : ""}
+                {pending?.receipts ? `${pending.receipts} report/evidence` : ""}
+              </span>
+            </dd>
+          </>
+        )}
       </dl>
 
       {(jira?.linked_subtasks?.length ?? 0) > 0 && (
@@ -515,8 +505,8 @@ export function JiraPanel({
       {/* Delivery receipts: proof hive's reports and comments reached Jira, so
           nobody re-sends something that already landed. */}
       {!!jira?.delivered?.length && (
-        <div className="jira-receipts">
-          <h3>Delivered to Jira</h3>
+        <details className="jira-receipts">
+          <summary className="muted">{jira.delivered.length} delivered to Jira</summary>
           <ul>
             {jira.delivered.map((d, i) => (
               <li key={i}>
@@ -526,7 +516,7 @@ export function JiraPanel({
               </li>
             ))}
           </ul>
-        </div>
+        </details>
       )}
     </section>
   );
@@ -577,6 +567,17 @@ export function TaskBody({ id }: { id: string }) {
       clearInterval(timer);
     };
   }, [id, rev[id]]);
+  // A decision link lands here as /tasks/:id#dcard-<id>: scroll to that card
+  // and flash it once the task has loaded.
+  const { hash } = useLocation();
+  useEffect(() => {
+    const el = hash ? document.getElementById(hash.slice(1)) : null;
+    if (!el) return;
+    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    el.classList.add("dcard-flash");
+    const timer = setTimeout(() => el.classList.remove("dcard-flash"), 1600);
+    return () => clearTimeout(timer);
+  }, [hash, t?.id]);
 
   if (err) return <div className="pad">Task not found: {err}</div>;
   if (!t) return <div className="pad">Loading…</div>;
@@ -602,6 +603,13 @@ export function TaskBody({ id }: { id: string }) {
   const trackingOnly = isTrackingOnly(t);
   const jiraMirror = isJiraMirror(t);
   const codeReview = t.state === "in_review" && !trackingOnly;
+  // Same rule as the Needs-you queue: a merged task, or a ticket whose work has
+  // all finished, is waiting on the director's accept. The verify card is the
+  // one place that action lives, so the raw state buttons stay hidden while a
+  // card owns the decision (this page used to show Done/In Progress/Failed and
+  // nothing that said "accept").
+  const verify = t.state === "verifying" && !mirrorStillWorking(t, tasks);
+  const cardOwnsAction = codeReview || verify;
   const bindingNotice = trackingBindingNotice(t);
   // ReviewCard already renders the quiz for in_review; this covers the states
   // the API also accepts answers in (verifying/done/failed) where no review
@@ -836,7 +844,8 @@ export function TaskBody({ id }: { id: string }) {
           </div>
         )}
 
-        {codeReview && <ReviewCard task={t} onDone={refresh} />}
+        {codeReview && <ReviewCard task={t} surface="task" onDone={refresh} />}
+        {verify && <VerifyCard task={t} surface="task" onDone={refresh} />}
 
         {/* The risk check's verdicts belong to the CHANGE, not to the land queue
             (HIVE-570). The review card carries them while the task sits in
@@ -1121,7 +1130,7 @@ export function TaskBody({ id }: { id: string }) {
                 </button>
               )}
               {t.state === "done" && !trackingOnly && <RequestChanges taskId={t.id} />}
-              <div className="transitions">
+              {!cardOwnsAction && <div className="transitions">
                 {(NEXT[t.state] || []).filter((to) => !(trackingOnly && t.state === "failed" && to === "queued")).map((to) => (
                   <button
                     key={to}
@@ -1132,11 +1141,11 @@ export function TaskBody({ id }: { id: string }) {
                     {STATE_LABEL[to]}
                   </button>
                 ))}
-              </div>
+              </div>}
               {/* Moving a linked ticket writes to Jira. Saying so on the control
                   itself is the difference between a deliberate action and a
                   surprise a colleague notices in their ticket feed. */}
-              {isJira && (
+              {isJira && !cardOwnsAction && (
                 <p className="muted jira-move-note">
                   {jiraMoveSummary(t.state, jira)}
                 </p>

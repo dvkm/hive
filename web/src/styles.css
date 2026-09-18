@@ -1189,7 +1189,7 @@ textarea { font-family: inherit; }
   padding: 2px 8px;
   border-radius: 5px;
   background: var(--accent-dim);
-  color: #cfe0ff;
+  color: var(--accent-text);
 }
 .pr-lg {
   display: inline-block;
@@ -1245,12 +1245,15 @@ textarea { font-family: inherit; }
 .crumbs a {
   color: var(--text-dim);
 }
+/* Inline, not flex: a long (Korean) title must wrap under the id, not stack
+   as a narrow column beside it. */
 .task-title {
   font-size: 22px;
+  line-height: 1.3;
   margin: 2px 0 10px;
-  display: flex;
-  align-items: center;
-  gap: 10px;
+}
+.task-title .task-num {
+  margin-right: 6px;
 }
 .task-sub {
   display: flex;

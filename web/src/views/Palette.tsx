@@ -304,7 +304,7 @@ export default function Palette() {
         run: () => {
           close();
           if (h.type === "task") openTask(h.id);
-          else if (h.type === "decision") navigate(`/decisions#dcard-${h.id}`);
+          else if (h.type === "decision") navigate(h.task_id ? `/tasks/${h.task_id}#dcard-${h.id}` : "/inbox");
           else if (h.type === "learning") navigate("/learnings");
           else if (h.type === "policy") navigate("/policies");
           else if (h.type === "project") navigate("/projects");

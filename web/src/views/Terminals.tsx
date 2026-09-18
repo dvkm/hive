@@ -110,7 +110,7 @@ export default function Terminals() {
             <StatusDot state={c.state} /> {STATE_LABEL[c.state]}: {c.n}
           </span>
         ))}
-        <Link to="/decisions" className="chip">
+        <Link to="/inbox" className="chip">
           open decisions: {decisions.length}
         </Link>
         <label className="chip fleet-raw">
