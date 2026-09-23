@@ -24,13 +24,13 @@ const OK = (stdout = ""): ExecResult => ({ code: 0, stdout, stderr: "" });
 const WT = mkdtempSync(join(tmpdir(), "hive-priority-wt-"));
 const has = (argv: string[], ...xs: string[]) => xs.every((x) => argv.includes(x));
 
-// Records the order tasks were spawned in. The worktree branch is `hive/<taskId>`,
-// which is the only place the spawn argv names the task.
+// Records the order tasks were spawned in. The worktree directory is
+// `hive-<taskId>`, which is the only place the spawn argv names the task.
 function stubHerdr() {
   const spawns: string[] = [];
   const exec: Exec = async (argv) => {
     if (has(argv, "worktree", "create")) {
-      spawns.push((argv[argv.indexOf("--branch") + 1] ?? "").replace(/^hive\//, ""));
+      spawns.push(/hive-([^/]+)$/.exec(argv[argv.indexOf("--path") + 1] ?? "")?.[1] ?? "");
       return OK(`{"result":{"worktree":{"path":${JSON.stringify(WT)},"branch":"hive/x","open_workspace_id":"w1"}}}`);
     }
     if (has(argv, "workspace", "list")) return OK('{"result":{"workspaces":[{"workspace_id":"wF","label":"hive-fleet"}]}}');

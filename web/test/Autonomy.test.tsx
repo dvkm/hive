@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { act, create } from "react-test-renderer";
 import { api } from "../src/lib/api";
 import type { AutonomyStats } from "../src/lib/api";
-import { AutonomyPanel } from "../src/views/Brief";
+import { AutonomyPanel } from "../src/views/Analytics";
 
 (globalThis as unknown as { window: typeof globalThis }).window = globalThis;
 

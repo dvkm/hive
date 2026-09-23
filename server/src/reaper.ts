@@ -72,7 +72,7 @@ export async function reapOnce(db: DB, deps: ReaperDeps = {}): Promise<void> {
     if (list.code !== 0) continue;
 
     for (const wt of parseWorktreeList(list.stdout)) {
-      const taskId = taskIdFromBranch(wt.branch);
+      const taskId = taskIdFromBranch(wt.branch) ?? taskIdFromCwd(wt.path);
       if (!taskId) continue; // not a hive worker worktree
       try {
         const task = getTask(db, taskId);

@@ -37,11 +37,16 @@ function makeTask(db: DB, projectId: string, extra: Partial<{ kind: string; stat
 
 // Open decision cards are the simplest actionable item there is: one card, one
 // thing waiting on the director.
+// Open cards the advisor already left to the director: those are the ones that
+// count against the budget.
 function openDecisions(db: DB, projectId: string, n: number): void {
   for (let i = 0; i < n; i++) {
     const taskId = makeTask(db, projectId, { state: "needs_decision" });
+    const id = newId("dec");
     db.query("INSERT INTO decisions (id, task_id, ts, title, status) VALUES (?,?,?,?,'open')")
-      .run(newId("dec"), taskId, now(), `question ${i}`);
+      .run(id, taskId, now(), `question ${i}`);
+    db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
+      .run(newId("ev"), taskId, now(), "system", "advisor_verdict", JSON.stringify({ decision_id: id, owner: "director", why: "a product call" }));
   }
 }
 

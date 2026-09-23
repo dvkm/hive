@@ -154,11 +154,21 @@ export function fleetLabel(taskId: string, title: string): string {
 
 // ---- pure argv builders (the unit-tested surface) ----
 
-export function worktreeCreateArgv(repoPath: string, branch: string, base?: string): string[] {
+export function worktreeCreateArgv(repoPath: string, branch: string, base?: string, path?: string): string[] {
   const a = ["worktree", "create", "--cwd", repoPath, "--branch", branch];
   if (base) a.push("--base", base);
+  if (path) a.push("--path", path);
   a.push("--json");
   return a;
+}
+
+// herdr names a worktree directory after its branch, and the reaper maps panes
+// and checkouts back to tasks by that `hive-<taskId>` directory name. A branch
+// hive named for people keeps the same local directory by passing it explicitly.
+export function worktreePathFor(repoPath: string, branch: string, taskId: string): string | undefined {
+  if (branch === `hive/${taskId}`) return undefined;
+  const repo = repoPath.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || "repo";
+  return join(homedir(), ".herdr", "worktrees", repo, `hive-${taskId}`);
 }
 
 // INTERACTIVE claude (NOT `-p`). The brief is delivered as claude's first
@@ -989,13 +999,14 @@ export class Herdr {
       }
       base = remoteBase;
     }
-    let create = await this.run(worktreeCreateArgv(args.repoPath, branch, base));
+    const path = worktreePathFor(args.repoPath, branch, args.taskId);
+    let create = await this.run(worktreeCreateArgv(args.repoPath, branch, base, path));
     // herdr runs worktree ops one at a time; concurrent cross-project spawns
     // make this fail transiently. Retry with jittered backoff so simultaneous
     // contenders spread out instead of thundering-herding a single retry.
     for (let attempt = 1; create.code !== 0 && isWorktreeBusyError(create) && attempt < 5; attempt++) {
       await new Promise((r) => setTimeout(r, 500 * attempt + Math.random() * 400));
-      create = await this.run(worktreeCreateArgv(args.repoPath, branch, base));
+      create = await this.run(worktreeCreateArgv(args.repoPath, branch, base, path));
     }
     // A respawn reuses the task id, and so the branch and the worktree path. A
     // worktree left behind by a dead agent (or by a spawn that created the
@@ -1010,7 +1021,7 @@ export class Herdr {
         taskId: args.taskId,
         hintPath: parseExistingWorktreePath(`${create.stdout}\n${create.stderr}`),
       });
-      if (rec.reclaimed) create = await this.run(worktreeCreateArgv(args.repoPath, branch, base));
+      if (rec.reclaimed) create = await this.run(worktreeCreateArgv(args.repoPath, branch, base, path));
     }
     if (create.code !== 0)
       throw new HerdrError(`worktree create failed: ${create.stderr.trim() || create.stdout.trim()}`);
@@ -1310,7 +1321,7 @@ export class Herdr {
       if (add.code !== 0) throw new HerdrError(`ghost stage failed: ${add.stderr.trim() || add.stdout.trim()}`);
       // --no-verify: a repo pre-commit hook must not be able to block a rescue.
       const commit = await this.exec([
-        "git", "-C", wt.path, "commit", "--no-verify", "-m", `hive: WIP rescued from ${args.taskId}`,
+        "git", "-C", wt.path, "commit", "--no-verify", "-m", "WIP",
       ]);
       if (commit.code !== 0) throw new HerdrError(`ghost commit failed: ${commit.stderr.trim() || commit.stdout.trim()}`);
     }
@@ -1381,15 +1392,25 @@ export class Herdr {
     return { safe: false, reason: "branch not pushed to origin nor merged; refusing to remove worktree" };
   }
 
+  // Is a branch name already used, locally or on origin? Read from what git
+  // prints, not only its exit code, so a ref that does not exist never counts.
+  async branchExists(repoPath: string, name: string): Promise<boolean> {
+    const local = await this.exec(["git", "-C", repoPath, "rev-parse", "--verify", "--quiet", `refs/heads/${name}`]).catch(() => null);
+    if (local?.code === 0 && local.stdout.trim()) return true;
+    const remote = await this.exec(["git", "-C", repoPath, "ls-remote", "--heads", "origin", name]).catch(() => null);
+    return !!(remote?.code === 0 && remote.stdout.trim());
+  }
+
   // Delete a finished task's branch on origin. hive pushes task branches (to open
   // PRs) and nothing ever removed them, so origins accumulate them forever —
   // 500+ stale `hive/*` refs by 2026-08.
   //
   // Three guards, all required, none of which can be satisfied by a branch that
   // isn't hive's own finished work:
-  //   1. the name is `hive/<taskId>` — never the default branch, never a human's
-  //      branch, never a `ghost-*` WIP rescue (those hold unmerged work by
-  //      definition);
+  //   1. the name is `hive/<taskId>`, or the caller vouches (`owned`) that hive
+  //      named this branch for the task — never the default branch, never a
+  //      human's branch, never a `ghost-*` WIP rescue (those hold unmerged work
+  //      by definition);
   //   2. the ref actually exists on origin (a project that never pushes no-ops);
   //   3. the REMOTE tip is already an ancestor of the local default branch, i.e.
   //      the remote holds no commit the default branch doesn't. That is the same
@@ -1403,11 +1424,13 @@ export class Herdr {
     repoPath: string;
     branch: string;
     defaultBranch?: string;
+    owned?: boolean;
   }): Promise<{ deleted: boolean; reason: string }> {
     const base = args.defaultBranch ?? "main";
     // Same shape reaper.taskIdFromBranch matches (duplicated rather than
     // imported: reaper.ts imports this file).
-    if (!/^hive\/[^/]+$/.test(args.branch) || args.branch === base)
+    const hiveShaped = /^hive\/[^/]+$/.test(args.branch) || (args.owned === true && !args.branch.startsWith("ghost-"));
+    if (!hiveShaped || args.branch === base)
       return { deleted: false, reason: "not a hive task branch" };
     try {
       const ls = await this.exec(["git", "-C", args.repoPath, "ls-remote", "--heads", "origin", args.branch]);

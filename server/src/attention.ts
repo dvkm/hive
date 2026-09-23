@@ -3,9 +3,9 @@
 //
 // The count is NOT a second definition of "needs you". It calls the exact
 // function the board, the nav badge and the inbox call
-// (web/src/lib/needsYou.ts), fed the same four lists those surfaces fetch:
-// open decisions, open checkpoints, open understanding checks, and tasks with
-// health. A count that disagrees with the badge would be worse than no count.
+// (web/src/lib/needsYou.ts), fed the same lists those surfaces fetch: open
+// decisions, draft intents, and tasks with health. A count that disagrees with
+// the badge would be worse than no count.
 //
 // Over budget, hive pauses its OPTIONAL generators — the two that file work
 // nobody asked for right now:
@@ -21,9 +21,9 @@ import { getSetting, setSetting } from "./db.ts";
 import { parseTask, parseDecision } from "./rows.ts";
 import { tasksWithHealth } from "./health.ts";
 import { notTestProjectSql } from "./testProjects.ts";
-import { openCheckpointRows, openUnderstandingQuizzes } from "./api.ts";
+import { withAdvice, withIntentStatus } from "./advisor.ts";
 import { heldWatchChanges } from "./watch.ts";
-import { getNeedsYouItems, isActionable, itemProject, inProjectFilter } from "../../web/src/lib/needsYou.ts";
+import { getNeedsYouItems, itemProject, inProjectFilter } from "../../web/src/lib/needsYou.ts";
 
 // Conductor's 3-5 concurrent-workspace sweet spot is where 5 comes from. It is
 // a hypothesis about how much a person can hold, not a number to enforce.
@@ -68,15 +68,15 @@ function actionable(db: DB, projectId = ""): { project_id?: string }[] {
     )
     .all()
     .map(parseDecision);
-  const checkpoints = openCheckpointRows(db, null).map((row: any) => ({
-    id: row.id,
-    task_id: row.task_id,
-    ts: row.ts,
-    project_id: row.project_id,
-  }));
-  const quizzes = openUnderstandingQuizzes(db, null);
-  return getNeedsYouItems(decisions as any, tasks as any, checkpoints as any, quizzes as any)
-    .filter((item) => isActionable(item) && inProjectFilter(itemProject(item, tasks as any), projectId))
+  const intents = db
+    .query(
+      `SELECT i.* FROM intents i JOIN projects p ON p.id = i.project_id
+        WHERE i.status = 'draft' AND ${notTestProjectSql("p.config")}`
+    )
+    .all()
+    .map((row: any) => withIntentStatus(db, row));
+  return getNeedsYouItems(decisions.map((d: any) => withAdvice(db, d)) as any, tasks as any, intents as any)
+    .filter((item) => inProjectFilter(itemProject(item, tasks as any), projectId))
     .map((item) => ({ project_id: itemProject(item, tasks as any) }));
 }
 

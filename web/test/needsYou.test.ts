@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import type { Checkpoint, Decision, Task, UnderstandingQuiz } from "../src/lib/api";
-import { actionableItems, getNeedsYouItems, isInMotion, itemProject, orderFocusItems, trackedSubtasks } from "../src/lib/needsYou";
+import type { Decision, Intent, Task } from "../src/lib/api";
+import { actionableItems, getNeedsYouItems, isInMotion, itemProject, mirrorStillWorking, orderFocusItems, trackedSubtasks } from "../src/lib/needsYou";
 import { inProjectFilter } from "../src/lib/projectFilter";
 import { JiraPanel, jiraMoveHint, jiraMoveSummary, jiraPanelNotice, trackingBindingNotice } from "../src/views/Task";
 
@@ -46,135 +46,87 @@ test("tracked Jira cards show logical subtasks with retry chains collapsed", () 
   ]);
 });
 
-test("needs-you queue includes every actionable item", () => {
-  const decision = { id: "decision-1" } as Decision;
-  const checkpoint = { id: "checkpoint-1" } as Checkpoint;
-  const quiz = { id: "quiz-1", task_id: "quiz-task", project_id: "p1", task_state: "in_review" } as UnderstandingQuiz;
-  const activeQuiz = { id: "quiz-active", task_id: "review-1", task_state: "done" } as UnderstandingQuiz;
-  const cancelledQuiz = { id: "quiz-cancelled", task_id: "cancelled-1", task_state: "in_review" } as UnderstandingQuiz;
+// The server marks a review the director's by its gate; review_actionable is
+// the same fact (health.ts sets it to review_gate === "needs_you").
+const yours = { review_gate: "needs_you", review_actionable: true } as const;
+
+const intent = (id: string, extra: Partial<Intent> = {}) =>
+  ({ id, project_id: "p1", task_id: null, status: "draft", body_md: "", updated_at: "2026-09-01T00:00:00Z", ...extra }) as Intent;
+
+test("needs you holds only decisions, draft asks, and reviews that wait for a Ship", () => {
   const items = getNeedsYouItems(
-    [decision],
+    [{ id: "decision-1" } as Decision],
     [
-      task("review-1", "in_review", { review_actionable: true, health: { status: "dead", reason: null, since: "now" } }),
+      task("review-1", "in_review", { ...yours, health: { status: "dead", reason: null, since: "now" } }),
       task("failed-1", "failed"),
-      task("requeued-1", "failed", { requeued_to: "successor" }),
       task("stuck-1", "in_progress", { health: { status: "stuck", reason: null, since: "now" } }),
-      task("manager-1", "in_progress", { source: "chat_supervisor", health: { status: "stuck", reason: null, since: "now" } }),
-      task("tracked-1", "failed", { source: "external" }),
-      task("quiz-task", "done"),
-      task("cancelled-1", "cancelled"),
+      task("merged-1", "verifying", { pr_url: "https://example.com/pull/1" }),
+      task("done-1", "done"),
     ],
-    [checkpoint],
-    [quiz, activeQuiz, cancelledQuiz]
+    [intent("intent-1"), intent("accepted-1", { status: "accepted" })]
   );
 
-  expect(items.map((item) => item.kind)).toEqual(["decision", "checkpoint", "quiz_digest", "review", "attention", "attention"]);
-  expect(items.map((item) => item.id)).toEqual(["decision-1", "checkpoint-1", "quiz-digest:p1", "review-1", "failed-1", "stuck-1"]);
-});
-
-test("a stuck/dead task blocked on an unmerged dependency is 'waiting', not 'attention', and contributes no attention item", () => {
-  const blocker = task("blocker-1", "in_progress", { number: 87, title: "Consolidate the external-task guard", pr_url: "https://example.com/pull/87" });
-  const stuck = task("stuck-1", "in_progress", { number: 993, title: "Reject undeliverable sends", depends_on: ["blocker-1"], health: { status: "stuck", reason: null, since: "now" } });
-  const items = getNeedsYouItems([], [blocker, stuck], [], []);
-
-  expect(items).toEqual([
-    {
-      kind: "waiting",
-      id: "stuck-1",
-      task: stuck,
-      blockedBy: [{ id: "blocker-1", number: 87, title: "Consolidate the external-task guard", state: "in_progress", pr_url: "https://example.com/pull/87" }],
-    },
+  // Stuck, failed and merged work is hive's: the digest reports it.
+  expect(items.map((item) => [item.kind, item.id])).toEqual([
+    ["decision", "decision-1"],
+    ["intent", "intent-1"],
+    ["review", "review-1"],
   ]);
 });
 
-// A mirror rides one column behind its work, so both reached `verifying` and
-// the inbox showed two cards for one ticket, the mirror's carrying nothing.
-test("a verifying Jira mirror waits its turn while its work task is still live", () => {
-  const mirror = task("mirror", "verifying", { source: "external", source_ref: "jira:WEB-165", jira_key: "WEB-165" });
-  const work = task("work", "verifying", { jira_mirror_task_id: "mirror" });
-  const during = getNeedsYouItems([], [mirror, work], [], []).filter((item) => item.kind === "verify");
-  expect(during.map((item) => item.id)).toEqual(["work"]);
-  // Once the work is done the mirror is the one thing left to close.
-  const after = getNeedsYouItems([], [mirror, { ...work, state: "done" }], [], []).filter((item) => item.kind === "verify");
-  expect(after.map((item) => item.id)).toEqual(["mirror"]);
+test("a decision the advisor has not handed to the director stays out", () => {
+  const items = getNeedsYouItems(
+    [
+      { id: "judging", for_director: false } as Decision,
+      { id: "yours", for_director: true } as Decision,
+      { id: "older-server" } as Decision,
+    ],
+    []
+  );
+  expect(items.map((item) => item.id)).toEqual(["yours", "older-server"]);
 });
 
-test("a dependency landing (verifying/done) moves its dependent from 'waiting' back to 'attention'", () => {
+test("a draft ask stays out while hive is still reading the code or waiting on the reporter", () => {
+  const items = getNeedsYouItems(
+    [],
+    [],
+    [
+      intent("reading", { hive_working: true }),
+      intent("asked-reporter", { waiting_on: "reporter" }),
+      intent("yours", { hive_working: false, waiting_on: null }),
+    ]
+  );
+  expect(items.map((item) => item.id)).toEqual(["yours"]);
+});
+
+// HIVE-500: a review the director cannot act on yet stays on the board, but
+// never counts as needing him.
+test("an in_review task needs you only when its review gate is needs_you", () => {
   const items = getNeedsYouItems(
     [],
     [
-      task("blocker-1", "verifying", { number: 87, title: "Consolidate the external-task guard" }),
-      task("stuck-1", "in_progress", { depends_on: ["blocker-1"], health: { status: "stuck", reason: null, since: "now" } }),
-    ],
-    [],
-    []
+      task("merging", "in_review", { review_gate: "hive_merging", review_actionable: false, ci_status: "passing" }),
+      task("pending", "in_review", { review_gate: "ci_pending", review_actionable: false, ci_status: "pending" }),
+      task("no-report", "in_review", { review_gate: "no_pr", review_actionable: false }),
+      task("ready", "in_review", { ...yours, review_hold: "It changes billing." }),
+    ]
   );
 
-  // The blocker sits in `verifying` waiting for the director, so it is a
-  // needs-you item in its own right now (HIVE-604) alongside the unblocked task.
-  expect(items.map((item) => item.kind)).toEqual(["verify", "attention"]);
+  expect(items.map((item) => [item.id, item.kind])).toEqual([["ready", "review"]]);
 });
 
-test("a task blocked only by dead dependencies needs attention instead of waiting", () => {
-  const items = getNeedsYouItems(
-    [],
-    [
-      task("failed-blocker", "failed"),
-      task("cancelled-blocker", "cancelled"),
-      task("wedged", "queued", {
-        depends_on: ["failed-blocker", "cancelled-blocker"],
-        health: { status: "stuck", reason: "all blocking dependencies ended without completing", since: "now" },
-      }),
-    ],
-    [],
-    []
-  );
-
-  expect(items.map((item) => ({ id: item.id, kind: item.kind }))).toContainEqual({ id: "wedged", kind: "attention" });
+// A mirror rides one column behind its work: while any work task under it is
+// live, the work task's card is the one that carries the ticket.
+test("a Jira mirror counts as still working while any of its work tasks is live", () => {
+  const mirror = task("mirror", "in_review", { source: "external", source_ref: "jira:ABC-10", jira_key: "ABC-10" });
+  const work = task("work", "in_progress", { jira_mirror_task_id: "mirror" });
+  expect(mirrorStillWorking(mirror, [mirror, work])).toBe(true);
+  expect(mirrorStillWorking(mirror, [mirror, { ...work, state: "done" }])).toBe(false);
+  // Only a mirror rides behind work; an ordinary task never does.
+  expect(mirrorStillWorking(work, [mirror, work])).toBe(false);
 });
 
-test("a failed task always needs routing, even with an unmet dependency", () => {
-  const items = getNeedsYouItems(
-    [],
-    [
-      task("blocker-1", "in_progress", { number: 87, title: "Still in flight" }),
-      task("failed-1", "failed", { depends_on: ["blocker-1"] }),
-    ],
-    [],
-    []
-  );
-
-  expect(items.map((item) => item.kind)).toEqual(["attention"]);
-});
-
-// HIVE-500: a review the director cannot act on yet is still listed, but as its
-// own kind, so no count and no focus card ever stops on it.
-test("reviews the director cannot act on split into review_pending", () => {
-  const items = getNeedsYouItems(
-    [],
-    [
-      task("pending", "in_review", { kind: "ship", pr_url: "https://example.com/pending", ci_status: "pending" }),
-      task("no-report", "in_review", { kind: "ship" }),
-      ...[1, 2].map((number) => task(`ready-${number}`, "in_review", {
-        kind: "ship",
-        pr_url: `https://example.com/ready-${number}`,
-        ci_status: "passing",
-        review_actionable: true,
-      })),
-    ],
-    [],
-    []
-  );
-
-  expect(items.map((item) => [item.id, item.kind])).toEqual([
-    ["pending", "review_pending"],
-    ["no-report", "review_pending"],
-    ["ready-1", "review"],
-    ["ready-2", "review"],
-  ]);
-});
-
-test("Focus gives priority a head start without starving old low-priority work", () => {
+test("the queue gives priority a head start without starving old low-priority work", () => {
   const tasks = [
     task("old-later", "in_review", { priority: "later", needs_you_since: "2026-08-20T00:00:00Z", updated_at: "2026-08-24T00:00:00Z" }),
     task("new-now", "in_review", { priority: "now", updated_at: "2026-08-23T00:00:00Z" }),
@@ -184,14 +136,14 @@ test("Focus gives priority a head start without starving old low-priority work",
   const items = [
     { kind: "review" as const, id: tasks[0].id, task: tasks[0] },
     { kind: "decision" as const, id: "decision-now", decision: { id: "decision-now", task_id: tasks[1].id, ts: tasks[1].updated_at } as Decision },
-    { kind: "checkpoint" as const, id: "checkpoint-normal", checkpoint: { id: "checkpoint-normal", task_id: tasks[2].id, ts: tasks[2].updated_at } as Checkpoint },
+    { kind: "review" as const, id: tasks[2].id, task: tasks[2] },
     { kind: "review" as const, id: tasks[3].id, task: tasks[3] },
   ];
 
   expect(orderFocusItems(items, tasks).map((item) => item.id)).toEqual([
     "old-later",
     "decision-now",
-    "checkpoint-normal",
+    "new-normal",
     "new-later",
   ]);
 });
@@ -200,13 +152,11 @@ test("tracking-only tasks never enter code-review queues", () => {
   const items = getNeedsYouItems(
     [],
     [
-      task("jira", "in_review", { source: "external", source_ref: "jira:WEB-1" }),
-      task("linked", "in_review", { source: "agent", source_ref: "jira:WEB-2" }),
-      task("canary-1", "in_review", { source: "external", never_dispatched: true }),
-      task("review", "in_review", { source: "agent", pr_url: "https://example.com/pr", ci_status: "passing" }),
-    ],
-    [],
-    []
+      task("jira", "in_review", { ...yours, source: "external", source_ref: "jira:WEB-1" }),
+      task("linked", "in_review", { ...yours, source: "agent", source_ref: "jira:WEB-2" }),
+      task("canary-1", "in_review", { ...yours, source: "external", never_dispatched: true }),
+      task("review", "in_review", { ...yours, source: "agent", pr_url: "https://example.com/pr", ci_status: "passing" }),
+    ]
   );
 
   expect(items.map((item) => item.id)).toEqual(["review"]);
@@ -334,19 +284,17 @@ test("legacy tracking bindings remain visibly actionable", () => {
 });
 
 test("itemProject resolves the project for every needs-you item kind", () => {
-  const reviewTask = task("t-review", "in_review", { project_id: "p1", pr_url: "https://x/1", ci_status: "passing", review_actionable: true });
+  const reviewTask = task("t-review", "in_review", { project_id: "p1", pr_url: "https://x/1", ci_status: "passing", ...yours });
   const decisionTask = task("t-decision", "needs_decision", { project_id: "p2" });
   const tasks = [reviewTask, decisionTask];
   const decision = { id: "d1", task_id: "t-decision", status: "open" } as Decision;
-  const checkpoint = { id: "c1", task_id: "t-x", project_id: "p3" } as Checkpoint;
-  const quiz = { id: "q1", task_id: "t-y", project_id: "p4", task_state: "verifying" } as UnderstandingQuiz;
 
-  const items = getNeedsYouItems([decision], tasks, [checkpoint], [quiz]);
+  const items = getNeedsYouItems([decision], tasks, [intent("i1", { project_id: "p3" })]);
   const projects = Object.fromEntries(items.map((item) => [item.kind, itemProject(item, tasks)]));
-  expect(projects).toEqual({ decision: "p2", checkpoint: "p3", quiz_digest: "p4", review: "p1" });
+  expect(projects).toEqual({ decision: "p2", intent: "p3", review: "p1" });
 
   // "All" (empty filter) keeps everything; a project filter keeps only its own.
-  expect(items.filter((item) => inProjectFilter(itemProject(item, tasks), "")).length).toBe(4);
+  expect(items.filter((item) => inProjectFilter(itemProject(item, tasks), "")).length).toBe(3);
   expect(items.filter((item) => inProjectFilter(itemProject(item, tasks), "p2")).map((item) => item.kind)).toEqual(["decision"]);
 });
 
@@ -366,30 +314,22 @@ test("in motion counts hive's own work, not tracking-only rows parked in a work 
   ]);
 });
 
-// HIVE-556. The nav badge, the landing headline and the board strip all call
-// actionableItems, so "needs you" can only ever mean one thing. This test is
-// what fails if a fourth surface starts counting its own set again.
-test("one needs-you count: waiting and pending reviews never count, and the project filter applies", () => {
-  const mine = task("mine", "in_review", { project_id: "acme", review_actionable: true });
-  const notMine = task("theirs", "in_review", { project_id: "other", review_actionable: true });
-  const pending = task("pending", "in_review", { project_id: "acme" });
+// HIVE-556. The nav badge and the Home headline both call actionableItems, so
+// "needs you" can only ever mean one thing. This test is what fails if another
+// surface starts counting its own set again.
+test("one needs-you count: pending reviews and stuck agents never count, and the project filter applies", () => {
+  const mine = task("mine", "in_review", { project_id: "acme", ...yours });
+  const notMine = task("theirs", "in_review", { project_id: "other", ...yours });
+  const pending = task("pending", "in_review", { project_id: "acme", review_gate: "review_running", review_actionable: false });
   const stuck = task("stuck", "in_progress", {
     project_id: "acme",
     health: { status: "stuck", since: "2026-01-01T00:00:00Z", reason: "quiet" },
   });
-  const blocked = task("blocked", "in_progress", {
-    project_id: "acme",
-    depends_on: ["mine"],
-    health: { status: "dead", since: "2026-01-01T00:00:00Z", reason: "agent gone" },
-  });
-  const tasks = [mine, notMine, pending, stuck, blocked];
-  const items = getNeedsYouItems([{ id: "d1", task_id: "mine" } as Decision], tasks, [], []);
+  const tasks = [mine, notMine, pending, stuck];
+  const items = getNeedsYouItems([{ id: "d1", task_id: "mine" } as Decision], tasks);
 
-  expect(items.map((item) => item.kind).sort()).toEqual(
-    ["attention", "decision", "review", "review", "review_pending", "waiting"],
-  );
-  // Across every project: the decision, two actionable reviews, one stuck task.
-  expect(actionableItems(items, tasks).map((item) => item.id).sort()).toEqual(["d1", "mine", "stuck", "theirs"]);
+  // Across every project: the decision and the two reviews waiting for a Ship.
+  expect(actionableItems(items, tasks).map((item) => item.id).sort()).toEqual(["d1", "mine", "theirs"]);
   // Scoped to one project, the other project's review drops out.
-  expect(actionableItems(items, tasks, "acme").map((item) => item.id).sort()).toEqual(["d1", "mine", "stuck"]);
+  expect(actionableItems(items, tasks, "acme").map((item) => item.id).sort()).toEqual(["d1", "mine"]);
 });

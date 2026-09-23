@@ -9,9 +9,9 @@ function stub(over: Partial<AutonomyStats> = {}): AutonomyStats {
     auto_merge_precision: { merges: 13, measurable: 12, clean: 11, fixed: 1, precision: 11 / 12, revert_detection: "on", cases: [] },
     inbox_load: {
       by_day: [0, 4, 8, 2, 0, 1, 3].map((total, i) => ({
-        day: `2026-08-1${3 + i}`, decision: total, quiz: 0, checkpoint: 0, dialog: 0, stale: 0, total,
+        day: `2026-08-1${3 + i}`, decision: total, checkpoint: 0, dialog: 0, stale: 0, total,
       })),
-      totals: { decision: 18, quiz: 0, checkpoint: 2, dialog: 0, stale: 0, total: 20 },
+      totals: { decision: 18, checkpoint: 2, dialog: 0, stale: 0, total: 20 },
       per_day: 20 / 7,
     },
     recovery: { auto_respawns: 9, one_cap_parks: 2, scouts_spawned: 4 },

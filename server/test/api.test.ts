@@ -450,10 +450,6 @@ test("the shared spawn boundary rejects external and Jira-linked tasks", async (
 
 test("review_summary keeps its structured sections; empty submission is rejected", async () => {
   const t = await post("/api/tasks", { project_id: projectId, title: "rs task" });
-  const longQuestion = "cms-e2e.yml requires VITE_CMS_URL to use host.docker.internal:5175 rather than localhost:5175, even though both names can sound like the same Vite server. Given the reasoning that made this task's WEB_URL override safe, why would replacing host.docker.internal with localhost break this suite when the browser runs from a separate Docker container?";
-  const longOption = "Because localhost is resolved by the process using it. From the Playwright container it points back to that container, not to the host machine running Vite, while host.docker.internal provides the route back to the host. The WEB_URL override compared two host-reachable preview endpoints, so it did not cross that container boundary.";
-  expect(longQuestion.length).toBeGreaterThan(300);
-  expect(longOption.length).toBeGreaterThan(300);
   const r = await post(`/api/tasks/${t.json.id}/events`, {
     type: "review_summary",
     done: ["fixed the save flow"],
@@ -467,25 +463,6 @@ test("review_summary keeps its structured sections; empty submission is rejected
       affected_areas: ["Draft editor", 42, "Offline saves"],
       risk_assessment: "The queue is covered, but browser shutdown can still interrupt a save.",
       participate: "We can now consider offline saves.",
-      check: {
-        question: "Which edit wins?",
-        options: [{ key: "old", label: "The oldest one." }, { key: "new", label: "The newest one." }, { key: "bad" }],
-        answer_key: "new",
-        explanation: "The queue preserves the latest accepted edit.",
-      },
-      checks: [
-        {
-          question: longQuestion,
-          options: [{ key: "old", label: longOption }, { key: "new", label: "The newest one." }],
-          answer_key: "new",
-          explanation: "The queue preserves the latest accepted edit.",
-        },
-        {
-          question: "What happens after a newer edit arrives?",
-          options: [{ key: "replace", label: "It replaces the queued edit." }, { key: "ignore", label: "It is ignored." }],
-          answer_key: "replace",
-        },
-      ],
     },
   });
   expect(r.status).toBe(201);
@@ -495,47 +472,10 @@ test("review_summary keeps its structured sections; empty submission is rejected
   expect(r.json.event.payload.understanding.scope).toBe("The editor queue and offline-save path were examined.");
   expect(r.json.event.payload.understanding.affected_areas).toEqual(["Draft editor", "Offline saves"]);
   expect(r.json.event.payload.understanding.risk_assessment).toBe("The queue is covered, but browser shutdown can still interrupt a save.");
-  expect(r.json.event.payload.understanding.checks).toHaveLength(2);
-  expect(r.json.event.payload.understanding.checks[0].question).toBe(longQuestion);
-  expect(r.json.event.payload.understanding.checks[0].options[0].label).toBe(longOption);
-  expect(r.json.event.payload.understanding.checks[1].answer_key).toBe("replace");
-  expect(r.json.event.payload.understanding.check).toBeUndefined();
   expect(r.json.event.payload.note).toBeUndefined();
-
-  const legacyBank = await post(`/api/tasks/${t.json.id}/events`, {
-    type: "review_summary",
-    understanding: {
-      check: [
-        { question: "First angle?", options: [{ key: "yes", label: "Yes." }, { key: "no", label: "No." }], answer_key: "yes" },
-        { question: "Second angle?", options: [{ key: "yes", label: "Yes." }, { key: "no", label: "No." }], answer_key: "yes" },
-      ],
-    },
-  });
-  expect(legacyBank.json.event.payload.understanding.checks).toHaveLength(2);
-  expect(legacyBank.json.event.payload.understanding.check).toBeUndefined();
 
   const bad = await post(`/api/tasks/${t.json.id}/events`, { type: "review_summary", note: "hi" });
   expect(bad.status).toBe(400);
-
-  for (const question of [
-    "You find that a shared resource is blocking your task. What should you do?",
-    "A PR is green, but merge keeps failing. Where else could the actual blocker live?",
-    "Your branch needs new base commits, but force-pushing is denied. What's the correct move?",
-  ]) {
-    const agentTraining = await post(`/api/tasks/${t.json.id}/events`, {
-      type: "review_summary",
-      done: ["reviewed the change"],
-      understanding: {
-        checks: [{
-          question,
-          options: [{ key: "inspect", label: "Inspect the worker environment." }, { key: "ignore", label: "Ignore it." }],
-          answer_key: "inspect",
-        }],
-      },
-    });
-    expect(agentTraining.status).toBe(400);
-    expect(agentTraining.json.error).toContain("teach the director");
-  }
 });
 
 test("checkpoints: emit -> listed open -> ack removes; flag steers; bad verdict 400", async () => {
@@ -733,23 +673,12 @@ test("transition endpoint enforces the state machine", async () => {
   expect(bad2.status).toBe(409);
 });
 
-// A handoff is held when the task owes an understanding check and its latest
-// review has none (HIVE-580). Tests that only care about the pr_url plumbing
-// file this first so they reach the part they are actually about.
-const REVIEW_WITH_CHECK = {
+// Tests that only care about the pr_url plumbing file a review first, the way
+// an agent does before `ready`.
+const REVIEW = {
   type: "review_summary",
   done: ["the work"],
-  understanding: {
-    essence: "a change",
-    checks: [
-      {
-        question: "What does this change do?",
-        options: [{ key: "a", label: "the work" }, { key: "b", label: "nothing" }],
-        answer_key: "a",
-        explanation: "It does the work.",
-      },
-    ],
-  },
+  understanding: { essence: "a change" },
 };
 
 test("in_review task with a PR refuses a direct move to verifying (must use /merge)", async () => {
@@ -757,7 +686,7 @@ test("in_review task with a PR refuses a direct move to verifying (must use /mer
   const id = t.json.id;
   await post(`/api/tasks/${id}/transition`, { to: "in_progress" });
   await post(`/api/tasks/${id}/events`, { type: "evidence", note: "proof", kind: "log" });
-  await post(`/api/tasks/${id}/events`, REVIEW_WITH_CHECK);
+  await post(`/api/tasks/${id}/events`, REVIEW);
   await post(`/api/tasks/${id}/events`, { type: "ready", pr_url: "https://gh/pr/99" });
 
   const r = await post(`/api/tasks/${id}/transition`, { to: "verifying" });
@@ -771,7 +700,7 @@ test("ready emit records the pr_url and advances in_progress -> in_review", asyn
   const id = t.json.id;
   await post(`/api/tasks/${id}/transition`, { to: "in_progress" });
   await post(`/api/tasks/${id}/events`, { type: "evidence", note: "proof", kind: "log" });
-  await post(`/api/tasks/${id}/events`, REVIEW_WITH_CHECK);
+  await post(`/api/tasks/${id}/events`, REVIEW);
 
   const r = await post(`/api/tasks/${id}/events`, { type: "ready", pr_url: "https://gh/pr/42", note: "PR up" });
   expect(r.status).toBe(200);
@@ -810,7 +739,7 @@ test("ready emit refreshes stale branch metadata for an already-linked PR", asyn
     const task = await call("/api/tasks", { project_id: project.json.id, title: "replace stale PR" });
     await call(`/api/tasks/${task.json.id}/transition`, { to: "in_progress" });
     await call(`/api/tasks/${task.json.id}/events`, { type: "evidence", note: "proof", kind: "log" });
-    await call(`/api/tasks/${task.json.id}/events`, REVIEW_WITH_CHECK);
+    await call(`/api/tasks/${task.json.id}/events`, REVIEW);
     db2.query("UPDATE tasks SET branch = ?, pr_url = ? WHERE id = ?").run(
       "hive/task-rejected",
       "https://github.com/example/repo/pull/2",
@@ -925,17 +854,9 @@ test("POST /merge returns instead of hanging when the post-merge smoke check fai
     await post2(`/api/tasks/${id}/events`, {
       type: "review_summary",
       done: ["implemented"],
-      understanding: {
-        essence: "The smoke check validates the merged result.",
-        check: {
-          question: "What validates the merged result?",
-          options: [{ key: "smoke", label: "The smoke check." }, { key: "none", label: "Nothing." }],
-          answer_key: "smoke",
-        },
-      },
+      understanding: { essence: "The smoke check validates the merged result." },
     });
     await post2(`/api/tasks/${id}/events`, { type: "ready", pr_url: "https://gh/pr/1" });
-    await post2(`/api/tasks/${id}/understanding-quiz/answer`, { answer_key: "smoke", source: "director" });
 
     const start = Date.now();
     const merged = await post2(`/api/tasks/${id}/merge`, {});

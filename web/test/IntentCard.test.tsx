@@ -107,6 +107,6 @@ test("draft intents sit above reviews in the needs-you queue, grouped per projec
     { ...intent, id: "int_beta", project_id: "beta", task_id: null },
     { ...intent, id: "int_alpha", project_id: "alpha", task_id: null },
   ];
-  const ordered = orderFocusItems(getNeedsYouItems([], tasks, [], [], drafts), tasks);
+  const ordered = orderFocusItems(getNeedsYouItems([], tasks, drafts), tasks);
   expect(ordered.map((item) => item.id)).toEqual(["int_alpha", "int_beta", "review-1"]);
 });

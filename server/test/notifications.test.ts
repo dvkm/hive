@@ -1,6 +1,7 @@
 import { test, expect } from "bun:test";
 import { openDb, newId, now, type DB } from "../src/db.ts";
 import { transition } from "../src/state.ts";
+import { notifyDirectorReviews } from "../src/reconciler.ts";
 import { enqueue, runDigest, ackNotifications, summarize, markShown, deeplinkPath, notificationLaunchArgv } from "../src/notifications.ts";
 import type { Exec, ExecResult } from "../src/exec.ts";
 
@@ -48,7 +49,7 @@ test("normal notifications batch into ONE digest, then never repeat", () => {
   expect(notification.hostname).toBe("notify");
   expect(notification.searchParams.get("title")).toBe("hive digest");
   expect(notification.searchParams.get("body")).toBe("2 done, 1 needs decision");
-  expect(notification.searchParams.get("path")).toBe("/inbox");
+  expect(notification.searchParams.get("path")).toBe("/");
 
   // all marked delivered; a second digest with nothing pending is a no-op
   const second = runDigest(db, { exec });
@@ -188,16 +189,36 @@ test("deeplink path: decision card beats task page beats the board", () => {
   expect(deeplinkPath({})).toBe("/");
 });
 
-test("a task handed to review notifies urgently", () => {
+test("a review is pushed once, and only when it needs the director's own Ship", () => {
   const { db, projectId } = freshDb();
-  const id = newId();
-  const t = now();
-  db.query(
-    "INSERT INTO tasks (id, project_id, title, state, kind, created_at, updated_at) VALUES (?,?,?, 'in_progress','ship', ?, ?)"
-  ).run(id, projectId, "ship it", t, t);
+  const reviewReady = (title: string, project: string) => {
+    const id = newId();
+    const t = now();
+    db.query(
+      "INSERT INTO tasks (id, project_id, title, state, kind, created_at, updated_at) VALUES (?,?,?, 'in_progress','ship', ?, ?)"
+    ).run(id, project, title, t, t);
+    db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
+      .run(newId("ev"), id, t, "agent", "review_summary", JSON.stringify({ done: ["did it"] }));
+    transition(db, id, "in_review");
+    return id;
+  };
+  const reviewPushes = (id: string) =>
+    db.query("SELECT * FROM notifications WHERE task_id = ? AND kind = 'review'").all(id) as any[];
 
-  transition(db, id, "in_review");
-  const notif = db.query("SELECT * FROM notifications WHERE task_id = ? AND kind = 'review'").get(id) as any;
-  expect(notif).toBeTruthy();
-  expect(notif.urgency).toBe("urgent");
+  // This project never ships `ship` work on its own, so the review is the director's.
+  const held = reviewReady("ship it", projectId);
+  expect(reviewPushes(held)).toHaveLength(0); // reaching review alone pushes nothing
+  notifyDirectorReviews(db);
+  notifyDirectorReviews(db);
+  const pushes = reviewPushes(held);
+  expect(pushes).toHaveLength(1);
+  expect(pushes[0].urgency).toBe("urgent");
+  expect(pushes[0].body).toContain("does not ship ship changes on its own");
+
+  // A project that ships this kind itself: hive lands it, nobody is pushed.
+  const auto = newId("proj");
+  db.query("INSERT INTO projects (id, name, config, created_at) VALUES (?,?,?,?)").run(auto, "auto", JSON.stringify({ auto_merge: { kinds: ["ship"] } }), now());
+  const landed = reviewReady("hive lands it", auto);
+  notifyDirectorReviews(db);
+  expect(reviewPushes(landed)).toHaveLength(0);
 });

@@ -10,7 +10,6 @@ process.env.HIVE_HOME = HOME;
 
 const { openDb } = await import("../src/db.ts");
 const { makeHandler } = await import("../src/api.ts");
-const { nagOpenDecisions } = await import("../src/reconciler.ts");
 const { isNonActionableIntake } = await import("../src/intake/gchat.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
 import type { Exec, ExecResult } from "../src/exec.ts";
@@ -312,35 +311,6 @@ test("dismissing an authority card denies the grant and steers the agent", async
   expect(g2.json.decision_id).not.toBe(d1);
 });
 
-// ---- decision aging nags ------------------------------------------------------
-
-test("open decisions nag urgently at 15m and again at 60m, once per tier", async () => {
-  const id = await newTask("aging decision");
-  const r = await post(`/api/tasks/${id}/guarded-action`, {
-    action: "command.dangerous.recursive-forced-rm",
-    target: "rm -rf /somewhere",
-    detail: "command approval (dangerous): recursive/forced rm",
-    summary: "clear a scratch directory",
-  });
-  const decisionId = r.json.decision_id;
-  const t0 = Date.parse(
-    (db.query("SELECT ts FROM decisions WHERE id = ?").get(decisionId) as any).ts
-  );
-  const nags = () =>
-    (db.query("SELECT COUNT(*) AS n FROM notifications WHERE kind = 'decision_nag' AND decision_id = ?").get(decisionId) as any).n;
-
-  nagOpenDecisions(db, t0 + 5 * 60 * 1000); // 5m: quiet
-  expect(nags()).toBe(0);
-  nagOpenDecisions(db, t0 + 20 * 60 * 1000); // 15m tier
-  nagOpenDecisions(db, t0 + 25 * 60 * 1000); // same tier: no repeat
-  expect(nags()).toBe(1);
-  nagOpenDecisions(db, t0 + 90 * 60 * 1000); // 60m tier
-  expect(nags()).toBe(2);
-  await post(`/api/decisions/${decisionId}/dismiss`, {});
-  nagOpenDecisions(db, t0 + 300 * 60 * 1000); // closed: silent
-  expect(nags()).toBe(2);
-});
-
 // ---- usage-limit park + timed resume -------------------------------------------
 
 test("parseResetClock: next local occurrence, same day or tomorrow", async () => {
@@ -476,66 +446,11 @@ test("emit ready without evidence is held with instructions; passes once evidenc
   db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
     "evd_gate_t", id, new Date().toISOString(), "log", "/tmp/p.log", "proof"
   );
-  // Evidence alone is not enough: this project auto-merges nothing, so every
-  // task owes an understanding check whatever the auto review later says, and
-  // the handoff says so while the agent is still on its turn (HIVE-580).
-  const noCheck = await post(`/api/tasks/${id}/events`, { type: "ready" });
-  expect(noCheck.json.held).toBe(true);
-  expect(noCheck.json.reason).toBe("missing_understanding_check");
-  expect(noCheck.json.message).toContain("emit it again");
-
-  await post(`/api/tasks/${id}/events`, {
-    type: "review_summary",
-    done: ["gated the handoff"],
-    understanding: {
-      essence: "hold the handoff instead of the merge",
-      checks: [
-        {
-          question: "When does the handoff get held?",
-          options: [{ key: "a", label: "when the review has no check" }, { key: "b", label: "never" }],
-          answer_key: "a",
-          explanation: "The same rule the merge gate reads, applied at handoff time.",
-        },
-      ],
-    },
-  });
-  await post(`/api/tasks/${id}/events`, { type: "ready" });
+  // Evidence is enough: nothing else holds the handoff, even in a project that
+  // auto-merges nothing.
+  const ready = await post(`/api/tasks/${id}/events`, { type: "ready" });
+  expect(ready.json.held).toBeUndefined();
   expect((db.query("SELECT state FROM tasks WHERE id = ?").get(id) as any).state).toBe("in_review");
-});
-
-test("emit ready fails open when the auto review has not run yet", async () => {
-  // The fail-open case (HIVE-580). This kind is inside auto_merge.kinds, so the
-  // only thing that could still owe a check is the auto review — and it has not
-  // run. The handoff must not guess: it lets this through, and the merge gate
-  // asks later if the verdict turns out to want a check.
-  const p = await post("/api/projects", {
-    name: "mechanical-p",
-    repo_path: "/repo",
-    config: { auto_merge: { kinds: ["chore"] } },
-  });
-  const id = (await post("/api/tasks", { project_id: p.json.id, title: "mechanical", kind: "chore" })).json.id;
-  await post(`/api/tasks/${id}/spawn`, {});
-  db.query("UPDATE tasks SET head_sha = 'deadbeef' WHERE id = ?").run(id);
-  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
-    "evd_mech", id, new Date().toISOString(), "log", "/tmp/m.log", "proof"
-  );
-
-  const res = await post(`/api/tasks/${id}/events`, { type: "ready" });
-  expect(res.json.held).toBeUndefined();
-  expect((db.query("SELECT state FROM tasks WHERE id = ?").get(id) as any).state).toBe("in_review");
-
-  // Same project, same kind, but the director asked for a quiz on this card:
-  // that signal does not depend on the review, so the handoff holds on it.
-  const id2 = (await post("/api/tasks", { project_id: p.json.id, title: "flagged", kind: "chore" })).json.id;
-  await post(`/api/tasks/${id2}/spawn`, {});
-  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
-    "evd_flag", id2, new Date().toISOString(), "log", "/tmp/f.log", "proof"
-  );
-  const { writeEvent } = await import("../src/state.ts");
-  writeEvent(db, { task_id: id2, source: "human", type: "understanding_required", payload: {} });
-  const held = await post(`/api/tasks/${id2}/events`, { type: "ready" });
-  expect(held.json.held).toBe(true);
-  expect(held.json.reason).toBe("missing_understanding_check");
 });
 
 test("idle backstop never re-reviews after changes_requested until new evidence arrives", async () => {
@@ -581,21 +496,14 @@ test("handOffToReview holds while a queued-input recovery is in flight (#1234 re
   expect(handOffToReview(db, id, "reconciler")).toBe(true);
 });
 
-test("a director answer keeps an old report and quiz out of review until regenerated", async () => {
+test("a director answer keeps an old report out of review until regenerated", async () => {
   const { decisionAnswerUnaddressed, writeEvent } = await import("../src/state.ts");
   const id = await newTask("refresh after my answer");
   await post(`/api/tasks/${id}/spawn`, {});
   const review = () => post(`/api/tasks/${id}/events`, {
     type: "review_summary",
     done: ["investigated the integration"],
-    understanding: {
-      background: "Authentication was initially blocked.",
-      check: {
-        question: "What changed?",
-        options: [{ key: "input", label: "The director supplied new input." }, { key: "nothing", label: "Nothing changed." }],
-        answer_key: "input",
-      },
-    },
+    understanding: { background: "Authentication was initially blocked." },
   });
   await review();
   db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(

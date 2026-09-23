@@ -167,10 +167,10 @@ const promote: Check = (v) => {
   return null;
 };
 
-// {sensitive_paths: ["auth", "payments", ...]} — path tokens whose changes stay
-// judgment-class no matter how clean the auto-review was. Each token matches as
-// a case-insensitive substring of any path segment, so "auth" also catches
-// `authTokens.ts`.
+// {sensitive_paths: ["auth", "payments", ...]} — path tokens whose changes wait
+// for the director's own Ship no matter how clean the auto-review was
+// (reviewer.directorHold). Each token matches as a case-insensitive substring
+// of any path segment, so "auth" also catches `authTokens.ts`.
 const understandingChecks: Check = (v) => {
   const bad = obj(v);
   if (bad) return bad;
@@ -334,7 +334,7 @@ const CHECKS: Record<string, Check> = {
   render_proof: bool,
   // Per-task preview stacks on the review card (server/src/preview.ts).
   preview,
-  // Which changes still need a director understanding check (hive-1559).
+  // Which changed paths always wait for the director's Ship (reviewer.directorHold).
   understanding_checks: understandingChecks,
   release_review_agents: bool,
   // false keeps a finished task's `hive/<id>` branch on origin (cleanup.ts).

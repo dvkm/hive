@@ -9,8 +9,11 @@ process.on("unhandledRejection", (e) => {
   console.error("[hive] unhandledRejection (survived):", e);
 });
 import { openDb, defaultDbPath } from "./db.ts";
-import { makeHandler, keepSupervisorWarm, notifyManagerOfEvent, repairDuplicateQuizPasses, deferShippedQuizzes, sweepManagerInboxes, wakeDueManagers, refreshOriginMain, acceptIntent } from "./api.ts";
+import { makeHandler, keepSupervisorWarm, notifyManagerOfEvent, sweepManagerInboxes, wakeDueManagers, refreshOriginMain, acceptIntent, apiAnswerDecision, withBundle } from "./api.ts";
 import { startIntentInvestigator } from "./intentInvestigate.ts";
+import { advisorOn, startAdvisor } from "./advisor.ts";
+import { parseDecision } from "./rows.ts";
+import { broadcast } from "./bus.ts";
 import { startReconciler, reAdoptAgentsOnBoot } from "./reconciler.ts";
 import { startDispatcher } from "./dispatcher.ts";
 import { startReaper } from "./reaper.ts";
@@ -69,13 +72,6 @@ applyTypesafeSettings(db);
   }
 }
 
-const carriedQuizPasses = repairDuplicateQuizPasses(db);
-if (carriedQuizPasses) console.log(`[hive] preserved ${carriedQuizPasses} completed quiz pass(es) across duplicate reviews`);
-
-// Backfill: quizzes still reading "required" on tasks that already shipped,
-// left behind by merges hive did not perform (HIVE-544). Idempotent.
-const sweptQuizzes = deferShippedQuizzes(db);
-if (sweptQuizzes) console.log(`[hive] deferred ${sweptQuizzes} unanswered quiz(zes) on tasks that already shipped`);
 const handle = makeHandler(db, { supervise: true });
 
 // First-run bootstrap: make sure the standing safety rules exist. Idempotent.
@@ -254,6 +250,18 @@ startJiraSync(db);
 // hive and the work starts. HIVE_INTENT_INVESTIGATE=0 keeps drafts as written.
 if (process.env.HIVE_INTENT_INVESTIGATE !== "0")
   startIntentInvestigator(db, { accept: (id) => acceptIntent(db, id, { accepted_by: "hive" }) });
+// Every decision card is judged before the director is asked: hive answers the
+// reversible ones and leaves product and authority calls to the director.
+// HIVE_ADVISOR=0 sends every card to the director again.
+if (advisorOn())
+  startAdvisor(db, {
+    answer: (id, key, note) =>
+      apiAnswerDecision(db, defaultHerdr, id, { answer_key: key, answer_note: note, source: "system", actor: "hive-advisor" }).ok,
+    publish: (id) => {
+      const row = db.query("SELECT * FROM decisions WHERE id = ?").get(id);
+      if (row) broadcast({ type: "decision", decision: withBundle(db, parseDecision(row)) });
+    },
+  });
 // Mirrors whose work finished while this server was down (and every ticket
 // shipped before the link existed) are advanced once, here — the same rule the
 // live path uses, so it closes nothing the live path would not have (HIVE-546).

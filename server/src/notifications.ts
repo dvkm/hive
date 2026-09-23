@@ -44,8 +44,6 @@ export function setNotifier(exec: Exec | null): void {
 // Where clicking a notification should land in the app. These are the same
 // paths the web UI already uses, so a deeplink is just a normal route.
 export function deeplinkPath(n: { kind?: string; task_id?: string | null; decision_id?: string | null }): string {
-  // The catch-up digest is one pass over many tasks, so it opens the queue, not a task.
-  if (n.kind === "quiz_digest") return "/inbox";
   if (n.decision_id) return `/decisions#dcard-${n.decision_id}`;
   if (n.task_id) return `/tasks/${n.task_id}`;
   return "/";
@@ -201,7 +199,7 @@ export function runDigest(db: DB, deps: DigestDeps = {}): { delivered: boolean; 
   db.query(
     `UPDATE notifications SET delivered_at = ? WHERE id IN (${ids.map(() => "?").join(",")})`
   ).run(at, ...ids);
-  deliverNative({ id: `digest-${at}`, title: "hive digest", body: summary, path: "/inbox" }, deps.exec ?? notifier);
+  deliverNative({ id: `digest-${at}`, title: "hive digest", body: summary, path: "/" }, deps.exec ?? notifier);
   return { delivered: true, count: pending.length, summary };
 }
 

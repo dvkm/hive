@@ -1,11 +1,10 @@
 // The intent record: what was asked, and what the director accepted.
 //
 // hive had no durable record of either. The ask lived in a task brief, which
-// dies with the task (Jira WEB-101's post-Done comments landed on nothing), and
-// the understanding quiz was minted from the review diff rather than from what
-// was accepted, so #2190 was re-asked three times. Anthropic's AI-Native SDLC
-// playbook (2026-08-21) puts an intent.md first in the loop — intent → spec →
-// plan → diff → PR → incident → new intent — and this is that record inside hive.
+// dies with the task (Jira WEB-101's post-Done comments landed on nothing).
+// Anthropic's AI-Native SDLC playbook (2026-08-21) puts an intent.md first in
+// the loop — intent → spec → plan → diff → PR → incident → new intent — and
+// this is that record inside hive.
 //
 // body_md is Markdown with EXACTLY the playbook's five headings, in order.
 // Deterministic parsing, no model call: the UI renders the sections it finds.
@@ -34,7 +33,6 @@ export interface Intent {
   author: string | null;
   accepted_by: string | null;
   accepted_at: string | null;
-  checks_json: string | null; // the understanding quiz, minted once at acceptance (HIVE-638)
   created_at: string;
   updated_at: string;
 }
@@ -108,21 +106,14 @@ export function intentNotAccepted(db: DB, task: { intent_id?: string | null } | 
   return getIntent(db, id)?.status === "draft";
 }
 
-// Where the accepted intent is versioned in the project repo. The Jira key when
-// there is one, so the file is findable by the ticket everyone else uses.
-export function intentSlug(task: { jira_key?: string | null; number?: number }): string {
-  const key = String(task?.jira_key ?? "").trim();
-  return key || `hive-${task?.number ?? 0}`;
-}
-
-// The intent file to drop into a fresh worktree, or null when this task has no
-// accepted intent. The agent's first commit versions it with the code.
-export function intentFileFor(db: DB, task: { intent_id?: string | null; jira_key?: string | null; number?: number }): { path: string; body: string } | null {
+// The accepted intent the agent works from, or null when this task has none.
+// It travels in the brief and stays out of the project repo.
+export function acceptedIntentBody(db: DB, task: { intent_id?: string | null }): string | null {
   const id = task?.intent_id;
   if (!id) return null;
   const intent = getIntent(db, id);
   if (!intent || intent.status !== "accepted") return null;
-  return { path: `intent/${intentSlug(task)}.md`, body: intent.body_md.endsWith("\n") ? intent.body_md : `${intent.body_md}\n` };
+  return intent.body_md.trim();
 }
 
 // Insert one intent row. The plain write behind every intake path (HIVE-637):
@@ -175,35 +166,4 @@ export function supersedeIntentRow(db: DB, id: string, byId: string, opts: { mov
     linkIntentTask(db, byId, previous.task_id);
     db.query("UPDATE intents SET task_id = NULL, updated_at = ? WHERE id = ?").run(t, id);
   }
-}
-
-// ---------------------------------------------------- the intent's own quiz
-// HIVE-638: the understanding checks are minted once, at acceptance, from the
-// accepted ask (see mintIntentChecks in intentDraft.ts) and cached here. The
-// director's pass is keyed on this intent's id, so re-emitting a review makes a
-// new head but never a new quiz. A superseded intent is a NEW row with a new
-// id, and that — a changed ask — is the only thing that re-asks.
-export function intentChecks(intent: Intent | null | undefined): unknown[] {
-  if (!intent || intent.status !== "accepted") return [];
-  try {
-    const parsed = JSON.parse(intent.checks_json ?? "null");
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-export function setIntentChecks(db: DB, id: string, checks: unknown[] | null): void {
-  db.query("UPDATE intents SET checks_json = ?, updated_at = ? WHERE id = ?")
-    .run(checks && checks.length ? JSON.stringify(checks) : null, now(), id);
-}
-
-// The accepted intent behind a task, or null. Used by the quiz: an accepted
-// intent WITH checks owns the quiz; anything else leaves today's diff-based
-// checks exactly as they are.
-export function acceptedIntentFor(db: DB, taskId: string): Intent | null {
-  const row = db.query("SELECT intent_id FROM tasks WHERE id = ?").get(taskId) as { intent_id?: string | null } | undefined;
-  if (!row?.intent_id) return null;
-  const intent = getIntent(db, row.intent_id);
-  return intent?.status === "accepted" ? intent : null;
 }

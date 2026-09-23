@@ -4,7 +4,6 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { DB } from "./db.ts";
 import { getTask, isSelfAuditLineage } from "./state.ts";
-import { prTitlePrefix, prBodyFooter } from "./marker.ts";
 import { managingThreadForTask } from "./chat.ts";
 import { PLAIN_ENGLISH } from "./plainEnglish.ts";
 import { taskIdentifier } from "./taskIdentifier.ts";
@@ -12,22 +11,24 @@ import { planGateKinds, planGateBlocks } from "./planCritic.ts";
 import { previewConfig } from "./preview.ts";
 import { figmaTokenEnv } from "./secrets.ts";
 import { matchPlaybook, playbookSection } from "./playbook.ts";
-import { intentFileFor } from "./intents.ts";
+import { acceptedIntentBody } from "./intents.ts";
 
-// The PR marker contract (documented in docs/API.md). Both halves are REQUIRED
-// on any PR the agent opens so hive can link the PR back to this task.
-function prMarkerSection(number: number, id: string): string {
-  return `## Opening a PR (REQUIRED marker)
-When you open the PR for this task, it MUST carry the hive marker so the board
-links the PR back to this task automatically:
+// Everything the agent leaves in the project reads like a teammate's work. Hive
+// links the PR by the branch it created, so nothing needs a marker.
+const PULL_REQUEST = `## Pull request, commits and code
+Write them the way a careful engineer on this team would:
 
-- The PR **title** MUST start with \`${prTitlePrefix(number)}\` (the space is part of it).
-- The PR **body** MUST include this line on its own (a footer is ideal):
+- PR title: one line in the style of the repo's recent history (\`git log --oneline -15\`
+  on the base branch). No task ids or tracker prefixes.
+- PR body: short. What changed and why in a few sentences, how you verified it, and
+  the ticket link if there is one. The long investigation goes in your review
+  summary, not the PR.
+- Commit messages follow the repo's style too.
+- Nothing you put in the repo, a commit, the PR or a code comment mentions hive,
+  agents, the director, task ids, local file paths or localhost links.
 
-  ${prBodyFooter(id)}
-
-Don't hand-format it — run \`hive pr-marker ${id}\` and paste what it prints.`;
-}
+Hand off with \`hive emit <task-id> ready --pr-url <url>\`. Hive links the PR by your
+branch.`;
 
 // Only added for projects with config.preview (server/src/preview.ts).
 const PREVIEW_PATH = `## Preview link (this project runs a preview stack)
@@ -78,35 +79,11 @@ Rules:
   Shape: {"done":[],"iffy":[{"what":"","why":""}],"decisions":[],
   "testing":[],"followups":[],"understanding":{"background":"","scope":"",
   "essence":"","walkthrough":[],"affected_areas":[],"risk_assessment":"",
-  "participate":"","checks":[{"question":"","options":[{"key":"a",
-  "label":""},{"key":"b","label":""}],"answer_key":"a","explanation":""}]}}
-  Omit empty sections. \`understanding.checks\` is REQUIRED only for
-  judgment-class work: the auto-review verdict is not \`looks_good\`, the diff
-  touches security, auth, payments or migrations, the task kind is outside the
-  project's auto-merge list, or the director asked for a quiz on this card. For
-  everything else the checks are OPTIONAL, and leaving them out blocks nothing.
-  When your task kind is outside the auto-merge list, or the director asked for
-  a quiz here, \`hive emit ... ready\` holds the handoff until your review
-  carries a check, so write it while the change is still fresh: you clear that
-  hold in the same turn, with no respawn.
-  Re-emitting a review after a rebase, a risk finding or a CI fix? Leave
-  \`understanding.checks\` out and the checks you already sent stay in place,
-  along with the director's pass. Re-listing the same questions keeps the pass
-  too, even if you reword or reorder them. Send \`"checks": []\` only when you
-  mean to drop the quiz on purpose.
-  Every question must help them understand this specific change: behavior, impact, risk,
-  tradeoff, or evidence. Never test whether the agent can code, debug, merge,
-  use tools, follow policy, or operate Hive; agent competence belongs in internal
-  checks. Never quiz project bookkeeping. If it does not improve the director's
-  understanding of this review, omit it. Include \`iffy\` for every real uncertainty.
-  Write every question and option in plain everyday words: one idea per sentence,
-  no nested clauses. Use jargon only if the diff itself introduces the term, and
-  then define it in the question or explanation. Make each option plainly
-  distinct from the others, not near-duplicates. Length follows the content, not
-  a cap: a simple change earns a short question, a genuinely complex change can
-  take the words it needs. Write background, essence, walkthrough, and
-  participate the way you would explain the change to a colleague on the phone:
-  clarity first, brevity second.
+  "participate":""}}
+  Omit empty sections. Include \`iffy\` for every real uncertainty. Write
+  background, essence, walkthrough, and participate in plain everyday words, the
+  way you would explain the change to a colleague on the phone: clarity first,
+  brevity second.
 - When you hit a decision the director must make, open a REAL decision card with
   2-4 concrete options and a recommendation:
 
@@ -319,21 +296,21 @@ output — attach what the command actually printed. If a command fails, fix the
 cause and run it again, or emit \`blocked\` explaining why it cannot pass.`;
 }
 
-// The accepted ask, versioned in the branch (HIVE-636/637). Only shown when the
-// file will actually be there: intentFileFor returns null unless the task's
-// intent has been accepted, and spawn writes exactly that path.
+// The accepted ask (HIVE-636/637), only once the task's intent is accepted.
 function intentSection(db: DB, task: any): string | null {
-  const file = intentFileFor(db, task);
-  if (!file) return null;
+  const body = acceptedIntentBody(db, task);
+  if (!body) return null;
   return `## The accepted ask (read this first)
-\`${file.path}\` in your worktree is the record of what was asked, as the director
-accepted it. Read it before you touch any code.
+This is the record of what was asked, as the director accepted it. Read it
+before you touch any code.
+
+${body}
 
 - \`## Constraints\` are HARD LIMITS. Do not trade one away for a tidier design;
   if one blocks the work, say so with \`hive emit <task-id> blocked\`.
 - \`## Proposed outcome\` is what done means here. Anything past it is out of scope.
 - The brief below was generated from that record. Where they differ, the record wins.
-- Keep the file: commit it with your change so the ask is versioned with the code.`;
+- The record stays out of the repo: do not write it into a file you commit.`;
 }
 
 function definitionOfDone(db: DB, task: { id: string; kind: string; source?: string | null }): string {
@@ -403,7 +380,7 @@ export function composeBrief(db: DB, taskId: string): string {
   parts.push(spawnTasksSection(task.project_id));
   const team = teamSection(db, taskId);
   if (team) parts.push(team);
-  parts.push(prMarkerSection(task.number, task.id));
+  parts.push(PULL_REQUEST);
   parts.push(BROWSER_VERIFICATION);
   const figma = figmaSection();
   if (figma) parts.push(figma);

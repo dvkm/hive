@@ -9,12 +9,11 @@ import type { Decision, Evidence, JiraTaskState, TaskDetail, UsageTotals } from 
 import { useStore } from "../lib/store";
 import { splitAttachments } from "../lib/attachments";
 import { Attach, BlockedBy, CiBadge, HEALTH_LABEL, needsLook, NEXT, PriorityChip, STATE_LABEL, StatusDot, toast } from "../lib/ui";
-import { ReviewAudit, ReviewCard, ReviewUnderstanding, RiskVerdicts, VerifyCard } from "./ReviewCard";
+import { ReviewCard, RiskVerdicts } from "./ReviewCard";
 import { CheckpointList } from "./Checkpoints";
 import { DecisionCard } from "./DecisionCard";
 import { IntentCard } from "./IntentCard";
 import { ReportView } from "./ReportView";
-import { UnderstandingQuiz } from "./UnderstandingQuiz";
 import { relTime } from "../lib/time";
 import { useLightbox } from "../lib/lightbox";
 import type { LightboxImage } from "../lib/lightbox";
@@ -23,7 +22,7 @@ import { buildTimeline, quietTimeline } from "../lib/timeline";
 import { ANSWERED_BY_LABEL } from "../lib/labels";
 import type { TimelineItem } from "../lib/timeline";
 import { eventText } from "../lib/eventText";
-import { isJiraMirror, isTrackingOnly, mirrorStillWorking, trackedSubtasks } from "../lib/needsYou";
+import { isJiraMirror, isTrackingOnly, trackedSubtasks } from "../lib/needsYou";
 import { PrReference, ReferenceText, TaskRef, prLabel } from "../lib/references";
 
 // Compact per-task usage line: tokens + estimated cost, only when usage exists.
@@ -100,14 +99,14 @@ function EvidenceItem({ e, onOpen }: { e: Evidence; onOpen?: () => void }) {
   );
 }
 
+// A closed decision. Open ones render as answerable DecisionCards instead.
 function DecisionMini({ d }: { d: Decision }) {
-  const answered = d.status !== "open";
   // An expired card was never answered, so "Answered: null" was a lie that also
   // deleted the only explanation the director had (HIVE-570). Say it closed, say
   // why, and keep the question it was asking about visible underneath.
   const expired = d.status === "expired";
   return (
-    <div className={`dmini ${answered ? "dmini-done" : "dmini-open"}`}>
+    <div className="dmini dmini-done">
       <div className="dmini-head">
         <strong><ReferenceText text={d.title} taskId={d.task_id} bundle={d.bundle} /></strong>
         <span className={`chip chip-risk risk-${d.risk || "unknown"}`}>{d.risk || "?"}</span>
@@ -117,15 +116,11 @@ function DecisionMini({ d }: { d: Decision }) {
           <div>Closed without an answer.{d.answer_note ? ` ${d.answer_note}` : ""}</div>
           {d.context && <div className="dmini-context">{d.context}</div>}
         </div>
-      ) : answered ? (
+      ) : (
         <div className="dmini-answer">
           Answered: <code>{d.answer_key}</code>
           {d.answer_note && <> — {d.answer_note}</>}
         </div>
-      ) : (
-        <Link className="btn btn-primary" to="/inbox">
-          Answer in inbox →
-        </Link>
       )}
     </div>
   );
@@ -193,7 +188,12 @@ function TimelineRow({ it }: { it: TimelineItem }) {
           </ul>
         )}
         {it.open ? (
-          <Link className="btn btn-primary btn-mini" to="/inbox">Answer in inbox →</Link>
+          <button
+            className="btn btn-primary btn-mini"
+            onClick={() => document.getElementById(`dcard-${d.id}`)?.scrollIntoView({ behavior: "smooth", block: "center" })}
+          >
+            Answer it
+          </button>
         ) : (
           <div className="tl-decision-answer">
             {d.answered_by && ANSWERED_BY_LABEL[d.answered_by] ? ANSWERED_BY_LABEL[d.answered_by] : "✓ You"}
@@ -524,7 +524,7 @@ export function JiraPanel({
 
 // board modal (see App.tsx / views/TaskModal.tsx).
 export function TaskBody({ id }: { id: string }) {
-  const { rev, projects, tasks, quizzes, reloadQuizzes, intents, reloadIntents } = useStore();
+  const { rev, projects, tasks, intents, reloadIntents } = useStore();
   const lightbox = useLightbox();
   const [t, setT] = useState<TaskDetail | null>(null);
   const [jira, setJira] = useState<JiraTaskState | null>(null);
@@ -603,25 +603,16 @@ export function TaskBody({ id }: { id: string }) {
   const trackingOnly = isTrackingOnly(t);
   const jiraMirror = isJiraMirror(t);
   const codeReview = t.state === "in_review" && !trackingOnly;
-  // Same rule as the Needs-you queue: a merged task, or a ticket whose work has
-  // all finished, is waiting on the director's accept. The verify card is the
-  // one place that action lives, so the raw state buttons stay hidden while a
-  // card owns the decision (this page used to show Done/In Progress/Failed and
-  // nothing that said "accept").
-  const verify = t.state === "verifying" && !mirrorStillWorking(t, tasks);
-  const cardOwnsAction = codeReview || verify;
   const bindingNotice = trackingBindingNotice(t);
-  // ReviewCard already renders the quiz for in_review; this covers the states
-  // the API also accepts answers in (verifying/done/failed) where no review
-  // card exists — the task page used to hide a quiz the Understanding column
-  // still counted as pending (hive-1028).
-  const postShipQuiz = !codeReview ? quizzes.find((q) => q.task_id === t.id) : undefined;
   const intent = intents.find((i) => i.id === t.intent_id);
+  // Merged work closes without the director, who may still close a verifying
+  // task by hand, and then it reads as what it is: a person checked it.
+  const markVerified = (to: string) => t.state === "verifying" && to === "done";
 
   const doTransition = async (to: string) => {
     try {
-      await api.transition(t.id, to as TaskDetail["state"]);
-      toast(`→ ${STATE_LABEL[to as TaskDetail["state"]]}`);
+      await api.transition(t.id, to as TaskDetail["state"], markVerified(to) ? "verified by the director" : undefined);
+      toast(markVerified(to) ? "Marked verified" : `→ ${STATE_LABEL[to as TaskDetail["state"]]}`);
     } catch (e) {
       toast((e as Error).message);
     }
@@ -844,8 +835,7 @@ export function TaskBody({ id }: { id: string }) {
           </div>
         )}
 
-        {codeReview && <ReviewCard task={t} surface="task" onDone={refresh} />}
-        {verify && <VerifyCard task={t} surface="task" onDone={refresh} />}
+        {codeReview && <ReviewCard task={t} onDone={refresh} />}
 
         {/* The risk check's verdicts belong to the CHANGE, not to the land queue
             (HIVE-570). The review card carries them while the task sits in
@@ -858,36 +848,6 @@ export function TaskBody({ id }: { id: string }) {
         )}
 
         {t.race_id && <RaceCompare raceId={t.race_id} taskId={t.id} onPicked={refresh} />}
-
-        {postShipQuiz && (
-          <section className="panel understanding-quiz-panel">
-            <h2>Understanding check</h2>
-            <details className="review-details" open>
-              <summary>
-                <span>{postShipQuiz.task_kind === "scout" ? "Explain report" : "Understand this change"}</span>
-                <small>Read before answering</small>
-              </summary>
-              <div className="review-details-body">
-                {postShipQuiz.report.understanding && (
-                  <ReviewUnderstanding
-                    packet={postShipQuiz.report.understanding}
-                    report={postShipQuiz.task_kind === "scout"}
-                    caveats={postShipQuiz.report.iffy}
-                  />
-                )}
-                <ReviewAudit r={postShipQuiz.report} />
-              </div>
-            </details>
-            {/* no allowDefer/onDeferred: done/failed tasks block nothing, so there's no approval to unlock early */}
-            <UnderstandingQuiz
-              quiz={postShipQuiz}
-              label="Confirm you understood the change"
-              intentSlug={postShipQuiz.intent_slug}
-              intentTaskId={postShipQuiz.task_id}
-              onPassed={reloadQuizzes}
-            />
-          </section>
-        )}
 
         {!codeReview && <CheckpointList events={t.events} />}
 
@@ -1130,7 +1090,7 @@ export function TaskBody({ id }: { id: string }) {
                 </button>
               )}
               {t.state === "done" && !trackingOnly && <RequestChanges taskId={t.id} />}
-              {!cardOwnsAction && <div className="transitions">
+              {!codeReview && <div className="transitions">
                 {(NEXT[t.state] || []).filter((to) => !(trackingOnly && t.state === "failed" && to === "queued")).map((to) => (
                   <button
                     key={to}
@@ -1138,14 +1098,14 @@ export function TaskBody({ id }: { id: string }) {
                     onClick={() => doTransition(to)}
                     title={isJira ? jiraMoveHint(t.state, to, jira) : undefined}
                   >
-                    {STATE_LABEL[to]}
+                    {markVerified(to) ? "Mark verified" : STATE_LABEL[to]}
                   </button>
                 ))}
               </div>}
               {/* Moving a linked ticket writes to Jira. Saying so on the control
                   itself is the difference between a deliberate action and a
                   surprise a colleague notices in their ticket feed. */}
-              {isJira && !cardOwnsAction && (
+              {isJira && !codeReview && (
                 <p className="muted jira-move-note">
                   {jiraMoveSummary(t.state, jira)}
                 </p>

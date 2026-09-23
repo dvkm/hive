@@ -69,10 +69,9 @@ test("silent past 4x the stale threshold → one hung event naming what the agen
   expect(p.silent_ms).toBeGreaterThan(4 * STALE_MS);
   expect(p.last_said).toContain("pnpm 9.1.0");
 
-  const notif: any = db.query("SELECT title, body, urgency FROM notifications WHERE kind = 'hung_agent' AND task_id = ?").get(id);
-  expect(notif.urgency).toBe("urgent");
-  expect(notif.title).toContain("No progress for 3h");
-  expect(notif.body).toContain("pnpm 9.1.0");
+  // Recorded, not pushed: hive restarts an agent that stays this quiet, so the
+  // director has nothing to do about it.
+  expect(db.query("SELECT 1 FROM notifications WHERE kind = 'hung_agent' AND task_id = ?").get(id)).toBeNull();
 });
 
 test("quiet but under the threshold → no hung signal", async () => {
@@ -169,7 +168,7 @@ test("a verifying task quiet past the threshold is never hung or stale — an in
   expect(notified(parked, "stale")).toBe(false);
 
   expect(flagged(working, "hung")).toBe(true);
-  expect(notified(working, "hung_agent")).toBe(true);
+  expect(notified(working, "hung_agent")).toBe(false);
 });
 
 // The binding, not just the state: an in_progress task whose agent was already

@@ -6,6 +6,7 @@ import { enqueue } from "./notifications.ts";
 import { getTask, transition, writeEvent, TERMINAL, type State } from "./state.ts";
 import { broadcastTask } from "./health.ts";
 import { taskIdFromBody, taskNumberFromTitle } from "./marker.ts";
+import { taskForHiveBranch } from "./taskIdentifier.ts";
 import { activeProjects, type ProjectRow } from "./testProjects.ts";
 
 export interface PrGardenerConfig {
@@ -48,6 +49,7 @@ export type AdoptPr = {
   url: string;
   title: string;
   body?: string | null;
+  headRefName?: string | null;
   isDraft?: boolean;
   labels?: { name?: string }[] | null;
 };
@@ -75,7 +77,8 @@ export function adoptUntrackedPr(
   // A marker means the PR claims a Hive task. linkPRs owns that link; adopting
   // would double-track it. Skip on the marker alone, even if the id resolves to
   // no local task (a marker from another Hive DB is still not ours to adopt).
-  if (taskIdFromBody(pr.body) || taskNumberFromTitle(pr.title) != null) return { outcome: "marked" };
+  if (taskIdFromBody(pr.body) || taskNumberFromTitle(pr.title) != null || taskForHiveBranch(db, projectId, pr.headRefName))
+    return { outcome: "marked" };
   const sourceRef = `pr-adopt:${pr.number}`;
   const existing: any = db
     .query("SELECT id FROM tasks WHERE project_id = ? AND (pr_url = ? OR source_ref = ?) LIMIT 1")
@@ -155,8 +158,8 @@ export function classifyPr(p: ClassifierInput): { action: GardenerAction; reason
   if (p.actionInFlight) return { action: "wait", reason: "An action is already in flight" };
   if (p.override === "force_close") return { action: "close", reason: "Close approved by the director" };
   if (p.override === "force_land" && p.linkedTaskState === "in_review") return { action: "land", reason: "Land approved by the director" };
-  // Passing an understanding quiz proves the director read the change. It is
-  // never approval to ship. Leave the review card alone until they choose.
+  // The review waits for the director's own Ship (reviewer.directorHold).
+  // Leave the review card alone until they choose.
   if (p.directorDeciding) return { action: "wait", reason: "The director is still deciding whether to ship it" };
   if (p.override === "retry_fix") return { action: "fix", reason: "Another fix attempt was approved by the director" };
   if (p.sensitive) return { action: "decision", reason: p.sensitiveReason ?? "Touches a sensitive path" };
@@ -217,8 +220,8 @@ type GhPr = {
 type GardenerDeps = {
   exec: Exec;
   land: (taskId: string) => Promise<{ ok: boolean; error?: string }>;
-  // True when only the director may resolve this task's review card, e.g. they
-  // passed the Focus understanding quiz. A quiz pass is never approval.
+  // True when only the director may resolve this task's review card: its
+  // settled review still waits for their own Ship (reviewer.directorHold).
   directorDeciding?: (taskId: string) => boolean;
   decide: (input: { task_id: string; title: string; context: string; options: any[] }) => { id: string };
   nowMs?: () => number;
@@ -327,7 +330,7 @@ export async function runPrGardener(db: DB, deps: GardenerDeps): Promise<void> {
     // the same pass rather than paying a second stall later in the sweep.
     const adoptListed = listed.code === 0 && gardener.adopt_untracked
       ? await deps.exec(
-          ["gh", "pr", "list", "--state", "open", "--limit", String(ADOPT_LIST_LIMIT), "--json", "number,url,title,body,isDraft,labels"],
+          ["gh", "pr", "list", "--state", "open", "--limit", String(ADOPT_LIST_LIMIT), "--json", "number,url,title,body,headRefName,isDraft,labels"],
           { cwd: project.repo_path, timeoutMs: GH_LIST_TIMEOUT_MS }
         )
       : null;
@@ -450,7 +453,7 @@ export async function runPrGardener(db: DB, deps: GardenerDeps): Promise<void> {
         }
       } else if (result.action === "close") {
         actions++;
-        const comment = `Closed by Hive's PR Gardener. ${result.reason}. This action is recorded in the project digest.`;
+        const comment = `Closing this: ${result.reason}.`;
         const closed = await deps.exec(["gh", "pr", "close", pr.url, "--comment", comment], { cwd: project.repo_path });
         if (closed.code === 0) {
           digest.closed.push(pr.number);

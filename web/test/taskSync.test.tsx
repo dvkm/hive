@@ -20,7 +20,7 @@ const task = (id: string): Task => ({ id, title: `Task ${id}`, updated_at: "2026
 
 // Restores whatever this file overwrote on the shared `api` singleton.
 function stubStoreApi(over: Partial<typeof api>): () => void {
-  const keys = ["cachedTasks", "tasks", "decisions", "projects", "checkpoints", "understandingQuizzes", "notifications", "offline", "away"] as const;
+  const keys = ["cachedTasks", "tasks", "decisions", "projects", "intents", "notifications", "offline", "away"] as const;
   const originals = Object.fromEntries(keys.map((k) => [k, (api as any)[k]]));
   const empty = async () => [];
   Object.assign(api, {
@@ -28,8 +28,7 @@ function stubStoreApi(over: Partial<typeof api>): () => void {
     tasks: empty,
     decisions: empty,
     projects: empty,
-    checkpoints: async () => ({ checkpoints: [] }),
-    understandingQuizzes: async () => ({ quizzes: [] }),
+    intents: empty,
     notifications: async () => ({ notifications: [] }),
     offline: async () => ({ on: false }),
     away: async () => ({ on: false, active: false, held: 0 }),
@@ -201,13 +200,11 @@ test("a genuinely empty response still counts as loaded", async () => {
 });
 
 test("the other siblings keep trying too", async () => {
-  let checkpointCalls = 0;
-  let quizCalls = 0;
+  let intentCalls = 0;
   let awayCalls = 0;
   let notificationCalls = 0;
   const restore = stubStoreApi({
-    checkpoints: (async () => { checkpointCalls++; throw new Error("network"); }) as typeof api.checkpoints,
-    understandingQuizzes: (async () => { quizCalls++; throw new Error("network"); }) as typeof api.understandingQuizzes,
+    intents: (async () => { intentCalls++; throw new Error("network"); }) as typeof api.intents,
     away: (async () => { awayCalls++; throw new Error("network"); }) as typeof api.away,
     notifications: (async () => { notificationCalls++; throw new Error("network"); }) as typeof api.notifications,
   });
@@ -215,17 +212,17 @@ test("the other siblings keep trying too", async () => {
   try {
     await withCapturedTimers(async (fire) => {
       await probe.render();
-      expect([checkpointCalls, quizCalls, awayCalls, notificationCalls]).toEqual([1, 1, 1, 1]);
-      // Four scheduled retries; firing them is a second attempt each.
+      expect([intentCalls, awayCalls, notificationCalls]).toEqual([1, 1, 1]);
+      // Three scheduled retries; firing them is a second attempt each.
       await fire();
-      expect([checkpointCalls, quizCalls, awayCalls, notificationCalls]).toEqual([2, 2, 2, 2]);
+      expect([intentCalls, awayCalls, notificationCalls]).toEqual([2, 2, 2]);
     });
   } finally {
     restore();
   }
 });
 
-test("the chat panel only offers first-run onboarding once the projects list has landed", async () => {
+test("the chat drawer only offers first-run onboarding once the projects list has landed", async () => {
   const restore = stubStoreApi({
     projects: (async () => {
       throw new Error("network");
@@ -239,10 +236,11 @@ test("the chat panel only offers first-run onboarding once the projects list has
       await act(async () => {
         renderer = create(
           <MemoryRouter>
-            <StoreProvider><Chat embedded /></StoreProvider>
+            <StoreProvider><Chat /></StoreProvider>
           </MemoryRouter>
         );
       });
+      await act(async () => renderer.root.findByProps({ className: "chat-fab" }).props.onClick());
       expect(onboarding(renderer)).toHaveLength(0);
 
       // A real empty install still gets the real empty state.

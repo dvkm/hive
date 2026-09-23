@@ -40,7 +40,7 @@ export function AwayBanner({ away, onResume }: { away: Away; onResume: () => voi
       <span className="away-banner-text">
         Away{untilText(away)}. Holding notifications{away.held > 0 ? `: ${away.held} so far` : ""}.
       </span>
-      {away.held > 0 && <Link to="/inbox">See what's held</Link>}
+      {away.held > 0 && <Link to="/">See what's held</Link>}
       <button className="btn btn-mini" onClick={onResume}>
         Resume notifications
       </button>
@@ -62,11 +62,11 @@ function HeldList({ items }: { items: HeldPush[] }) {
   );
 }
 
-// The view the wake-up push links to. While away it shows what is being held;
-// after away mode lifts it shows what the summary push covered, until dismissed.
+// On Home, where the wake-up push lands. While away it shows what is being
+// held; after away mode lifts it shows what the summary push covered, until
+// dismissed.
 export function HeldSummary() {
-  // Optional chaining because the Brief's own tests mount it against partial
-  // store stubs.
+  // Optional chaining because tests mount it against partial store stubs.
   const { away } = useStore();
   const flush = away?.last_flush ?? null;
   const [dismissed, setDismissed] = useState(() => localStorage.getItem(DISMISSED_KEY));

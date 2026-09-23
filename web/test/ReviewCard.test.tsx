@@ -1,17 +1,13 @@
-import { beforeEach, expect, test } from "bun:test";
+import { expect, test } from "bun:test";
 import { act, create } from "react-test-renderer";
 import { MemoryRouter } from "react-router-dom";
-import { Ctx, resetQuizStatesForTests, type Store } from "../src/lib/store";
+import { Ctx, type Store } from "../src/lib/store";
 import { LightboxProvider } from "../src/lib/lightbox";
 import { api } from "../src/lib/api";
 import type { Task, TaskDetail } from "../src/lib/api";
 import { ReviewCard } from "../src/views/ReviewCard";
-import { UnderstandingQuiz } from "../src/views/UnderstandingQuiz";
 
-// Quiz state lives in a module-level map shared across every bun test file.
-beforeEach(resetQuizStatesForTests);
-
-const fakeStore = { projects: [], quizzes: [] } as unknown as Store;
+const fakeStore = { projects: [] } as unknown as Store;
 
 const task = (id: string, source: string | null = "agent"): Task => ({
   id,
@@ -62,25 +58,18 @@ function tree(t: Task) {
   );
 }
 
-test("Focus keeps explicit Ship and Request changes actions after understanding is confirmed", async () => {
-  const originalTask = api.task;
-  api.task = (async (id: string) => passingDetail(id)) as typeof api.task;
-  try {
-    let renderer!: ReturnType<typeof create>;
-    await act(async () => {
-      renderer = create(
-        <MemoryRouter>
-          <Ctx.Provider value={fakeStore}>
-            <LightboxProvider><ReviewCard task={task("focus-review")} surface="focus" /></LightboxProvider>
-          </Ctx.Provider>
-        </MemoryRouter>
-      );
-    });
-    expect(renderer.root.findAll((n) => n.type === "button" && n.children.includes("Ship"))).toHaveLength(1);
-    expect(renderer.root.findAll((n) => n.type === "button" && n.children.includes("Request changes"))).toHaveLength(1);
-  } finally {
-    api.task = originalTask;
-  }
+// The understanding quiz is retired: a green review with no check at all is
+// approvable, and nothing on the card asks for one.
+test("a green review with no understanding check can be approved", async () => {
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(tree(task("no-check")));
+  });
+  const approve = renderer.root.findAll((n) => n.type === "button" && n.children.includes("Approve & merge"));
+  expect(approve).toHaveLength(1);
+  expect(approve[0].props.disabled).toBe(false);
+  expect(renderer.root.findAll((n) => n.type === "button" && n.children.includes("Request changes"))).toHaveLength(1);
+  expect(JSON.stringify(renderer.toJSON())).not.toMatch(/understanding check|quiz/i);
 });
 
 test("re-rendering ReviewCard in place with a different task resets mode/notes", async () => {
@@ -123,11 +112,10 @@ test("re-rendering ReviewCard in place with a different task resets mode/notes",
   expect(renderer.root.findAllByType("textarea")[0].props.value).toBe("");
 });
 
-// A detail whose understanding check is already passed, so quizBlocked is
-// false and deliveryBlocked is false (pr_url set, ci_status passing) — the
-// merge button's enabled/disabled state is then caused ONLY by branch-check,
-// not by some other pre-existing block (task #1000's two tests below rely on
-// this isolation, per the "does this check even test the thing" principle).
+// A detail with nothing else holding the merge: deliveryBlocked is false
+// (pr_url set, ci_status passing), so the merge button's enabled/disabled state
+// is caused ONLY by branch-check (task #1000's two tests below rely on this
+// isolation, per the "does this check even test the thing" principle).
 function passingDetail(id: string): TaskDetail {
   return {
     ...task(id, "agent"),
@@ -138,132 +126,13 @@ function passingDetail(id: string): TaskDetail {
         ts: "2026-01-01T00:00:00.000Z",
         source: "agent",
         type: "review_summary",
-        payload: { understanding: { check: { question: "Q?", options: [{ key: "a", label: "A" }, { key: "b", label: "B" }], answer_key: "a" } } },
-      } as any,
-      {
-        id: "quiz-1",
-        task_id: id,
-        ts: "2026-01-01T00:00:01.000Z",
-        source: "director",
-        type: "understanding_quiz_passed",
-        payload: { review_event_id: "rev-1" },
+        payload: { done: ["Did the thing."] },
       } as any,
     ],
     evidence: [],
     decisions: [],
   };
 }
-
-// HIVE-421: approved to land FIRST, understanding check passed AFTER. The
-// approval predates the insight, so the queue must ask before it merges.
-function landMarkedThenPassedDetail(id: string): TaskDetail {
-  const base = passingDetail(id);
-  return {
-    ...base,
-    land_queued_at: "2026-01-01T00:00:00.500Z",
-    events: [
-      base.events[0],
-      { id: "land-1", task_id: id, ts: "2026-01-01T00:00:00.500Z", source: "director", type: "land_queued", payload: {} } as any,
-      base.events[1],
-    ],
-  };
-}
-
-test("a quiz passed after the land mark asks for a Land now tap instead of merging (HIVE-421)", async () => {
-  const originalTask = api.task;
-  const originalLandQueue = api.landQueue;
-  const calls: { ids: string[]; queued: boolean }[] = [];
-  api.task = (async (id: string) => landMarkedThenPassedDetail(id)) as typeof api.task;
-  api.landQueue = (async (ids: string[], queued = true) => {
-    calls.push({ ids, queued });
-    return { changed: ids, queued };
-  }) as typeof api.landQueue;
-  try {
-    let renderer!: ReturnType<typeof create>;
-    await act(async () => {
-      renderer = create(tree({ ...task("land-held"), land_queued_at: "2026-01-01T00:00:00.500Z" }));
-    });
-    const landNow = renderer.root.findAll((n) => n.type === "button" && n.children.includes("Land now"));
-    const unmark = renderer.root.findAll((n) => n.type === "button" && n.children.includes("Unmark"));
-    expect(landNow).toHaveLength(1);
-    expect(unmark).toHaveLength(1);
-
-    // toast() reaches for a DOM this renderer has none of; the tap itself is
-    // what matters here.
-    const doc = (globalThis as any).document;
-    (globalThis as any).document = { createElement: () => ({ style: {}, className: "", classList: { add() {}, remove() {} }, remove() {} }), body: { appendChild() {} } };
-    try {
-      await act(async () => {
-        await landNow[0].props.onClick();
-      });
-    } finally {
-      (globalThis as any).document = doc;
-    }
-    expect(calls).toEqual([{ ids: ["land-held"], queued: true }]);
-  } finally {
-    api.task = originalTask;
-    api.landQueue = originalLandQueue;
-  }
-});
-
-// HIVE-421 steer: the pass happens in THIS session (no quiz_passed event yet),
-// so the hold comes from the in-session pass. Tapping "Land now" must clear it
-// right away — the director just confirmed, the card must not still read held.
-test("passing the quiz then tapping Land now clears the hold in the same session", async () => {
-  const originalTask = api.task;
-  const originalLandQueue = api.landQueue;
-  const calls: { ids: string[]; queued: boolean }[] = [];
-  // Only the review_summary — the quiz is passed below, in-session.
-  api.task = (async (id: string) => ({ ...passingDetail(id), events: [passingDetail(id).events[0]] })) as typeof api.task;
-  api.landQueue = (async (ids: string[], queued = true) => {
-    calls.push({ ids, queued });
-    return { changed: ids, queued };
-  }) as typeof api.landQueue;
-  try {
-    let renderer!: ReturnType<typeof create>;
-    await act(async () => {
-      renderer = create(tree({ ...task("land-same-session"), land_queued_at: "2026-01-01T00:00:00.500Z" }));
-    });
-    expect(renderer.root.findAll((n) => n.type === "button" && n.children.includes("Land now"))).toHaveLength(0);
-
-    await act(async () => {
-      renderer.root.findByType(UnderstandingQuiz).props.onPassed();
-    });
-    const landNow = renderer.root.findAll((n) => n.type === "button" && n.children.includes("Land now"));
-    expect(landNow).toHaveLength(1);
-
-    const doc = (globalThis as any).document;
-    (globalThis as any).document = { createElement: () => ({ style: {}, className: "", classList: { add() {}, remove() {} }, remove() {} }), body: { appendChild() {} } };
-    try {
-      await act(async () => {
-        await landNow[0].props.onClick();
-      });
-    } finally {
-      (globalThis as any).document = doc;
-    }
-    expect(calls).toEqual([{ ids: ["land-same-session"], queued: true }]);
-    // The card now reads as queued to land, not as held awaiting a tap.
-    expect(renderer.root.findAll((n) => n.type === "button" && n.children.includes("Land now"))).toHaveLength(0);
-    expect(renderer.root.findAll((n) => n.type === "button" && n.children.includes("Unmark"))).toHaveLength(0);
-  } finally {
-    api.task = originalTask;
-    api.landQueue = originalLandQueue;
-  }
-});
-
-test("a task that is not queued to land shows no land prompt", async () => {
-  const originalTask = api.task;
-  api.task = (async (id: string) => passingDetail(id)) as typeof api.task;
-  try {
-    let renderer!: ReturnType<typeof create>;
-    await act(async () => {
-      renderer = create(tree(task("not-queued")));
-    });
-    expect(renderer.root.findAll((n) => n.type === "button" && n.children.includes("Land now"))).toHaveLength(0);
-  } finally {
-    api.task = originalTask;
-  }
-});
 
 // task #1000: the merge decision must reflect the LIVE branch-check, not just
 // whatever the agent's own review_summary claims. An unmet dependency
@@ -377,80 +246,6 @@ test("Request changes is hidden for a never-dispatched external task", async () 
     (n) => n.type === "button" && n.children.includes("Request changes")
   );
   expect(requestChangesBtn.length).toBe(0);
-});
-
-// "Have agent add it" (shown when the review has no understanding quiz yet)
-// calls the same requestChanges API as "Request changes" above — same gap,
-// same fix.
-test("Have agent add it is hidden for a never-dispatched external task", async () => {
-  const t: Task = { ...task("never-dispatched-quiz", "external"), never_dispatched: true };
-
-  let renderer!: ReturnType<typeof create>;
-  await act(async () => {
-    renderer = create(tree(t));
-  });
-
-  const haveAgentBtn = renderer.root.findAll(
-    (n) => n.type === "button" && n.children.includes("Have agent add it")
-  );
-  expect(haveAgentBtn.length).toBe(0);
-
-  // The button is gone, but the blocked-reason text left behind must not still
-  // tell the director to ask an agent that was never dispatched.
-  const blockedText = JSON.stringify(
-    renderer.root.findAll((n) => n.type === "div" && typeof n.props.className === "string" && n.props.className.includes("review-blocked")).map((n) => n.children)
-  );
-  expect(blockedText).not.toContain("Ask the agent to refresh its review");
-  expect(blockedText).toContain("never been dispatched");
-});
-
-// HIVE-576: "Have agent add it" must only appear when a check is actually
-// owed. It used to ignore quizRequired, so a mechanical change (branch-check
-// understanding_required=false) still offered the button.
-test("Have agent add it is hidden when the branch check says no understanding check is owed", async () => {
-  const originalBranchCheck = api.branchCheck;
-  api.branchCheck = (async () => ({
-    unmet_deps: [],
-    embedded_tasks: [],
-    understanding_required: false,
-    confirmed_risks: [],
-  })) as typeof api.branchCheck;
-  try {
-    let renderer!: ReturnType<typeof create>;
-    await act(async () => {
-      renderer = create(tree(task("mechanical-change")));
-    });
-
-    const haveAgentBtn = renderer.root.findAll(
-      (n) => n.type === "button" && n.children.includes("Have agent add it")
-    );
-    expect(haveAgentBtn.length).toBe(0);
-  } finally {
-    api.branchCheck = originalBranchCheck;
-  }
-});
-
-test("Have agent add it still shows when a check is owed and missing", async () => {
-  const originalBranchCheck = api.branchCheck;
-  api.branchCheck = (async () => ({
-    unmet_deps: [],
-    embedded_tasks: [],
-    understanding_required: true,
-    confirmed_risks: [],
-  })) as typeof api.branchCheck;
-  try {
-    let renderer!: ReturnType<typeof create>;
-    await act(async () => {
-      renderer = create(tree(task("owed-quiz")));
-    });
-
-    const haveAgentBtn = renderer.root.findAll(
-      (n) => n.type === "button" && n.children.includes("Have agent add it")
-    );
-    expect(haveAgentBtn.length).toBe(1);
-  } finally {
-    api.branchCheck = originalBranchCheck;
-  }
 });
 
 // #1556: the explanation page is the mental model, so it is embedded in the
@@ -662,11 +457,8 @@ test("a task with no verification contract renders no checklist", async () => {
 
 // ---------------------------------------------------------------------------
 // HIVE-570. The risk check runs when the PR reaches review, so the card knows
-// before it asks the director for anything whether Ship can work. It used to ask
-// for the quiz first and refuse the merge afterwards.
+// before the director presses anything whether Ship can work.
 
-// An unreviewed detail: no review_summary at all, so the ONLY reason the quiz
-// could be hidden here is the confirmed risk, not a passed or missing check.
 function riskyDetail(id: string): TaskDetail {
   return {
     ...task(id, "agent"),
@@ -732,28 +524,6 @@ test("a confirmed risk disables Approve & merge and says which risk (HIVE-570)",
   expect(anyway[0].props.disabled).toBe(false);
 });
 
-test("a confirmed risk means no understanding check is asked (HIVE-570)", async () => {
-  const renderer = await renderWithConfirmedRisk(riskyDetail);
-  expect(renderer.root.findAllByType(UnderstandingQuiz)).toHaveLength(0);
-  const text = JSON.stringify(renderer.toJSON());
-  expect(text).toContain("not ready");
-  // And it must not be mislabelled as a mechanical change with no check needed.
-  expect(text).not.toContain("Mechanical change");
-});
-
-test("a risk found after a passed quiz says the answer was kept (HIVE-570)", async () => {
-  const late = (id: string): TaskDetail => {
-    const risky = riskyDetail(id);
-    const passed = passingDetail(id);
-    return { ...risky, events: [...passed.events, ...risky.events] };
-  };
-  const renderer = await renderWithConfirmedRisk(late);
-  const text = JSON.stringify(renderer.toJSON());
-  expect(text).toContain("You passed the understanding check on this change earlier");
-  expect(text).toContain("abc1234");
-  expect(text).toContain("your answer is kept");
-});
-
 test("the risk verdicts stay on the card so the finding is readable (HIVE-570)", async () => {
   const renderer = await renderWithConfirmedRisk(riskyDetail);
   const text = JSON.stringify(renderer.toJSON());
@@ -761,9 +531,7 @@ test("the risk verdicts stay on the card so the finding is readable (HIVE-570)",
   expect(text).toContain("confirmed");
 });
 
-test("Merge anyway re-opens the check it silenced instead of dead-ending (HIVE-570)", async () => {
-  // The server still refuses a merge whose understanding check is owed, so the
-  // override has to bring the check back rather than merge straight past it.
+test("Merge anyway merges past the confirmed risks, which stay on the card (HIVE-570)", async () => {
   const originalTask = api.task;
   const originalBranchCheck = api.branchCheck;
   const merges: unknown[][] = [];
@@ -779,6 +547,9 @@ test("Merge anyway re-opens the check it silenced instead of dead-ending (HIVE-5
     merges.push(args);
     return {} as never;
   }) as typeof api.merge;
+  // toast() reaches for a DOM this renderer has none of.
+  const doc = (globalThis as any).document;
+  (globalThis as any).document = { createElement: () => ({ classList: { add() {}, remove() {} }, remove() {} }), body: { appendChild() {} } };
   try {
     let renderer!: ReturnType<typeof create>;
     await act(async () => {
@@ -786,20 +557,17 @@ test("Merge anyway re-opens the check it silenced instead of dead-ending (HIVE-5
     });
 
     await act(async () => {
-      buttonNamed(renderer, "Merge anyway")[0].props.onClick();
+      await buttonNamed(renderer, "Merge anyway")[0].props.onClick();
     });
 
-    // No merge was attempted; the check is back and says why.
-    expect(merges).toHaveLength(0);
-    const text = JSON.stringify(renderer.toJSON());
-    expect(text).toContain("You chose to merge despite the confirmed risks");
-    // Ship is now gated on the check, not on the risk.
-    const merge = buttonNamed(renderer, "Approve & merge")[0];
-    expect(merge.props.title).not.toContain("a leak");
+    // One merge, told to override the confirmed risks; nothing asked first.
+    expect(merges).toEqual([["risky-override", undefined, true]]);
+    expect(JSON.stringify(renderer.toJSON())).toContain("a leak");
   } finally {
     api.task = originalTask;
     api.branchCheck = originalBranchCheck;
     api.merge = originalMerge;
+    (globalThis as any).document = doc;
   }
 });
 
@@ -858,7 +626,6 @@ test("the card leads with what changed and its recommendation agrees with the op
   api.branchCheck = (async () => ({
     unmet_deps: [],
     embedded_tasks: [],
-    understanding_required: false,
     confirmed_risks: [],
   })) as typeof api.branchCheck;
   try {

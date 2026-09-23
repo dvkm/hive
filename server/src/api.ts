@@ -61,22 +61,19 @@ import { seedWorktree, type SeedResult } from "./worktreeSeed.ts";
 import {
   INTENT_SECTIONS,
   INTENT_SOURCES,
-  acceptedIntentFor,
   getIntent,
-  intentChecks,
-  intentSlug,
-  setIntentChecks,
   intentSection,
   insertIntent,
   intentBodyError,
-  intentFileFor,
   linkIntentTask,
   openQuestions,
   supersedeIntentRow,
   type Intent,
 } from "./intents.ts";
-import { briefFromIntent, draftIntentBody, mintIntentChecks, renderIntentBody, type IntentSourceText } from "./intentDraft.ts";
+import { briefFromIntent, draftIntentBody, renderIntentBody, type IntentSourceText } from "./intentDraft.ts";
 import { takeOver, handBack, TakeoverError } from "./takeover.ts";
+import { advisorWillJudge, withAdvice, withIntentStatus } from "./advisor.ts";
+import { buildDigest } from "./digest.ts";
 import { figmaTokenEnv, resolveProjectSecrets, serviceName } from "./secrets.ts";
 import { teamclaudeEnv, teamclaudeOverlay, usesTeamclaude } from "./teamclaude.ts";
 import { runSmokeAfterMerge, type Fetcher } from "./monitors.ts";
@@ -125,7 +122,7 @@ import { classifyCardText } from "./policy.ts";
 import { typesafeSettings, typesafeStatus, saveTypesafeSettings, probeTypesafe } from "./typesafe.ts";
 import { decisionAnswerTokenOk, vapidPublicKey, saveSubscription, removeSubscription, type PushSub } from "./push.ts";
 import { explainCommandDecision } from "./explain.ts";
-import { confirmedRisks, unfinishedRiskCheck, cautionCleared, latestAutoReviewVerdict, reviewPipelineSettled, livePrHead } from "./reviewer.ts";
+import { confirmedRisks, unfinishedRiskCheck, cautionCleared, latestAutoReviewVerdict, livePrHead, DEFAULT_SENSITIVE_PATHS } from "./reviewer.ts";
 import { explanationFor, explanationGate } from "./explainDiff.ts";
 import { agentPlatformEnv, commandForCurrentShell } from "./platform.ts";
 import { critiquePlan, parsePlan, planGateBlocks, planReleaseSteer } from "./planCritic.ts";
@@ -135,7 +132,6 @@ import { getAway, setAway, awayNow, heldPushes, lastFlush, syncAway } from "./aw
 import type { AwayConfig } from "./away.ts";
 import { taskDiff } from "./diff.ts";
 import { previewState, startPreview, stopPreview, previewNoteContext } from "./preview.ts";
-import { catchupCards } from "./glance.ts";
 import { authoredFiles, captureBranchScope, detectDestructiveRebase, type BranchScope } from "./rebaseGuard.ts";
 import { overlapHold } from "./fileScope.ts";
 import { landGraph, markLand, resolveLandPauseForDecision, CONFIRMED_RISK_CODE } from "./landQueue.ts";
@@ -148,7 +144,7 @@ import { autonomyStats } from "./autonomyStats.ts";
 import { defaultExec, isSafeRef, projectBaseBranch, projectComparisonBase, preferSafeRef } from "./exec.ts";
 import { runDoctor, doctorOk, type Check } from "./doctor.ts";
 import { taskIdFromBody, taskNumberFromTitle } from "./marker.ts";
-import { projectPrefix, taskIdentifier } from "./taskIdentifier.ts";
+import { projectPrefix, taskIdentifier, branchSlug, taskForHiveBranch } from "./taskIdentifier.ts";
 import {
   createThread,
   getThread,
@@ -760,17 +756,6 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         );
 
       if (pathname === "/api/checkpoints" && method === "GET") return listOpenCheckpoints(db, url);
-      if (pathname === "/api/understanding-quizzes" && method === "GET") return listUnderstandingQuizzes(db, url);
-      // The glance layer over shipped work (HIVE-511): one small card per
-      // change, not the long explanation page.
-      if (pathname === "/api/catchup" && method === "GET")
-        return json({
-          cards: await catchupCards(
-            db,
-            { projectId: url.searchParams.get("project_id"), limit: Number(url.searchParams.get("limit")) || undefined },
-            deps.exec ?? defaultExec
-          ),
-        });
 
       if (pathname === "/api/offline" && method === "GET")
         return json({ on: isOffline(db) });
@@ -795,12 +780,6 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       if (pathname === "/api/away" && method === "POST") return setAwayMode(db, await req.json());
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/checkpoints\/([^/]+)\/ack$/);
       if (m && method === "POST") return await ackCheckpoint(db, herdr, m[1], m[2], await req.json());
-      m = pathname.match(/^\/api\/tasks\/([^/]+)\/understanding-quiz\/answer$/);
-      if (m && method === "POST") return answerUnderstandingQuiz(db, m[1], await req.json());
-      m = pathname.match(/^\/api\/tasks\/([^/]+)\/understanding-quiz\/defer$/);
-      if (m && method === "POST") return deferUnderstandingQuiz(db, m[1], await req.json());
-      m = pathname.match(/^\/api\/tasks\/([^/]+)\/understanding-quiz\/require$/);
-      if (m && method === "POST") return requireUnderstandingQuiz(db, m[1], await req.json());
 
       m = pathname.match(/^\/api\/tasks\/([^/]+)\/focus-agent$/);
       if (m && method === "POST") return await focusAgent(db, herdr, m[1]);
@@ -970,6 +949,10 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
       // ---- incidents ----
       if (pathname === "/api/incidents" && method === "GET") return listIncidents(db, url);
 
+      // ---- the director's digest (what happened since they last looked) ----
+      if (pathname === "/api/digest" && method === "GET")
+        return json(await buildDigest(db, { since: url.searchParams.get("since"), mark: url.searchParams.get("mark") === "1", exec: deps.exec }));
+
       // ---- intents (what was asked, and what was accepted) ----
       if (pathname === "/api/intents") {
         if (method === "GET") return listIntents(db, url);
@@ -986,7 +969,7 @@ export function makeHandler(db: DB, deps: HandlerDeps = {}) {
         if (method === "PUT") return updateIntent(db, m[1], await req.json());
       }
       m = pathname.match(/^\/api\/intents\/([^/]+)\/accept$/);
-      if (m && method === "POST") return await acceptIntent(db, m[1], await req.json().catch(() => ({})), deps);
+      if (m && method === "POST") return await acceptIntent(db, m[1], await req.json().catch(() => ({})));
       m = pathname.match(/^\/api\/intents\/([^/]+)\/supersede$/);
       if (m && method === "POST") return supersedeIntent(db, m[1], await req.json().catch(() => ({})));
 
@@ -2358,14 +2341,12 @@ function authorizePriority(source: any, priority: string): Response | null {
 }
 
 // Security-shaped work starts one notch up the queue. Same vocabulary the
-// understanding-quiz gate applies to changed paths (DEFAULT_SENSITIVE_PATHS),
-// matched here as whole words against the title and brief so "author" and
-// "authority" do not read as "auth".
+// director hold applies to changed paths (DEFAULT_SENSITIVE_PATHS), matched
+// here as whole words against the title and brief so "author" and "authority"
+// do not read as "auth".
 // ponytail: the default token list only, not a project's sensitive_paths
-// override — that override is about which FILES earn a quiz, not about what a
-// brief is asking for. Wire it up if a project ever needs its own words.
-// Built per call, not once at module load: DEFAULT_SENSITIVE_PATHS is declared
-// further down this file, so a module-level regex here would read it too early.
+// override — that override is about which FILES wait for the director's Ship,
+// not about what a brief is asking for. Wire it up if a project ever needs its own words.
 export function looksSecuritySensitive(text: string): boolean {
   return new RegExp(`\\b(${DEFAULT_SENSITIVE_PATHS.join("|")})s?\\b`, "i").test(text ?? "");
 }
@@ -2632,14 +2613,18 @@ function dupSuspectedWarning(survivor: any, decisionId: string): string {
 // moves to `in_review`, which is the ONLY state POST /merge accepts and the only
 // one the Review lane renders. Without this the Approve & merge button is
 // unreachable. The reconciler re-checks open PRs as a time-based fallback.
-// Resolve a PR's hive marker to the task it names: the `hive-task: <id>` body
-// footer first (the stable machine key), then the `[hive-<number>]` title
-// prefix. THE one resolver — linkPrIfMarked writes links with it, and the
-// reconciler checks a stored link against it before acting on the PR (#2093).
+// Resolve a PR to the task it belongs to: the head branch hive named for the
+// task first, then the legacy markers older PRs carry (the `hive-task: <id>`
+// body footer, then the `[hive-<number>]` title prefix). THE one resolver:
+// linkPrIfMarked writes links with it, and the reconciler checks a stored link
+// against it before acting on the PR (#2093).
 export function taskFromPrMarker(
   db: DB,
-  pr: { title?: string | null; body?: string | null }
-): { task: any; via: "id" | "number" } | null {
+  pr: { title?: string | null; body?: string | null; headRefName?: string | null; project_id?: string | null }
+): { task: any; via: "branch" | "id" | "number" } | null {
+  const owner = taskForHiveBranch(db, pr.project_id ?? null, pr.headRefName);
+  const byBranch: any = owner ? getTask(db, owner) : null;
+  if (byBranch && !/^hive\//.test(String(pr.headRefName))) return { task: byBranch, via: "branch" };
   const id = taskIdFromBody(pr.body);
   const byId: any = id ? getTask(db, id) : null;
   if (byId) return { task: byId, via: "id" };
@@ -2651,7 +2636,7 @@ export function taskFromPrMarker(
 
 export function linkPrIfMarked(
   db: DB,
-  pr: { title?: string | null; body?: string | null; url: string },
+  pr: { title?: string | null; body?: string | null; url: string; headRefName?: string | null; project_id?: string | null },
   source: "reconciler" | "director" = "reconciler",
   // A task whose stored PR no longer exists (the repo's history was rewritten,
   // the PR was created against a different repo, the branch was replayed) is
@@ -2709,7 +2694,7 @@ async function linkPrEndpoint(db: DB, body: any, deps: HandlerDeps): Promise<Res
   const prUrl = String(body?.pr_url ?? "").trim();
   if (!prUrl) return err("pr_url is required");
   const exec = deps.exec ?? defaultExec;
-  const r = await exec(["gh", "pr", "view", prUrl, "--json", "title,body,url"]);
+  const r = await exec(["gh", "pr", "view", prUrl, "--json", "title,body,url,headRefName"]);
   if (r.code !== 0) return err(r.stderr.trim() || r.stdout.trim() || "gh pr view failed", 502);
   let data: any;
   try {
@@ -2717,8 +2702,8 @@ async function linkPrEndpoint(db: DB, body: any, deps: HandlerDeps): Promise<Res
   } catch {
     return err("could not parse gh pr view output", 502);
   }
-  const res = linkPrIfMarked(db, { title: data.title, body: data.body, url: data.url || prUrl }, "director", body?.force === true);
-  if (!res) return err("PR carries no hive marker (no `hive-task:` footer or `[hive-<n>]` title)", 422);
+  const res = linkPrIfMarked(db, { title: data.title, body: data.body, url: data.url || prUrl, headRefName: data.headRefName }, "director", body?.force === true);
+  if (!res) return err("no task works on this PR's branch, and it carries no legacy task marker", 422);
   return json({ ok: true, ...res });
 }
 
@@ -3427,13 +3412,6 @@ async function doTransition(db: DB, id: string, body: any, deps: HandlerDeps = {
     const t = getTask(db, id);
     if (t) {
       const hiveOwnedReview = !isTrackingOnlyTask(t);
-      if (hiveOwnedReview && to === "verifying" && t.state === "in_review" && t.kind === "scout" && understandingChecksRequired(db, t)) {
-        const quiz = latestUnderstandingQuiz(db, id);
-        if (!quiz)
-          return err("Understanding check required. Ask the agent to add one before accepting this report.", 409);
-        if (understandingQuizStatus(db, id, quiz.quizKey) === "required")
-          return err("Pass the understanding check before accepting this report, or choose 'Continue now, quiz me later'.", 409);
-      }
       // A task with a PR must go through POST /merge — a plain move to verifying
       // skips the actual merge, and the smoke monitor then stamps the task done
       // with the PR still open (seen live 2026-07-18: task 2ae573b0a229 / PR #281).
@@ -3503,19 +3481,12 @@ export async function taskBranchCheckEndpoint(db: DB, id: string, deps: HandlerD
     const found = await findEmbeddedTasks(deps.exec ?? defaultExec, project.repo_path, base, task.branch, others);
     if (found) embedded_tasks = found;
   }
-  // The review card only blocks on the understanding check when this says so.
   // The risk check ran when the PR reached review, not at the land attempt
   // (HIVE-565), so its verdict is known before the director spends any effort:
-  // the card can refuse Ship and skip the quiz instead of asking for both and
-  // then blocking the merge.
+  // the card can refuse Ship instead of offering it and then blocking the merge.
   return json({
     unmet_deps,
     embedded_tasks,
-    understanding_required: understandingChecksRequired(db, task),
-    // Which key the pass is recorded under: the intent id when an accepted
-    // intent owns the quiz, otherwise the review event the card already knows
-    // (HIVE-638). The card reads the pass off the timeline, so it has to match.
-    understanding_quiz_key: latestUnderstandingQuiz(db, task.id)?.quizKey ?? null,
     confirmed_risks: confirmedRisks(db, task.id, task.head_sha),
     risk_check_unfinished: unfinishedRiskCheck(db, task.id, task.head_sha),
   });
@@ -3797,12 +3768,6 @@ async function mergeTaskLocked(
   // it CONFIRMED are the ones that survived an adversarial second look, so the
   // director sees that short list verbatim instead of the whole caution blob.
   // Refuted risks say nothing here. Overridable, like the rebase guard below.
-  //
-  // This runs BEFORE the understanding check (HIVE-565). The quiz is the most
-  // expensive thing hive asks of the director, and asking for it on a change
-  // the machine is about to refuse is the wrong order. A risk that lands AFTER
-  // the quiz was passed — a new push, a late verdict — says so, so the refusal
-  // never reads as "you did that for nothing".
   const confirmed = body?.override_confirmed_risks ? [] : confirmedRisks(db, id, task.head_sha);
   if (confirmed.length) {
     // HIVE-588: a verdict only ever describes the commit it was recorded on.
@@ -3829,11 +3794,8 @@ async function mergeTaskLocked(
         409
       );
     }
-    const quiz = latestUnderstandingQuiz(db, id);
-    const late = quiz && understandingQuizStatus(db, id, quiz.quizKey) === "passed";
     return err(
-      (late ? `you passed the understanding check on this change earlier; a new finding arrived on commit ${String(task.head_sha ?? "").slice(0, 7)}. ` : "") +
-        `merge blocked — the risk check confirmed ${confirmed.length} risk${confirmed.length === 1 ? "" : "s"} on this head: ` +
+      `merge blocked — the risk check confirmed ${confirmed.length} risk${confirmed.length === 1 ? "" : "s"} on this head: ` +
         confirmed.map((c) => `“${c.risk}” — ${c.why}${c.evidence_path ? ` (${c.evidence_path})` : ""}`).join("; ") +
         `. Fix them, or merge with override_confirmed_risks=true.`,
       409,
@@ -3855,19 +3817,6 @@ async function mergeTaskLocked(
         `Wait for it to retry, or merge with override_confirmed_risks=true.`,
       409
     );
-
-  // Mechanical changes (hive-1559) never mint a quiz, so nothing here to gate on.
-  let deferQuizReviewEventId: string | null = null;
-  if (understandingChecksRequired(db, task)) {
-    const quiz = latestUnderstandingQuiz(db, id);
-    if (!quiz)
-      return err("Understanding check required. Ask the agent to submit one in its latest review before merging.", 409);
-    if (understandingQuizStatus(db, id, quiz.quizKey) === "required") {
-      if (!autoShipKind)
-        return err("Pass the understanding check before merging, or choose 'Continue now, quiz me later'.", 409);
-      deferQuizReviewEventId = quiz.quizKey;
-    }
-  }
 
   // HIVE-403: the verification contract, at the merge gate. For a kind the
   // project ships automatically, an unproven command blocks the merge outright
@@ -4162,21 +4111,6 @@ async function mergeTaskLocked(
 
   if (!mergeStillCurrent()) return recoverySuperseded();
 
-  // One of two places a quiz settles on a merge: this is the hive-performed
-  // merge. The other is deferQuizForExternalMerge (below), for a PR merged on
-  // GitHub that the reconciler only observes afterwards.
-  if (deferQuizReviewEventId) {
-    writeEvent(db, {
-      task_id: id,
-      source: "system",
-      type: "understanding_quiz_deferred",
-      payload: {
-        review_event_id: deferQuizReviewEventId,
-        actor,
-        note: "Automatically deferred because this task kind is enabled in auto_merge.kinds.",
-      },
-    });
-  }
   // What this merge actually landed, recorded at merge time so autonomy stats
   // (server/src/autonomyStats.ts) can later ask "did a fix touch these files?".
   // Best effort: an unreadable repo or a deleted PR head just leaves it absent.
@@ -4460,6 +4394,31 @@ function seedFailureReported(db: DB, projectId: string, signature: string): bool
   });
 }
 
+// The branch a task works on. A respawn keeps whatever it already had (older
+// tasks keep `hive/<id>`); a first spawn gets a name a person would pick,
+// recorded before the worktree exists so a failed spawn retries on the same one.
+async function pickBranch(db: DB, task: any, repoPath: string, herdr: Herdr): Promise<string> {
+  if (task.branch) return task.branch;
+  const named = db
+    .query("SELECT json_extract(payload, '$.branch') AS branch FROM events WHERE task_id = ? AND type = 'branch_named' ORDER BY ts DESC, rowid DESC LIMIT 1")
+    .get(task.id) as { branch: string | null } | undefined;
+  if (named?.branch) return named.branch;
+  const slug = branchSlug(task);
+  const taken = async (name: string): Promise<boolean> => {
+    if (db.query("SELECT 1 FROM tasks WHERE project_id = ? AND (branch = ? OR resume_branch = ?) LIMIT 1").get(task.project_id, name, name)) return true;
+    if (taskForHiveBranch(db, task.project_id, name)) return true;
+    return herdr.branchExists(repoPath, name);
+  };
+  let branch = `${slug}-${task.id.slice(0, 6)}`;
+  for (const candidate of [slug, `${slug}-2`, `${slug}-3`, `${slug}-4`, `${slug}-5`]) {
+    if (await taken(candidate)) continue;
+    branch = candidate;
+    break;
+  }
+  writeEvent(db, { task_id: task.id, source: "herdr", type: "branch_named", payload: { branch } });
+  return branch;
+}
+
 export async function spawnAgent(
   db: DB,
   herdr: Herdr,
@@ -4508,13 +4467,14 @@ export async function spawnAgent(
     // silently resolve to someone else's PR). Confirm the marker live before
     // telling a fresh agent to adopt it.
     if (!(await resumePointerMarkerHolds(db, opts.exec ?? defaultExec, ids, task.resume_pr_url))) {
-      const error = `refusing to dispatch: PR ${task.resume_pr_url} no longer carries a hive-task marker naming this task (or its parent) — it may point at a different or migrated repo. Reattach to the current PR (or clear resume_pr_url) before dispatching`;
+      const error = `refusing to dispatch: PR ${task.resume_pr_url} is not on this task's (or its parent's) branch — it may point at a different or migrated repo. Reattach to the current PR (or clear resume_pr_url) before dispatching`;
       writeEvent(db, { task_id: id, source: "herdr", type: "spawn_error", payload: { error } });
       return { ok: false, error };
     }
   }
   const project: any = db.query("SELECT * FROM projects WHERE id = ?").get(task.project_id);
   if (!project?.repo_path) return { ok: false, error: "project has no repo_path" };
+  const branch = await pickBranch(db, task, project.repo_path, herdr);
   // A race attempt pins its own backend (HIVE-351) so one attempt can run on
   // codex while its sibling runs on claude. Overlaying it on the project config
   // is enough: model, argv and hooks all key off the same `agent` field.
@@ -4544,6 +4504,7 @@ export async function spawnAgent(
     ...agentPlatformEnv(),
     ...claudeProfileEnvForRepo(project.repo_path),
     HIVE_AGENT: agent,
+    HIVE_BRANCH: branch,
   };
 
   // HIVE-552: a finished agent idles at its prompt holding the task name, which
@@ -4573,6 +4534,7 @@ export async function spawnAgent(
       hiveUrl,
       title: task.title,
       brief,
+      branch,
       base: projectBaseBranch(config),
       env,
       model: modelForTask(config, task.kind),
@@ -4589,21 +4551,6 @@ export async function spawnAgent(
       // agents don't have to install deps / bring up their stack themselves.
       prepareWorktree: async (worktreePath) => {
         if (agent === "claude") writeHookSettings(worktreePath, id, hiveUrl, config.command_approval);
-        // HIVE-636: drop the accepted intent into the branch so it is versioned
-        // with the code the agent is about to write — the agent's first commit
-        // picks it up. Best-effort like the rest of prepareWorktree: a spawn is
-        // never failed over a record file.
-        const intentFile = intentFileFor(db, task);
-        if (intentFile) {
-          try {
-            const full = join(worktreePath, intentFile.path);
-            mkdirSync(dirname(full), { recursive: true });
-            writeFileSync(full, intentFile.body);
-            writeEvent(db, { task_id: id, source: "herdr", type: "intent_written", payload: { path: intentFile.path } });
-          } catch (e: any) {
-            console.error(`[hive] intent file ${id}:`, e);
-          }
-        }
         // HIVE-355: seed the untracked config a fresh checkout is missing and
         // clone the warm state (node_modules) BEFORE setup_argv, so the project's
         // own setup hook finds the work already done and no-ops. Best-effort by
@@ -4837,7 +4784,7 @@ async function sendSteer(db: DB, herdr: Herdr, id: string, req: Request): Promis
     // and nothing reads it here — a stored 'queued' would just go stale
     // forever once syncJiraOnce actually pushes the comment (task #1008).
     if (files.length) return err("Jira comment attachments are not supported yet", 400);
-    const comment = sender ? `Hive agent #${sender.number} (${sender.title}):\n${text}` : text;
+    const comment = text;
     if (comment.length > JIRA_COMMENT_MAX_LENGTH)
       return err(`Jira comments are limited to ${JIRA_COMMENT_MAX_LENGTH} characters`, 413);
     writeEvent(db, {
@@ -5071,70 +5018,12 @@ function checkpointPlan(payload: string): Record<string, unknown> | null {
   }
 }
 
-interface UnderstandingCheck {
-  question: string;
-  options: { key: string; label: string }[];
-  answerKey: string;
-  explanation?: string;
-}
-
-// Server-side lint floor: only the egregious wording gets flagged (a question
-// past ~400 chars, or an option past ~150), and even then it's a steer asking
-// the agent to tighten the wording, never a rejection — the length rule is
-// soft guidance (director feedback 2026-08-25), so a long-but-reasonable quiz
-// for a genuinely complex change must sail through untouched.
-function isEgregiousCheckWording(check: { question: string; options: { label: string }[] }): boolean {
-  return check.question.length > 400 || check.options.some((option) => option.label.length > 150);
-}
-
-export const QUIZ_WORDING_STEER =
-  "Your understanding-quiz wording is egregiously long (a question over ~400 chars or an option over ~150). " +
-  "Tighten the wording: plain everyday words, one idea per sentence, no nested clauses.";
-
-function isAgentProcedureQuestion(value: unknown): boolean {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const question = typeof (value as Record<string, unknown>).question === "string"
-    ? String((value as Record<string, unknown>).question)
-    : "";
-  return [
-    /\bwhat should (?:you|an? agent|the agent|the worker|the supervisor|the orchestrator) do\b/i,
-    /\byour (?:branch|task|pr|pull request|checkout|worktree)\b/i,
-    /\bwhere (?:else )?(?:could|should|would) (?:the )?(?:actual )?blocker live\b/i,
-    /\bwhere should you investigate\b/i,
-    /\bwhat(?:'s| is) the (?:correct|best|next) move\b/i,
-  ].some((pattern) => pattern.test(question));
-}
-
-function normalizeUnderstandingCheck(value: unknown): UnderstandingCheck | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const raw = value as Record<string, unknown>;
-  const question = typeof raw.question === "string" ? raw.question.trim().slice(0, 600) : "";
-  const answerKey = typeof raw.answer_key === "string" ? raw.answer_key.trim().slice(0, 80) : "";
-  const seen = new Set<string>();
-  const options = Array.isArray(raw.options)
-    ? raw.options.flatMap((item) => {
-        if (!item || typeof item !== "object" || Array.isArray(item)) return [];
-        const option = item as Record<string, unknown>;
-        const key = typeof option.key === "string" ? option.key.trim().slice(0, 80) : "";
-        const label = typeof option.label === "string" ? option.label.trim().slice(0, 600) : "";
-        if (!key || !label || seen.has(key)) return [];
-        seen.add(key);
-        return [{ key, label }];
-      }).slice(0, 4)
-    : [];
-  if (!question || options.length < 2 || !options.some((option) => option.key === answerKey)) return null;
-  const explanation = typeof raw.explanation === "string" && raw.explanation.trim()
-    ? raw.explanation.trim().slice(0, 600)
-    : undefined;
-  return { question, options, answerKey, explanation };
-}
-
 // Recurrence guard. One artifact states a fact once: a review card that repeats
-// the same point across three bullets and then quizzes it again is the padding
-// the director called out (2026-08-19). The prompts (see plainEnglish.ts) ask
-// for this; here it is enforced for the case a rule cannot be argued with — the
-// SAME sentence twice, ignoring case, punctuation and spacing. A reworded
-// repeat still gets through, so this is a floor, not a filter.
+// the same point across three bullets is the padding the director called out
+// (2026-08-19). The prompts (see plainEnglish.ts) ask for this; here it is
+// enforced for the case a rule cannot be argued with — the SAME sentence twice,
+// ignoring case, punctuation and spacing. A reworded repeat still gets through,
+// so this is a floor, not a filter.
 function recurrenceKey(value: unknown): string {
   const text =
     typeof value === "string"
@@ -5145,657 +5034,14 @@ function recurrenceKey(value: unknown): string {
   return text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
 }
 
-function dropRepeats<T>(items: T[], key: (value: T) => string = recurrenceKey): T[] {
+function dropRepeats<T>(items: T[]): T[] {
   const seen = new Set<string>();
   return items.filter((item) => {
-    const k = key(item);
+    const k = recurrenceKey(item);
     if (!k || seen.has(k)) return false;
     seen.add(k);
     return true;
   });
-}
-
-function normalizeUnderstandingChecks(understanding: unknown): UnderstandingCheck[] {
-  if (!understanding || typeof understanding !== "object" || Array.isArray(understanding)) return [];
-  const raw = understanding as Record<string, unknown>;
-  const values = Array.isArray(raw.checks) ? raw.checks : Array.isArray(raw.check) ? raw.check : raw.check ? [raw.check] : [];
-  return values.flatMap((value) => {
-    const check = normalizeUnderstandingCheck(value);
-    return check ? [check] : [];
-  }).slice(0, 5);
-}
-
-// Semantic identity for one check. An agent regenerates this text on every
-// run, so whitespace and wording drift is the normal case and byte-identity is
-// the wrong equivalence (HIVE-545). Two checks are the same when they ask the
-// same question, offer the same set of answers, and mark the same one correct.
-// The OPTIONS are part of the identity on purpose: same question, different
-// options is a DIFFERENT check, and carrying an answer across that would
-// record the director as having answered something they never saw.
-function understandingCheckKey(check: UnderstandingCheck): string {
-  const labels = check.options.map((option) => recurrenceKey(option.label)).sort().join("|");
-  const answer = recurrenceKey(check.options.find((option) => option.key === check.answerKey)?.label ?? "");
-  return [recurrenceKey(check.question), labels, answer].join("::");
-}
-
-// Same quiz? Order-independent, because the order a reviewer happens to list
-// its questions in is not part of what the director answered. Nothing maps an
-// answer back to a position: the only thing carried is a WHOLE-quiz pass, which
-// means every question in the set was answered however it was ordered.
-function sameUnderstandingChecks(a: unknown, b: unknown): boolean {
-  const left = normalizeUnderstandingChecks({ checks: a });
-  const right = normalizeUnderstandingChecks({ checks: b });
-  if (!left.length || left.length !== right.length) return false;
-  return (
-    left.map(understandingCheckKey).sort().join("\n") ===
-    right.map(understandingCheckKey).sort().join("\n")
-  );
-}
-
-// listUnderstandingQuizzes and answerUnderstandingQuiz must agree on which task
-// states have an actionable quiz, or the list can advertise an item the answer
-// endpoint then rejects (hive-1006).
-const UNDERSTANDING_QUIZ_ANSWERABLE_STATES = ["in_review", "verifying", "done", "failed"];
-
-// Paths whose changes always deserve a director quiz, whatever the reviewer
-// said. Per-project override: config.understanding_checks.sensitive_paths.
-const DEFAULT_SENSITIVE_PATHS = ["auth", "token", "security", "payment", "billing", "migration", "secret", "credential", "password"];
-
-// Match a token anywhere inside a path segment, case-insensitively, so "auth"
-// hits `server/src/auth.ts`, `web/authGuard.ts` AND `src/authTokens.ts`.
-// Deliberately biased to false positives: quizzing a mechanical change costs
-// the director one question, missing a sensitive one costs a blind merge.
-// ponytail: substring matching, not globs. Swap in a glob matcher only if a
-// project needs a path shape this cannot express.
-function touchesSensitivePath(files: string[], tokens: string[]): boolean {
-  const needles = tokens.map((token) => token.toLowerCase()).filter(Boolean);
-  return files.some((file) => {
-    const segments = file.toLowerCase().split("/");
-    return needles.some((needle) => segments.some((segment) => segment.includes(needle)));
-  });
-}
-
-// The newest verdict from the auto reviewer, or null when it never produced one
-// (never ran, errored, or was skipped by project config).
-
-// Judgment-class or not (hive-1559). Hive raises only the few changes that
-// actually need the director's head; everything mechanical merges without a
-// quiz and never lands in the post-ship backlog. A task is judgment-class when
-// ANY of these holds:
-//   1. the latest auto_review verdict is not `looks_good` (missing, errored,
-//      skipped and `caution` all count — no clean verdict means no free pass),
-//   2. its reviewed diff touches a sensitive path (auth/security/payments/
-//      migrations by default, per-project via config.understanding_checks),
-//   3. its kind is outside the project's auto_merge.kinds allow-list, or
-//   4. the director flagged the task (POST .../understanding-quiz/require).
-// The part of the rule that does not need the auto review to have run: a kind
-// the project never auto-merges, and a card the director flagged by hand. Both
-// are already true when the agent hands off, which is what lets the emit gate
-// (HIVE-580) hold on them without guessing at a verdict that does not exist
-// yet. Everything below this line reads the review, so it can only be decided
-// later — a caller that runs before the review must treat "not certain" as
-// "let it through", not as "no check needed".
-export function understandingCheckCertain(
-  db: DB,
-  task: { id: string; kind: string; project_id: string }
-): boolean {
-  const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id);
-  const config = JSON.parse(project?.config ?? "{}");
-  if (!(Array.isArray(config.auto_merge?.kinds) && config.auto_merge.kinds.includes(task.kind))) return true;
-  return !!db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_required' LIMIT 1").get(task.id);
-}
-
-export function understandingChecksRequired(
-  db: DB,
-  task: { id: string; kind: string; project_id: string; head_sha?: string | null }
-): boolean {
-  if (understandingCheckCertain(db, task)) return true;
-  const project: any = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id);
-  const config = JSON.parse(project?.config ?? "{}");
-  const review = latestAutoReviewVerdict(db, task.id);
-  if (!review) return true;
-  // A review's verdict only speaks for the head it looked at. A force-push
-  // after review moves task.head_sha out from under it (HIVE-453) — treat that
-  // review as absent so a stale cleared-caution or stale looks_good can't
-  // un-gate the quiz for a head nobody actually reviewed.
-  if (task.head_sha && review.reviewed_head_sha !== task.head_sha) return true;
-  // A caution whose every risk was refuted and every question answered from the
-  // code is not judgment-class either (HIVE-407) — the same rule the reconciler
-  // uses to auto-merge it. Anything still confirmed or human-only needs the
-  // director, so it keeps its quiz.
-  if (review.verdict !== "looks_good" && !cautionCleared(db, task.id, review.reviewed_head_sha, review)) return true;
-  const tokens = Array.isArray(config.understanding_checks?.sensitive_paths)
-    ? config.understanding_checks.sensitive_paths.map(String)
-    : DEFAULT_SENSITIVE_PATHS;
-  return touchesSensitivePath(review.files, tokens);
-}
-
-// Judgment-class says a quiz is OWED. This says it is ANSWERABLE (HIVE-488).
-// A task still in review has nothing to ask the director until its own review
-// pipeline finished for the CURRENT head: the auto review was written for that
-// head, and every risk and question it raised has a verdict keyed to that head.
-// Short of that the quiz is pipeline state — the review card still shows the
-// task as in review, but it must not count toward the quiz or needs-you totals.
-// Shipped tasks (verifying/done/failed) are the post-ship catch-up class: their
-// head is settled and their quiz is answerable, and it only ever feeds the
-// digest, never a blocking gate.
-function quizAnswerable(db: DB, task: { id: string; state: string; head_sha: string | null; project_id: string }): boolean {
-  // Shipped: the post-ship catch-up class. Its head is settled, so it is
-  // answerable, and it only ever feeds the digest.
-  if (task.state !== "in_review") return true;
-  // A change the risk check already refused is not a change to quiz anybody on
-  // (HIVE-570). The quiz is the most expensive thing hive asks of the director,
-  // and asking for it on a PR that cannot merge spends his effort before the
-  // machine spends any of its own. The finding goes back to the agent; the quiz
-  // comes back on its own once the next push clears the risk.
-  if (confirmedRisks(db, task.id, task.head_sha).length) return false;
-  // The director asked for this one by hand, so it is their question whatever
-  // the pipeline is doing.
-  if (db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_required' LIMIT 1").get(task.id)) return true;
-  // No head to key verdicts to, or a project that never auto-reviews: the
-  // reviewer skips both, so nothing further is coming and this is as complete
-  // as the review gets.
-  return reviewPipelineSettled(db, task);
-}
-
-// Re-emitting a review is the normal reply to a rebase, a risk finding or red
-// CI. A re-emitted review that says nothing about the understanding checks means
-// "nothing to add", not "delete them" (HIVE-545) — last-write-wins used to wipe
-// a quiz the director had already passed and drop an approved PR back out of
-// the land queue. So the checks carry forward. Only an explicit `checks: []`
-// clears them, and that empty array is stored so the clear sticks.
-// Returns the newest review that actually spoke about checks, or null when no
-// review ever did (or the last word was an explicit clear).
-function carriedUnderstandingChecks(db: DB, taskId: string): { checks: unknown[]; eventId: string; rowid: number } | null {
-  const rows = db
-    .query("SELECT id, rowid, payload FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY rowid DESC")
-    .all(taskId) as { id: string; rowid: number; payload: string }[];
-  for (const row of rows) {
-    let understanding: any;
-    try { understanding = JSON.parse(row.payload)?.understanding; } catch { continue; }
-    if (!understanding || typeof understanding !== "object" || !Array.isArray(understanding.checks)) continue;
-    if (!understanding.checks.length) return null;
-    return { checks: understanding.checks, eventId: row.id, rowid: row.rowid };
-  }
-  return null;
-}
-
-// The quiz a task owes, and the KEY its attempts and its pass are recorded
-// under. Two sources, and the intent wins (HIVE-638):
-//   - an accepted intent with minted checks: the key is the INTENT id, so every
-//     review head reads the same quiz and a re-emitted review never re-asks.
-//     Only a superseded intent (a new row, a new id) asks again.
-//   - no intent: the key is the review event id, exactly as before, and the
-//     agent's own diff-based checks are asked.
-// The key lands in the attempt/pass payloads as `review_event_id` — the field
-// name predates intents, and every historical row is written under it.
-function intentUnderstandingQuiz(db: DB, taskId: string): { quizKey: string; checks: UnderstandingCheck[]; intent: Intent } | null {
-  const intent = acceptedIntentFor(db, taskId);
-  if (!intent) return null;
-  const checks = normalizeUnderstandingChecks({ checks: intentChecks(intent) });
-  return checks.length ? { quizKey: intent.id, checks, intent } : null;
-}
-
-// What the quiz card says it is asking about: "from intent <slug>", linking to
-// the intent card. The slug is the same one the intent file carries in the
-// worktree, so the director sees one name for the ask everywhere.
-function intentQuizLabel(db: DB, taskId: string, intent?: Intent | null): { intent_id?: string; intent_slug?: string } {
-  if (!intent) return {};
-  const task = db.query("SELECT jira_key, number FROM tasks WHERE id = ?").get(taskId) as
-    | { jira_key: string | null; number: number }
-    | undefined;
-  return { intent_id: intent.id, intent_slug: intentSlug(task ?? {}) };
-}
-
-function latestUnderstandingQuiz(db: DB, taskId: string): { quizKey: string; checks: UnderstandingCheck[]; intent?: Intent } | null {
-  const fromIntent = intentUnderstandingQuiz(db, taskId);
-  if (fromIntent) return fromIntent;
-  const row: any = db
-    .query("SELECT id, payload FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY ts DESC, rowid DESC LIMIT 1")
-    .get(taskId);
-  if (!row) return null;
-  try {
-    const payload = JSON.parse(row.payload);
-    const checks = normalizeUnderstandingChecks(payload?.understanding);
-    return checks.length ? { quizKey: row.id, checks } : null;
-  } catch {
-    return null;
-  }
-}
-
-function understandingQuizProgress(db: DB, taskId: string, quizKey: string): { attempts: number; completed: Set<number> } {
-  const rows = db
-    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'understanding_quiz_attempt' AND json_extract(payload, '$.review_event_id') = ?")
-    .all(taskId, quizKey) as { payload: string }[];
-  const completed = new Set<number>();
-  for (const row of rows) {
-    try {
-      const payload = JSON.parse(row.payload);
-      if (payload.correct === true && Number.isInteger(payload.check_index)) completed.add(payload.check_index);
-    } catch {
-      /* ignore malformed legacy attempts */
-    }
-  }
-  return { attempts: rows.length, completed };
-}
-
-function activeUnderstandingCheck(
-  db: DB,
-  taskId: string,
-  quiz: { quizKey: string; checks: UnderstandingCheck[] }
-): { check: UnderstandingCheck; index: number; completed: number; version: string } {
-  const progress = understandingQuizProgress(db, taskId, quiz.quizKey);
-  const remaining = quiz.checks.map((_, index) => index).filter((index) => !progress.completed.has(index));
-  const pool = remaining.length ? remaining : quiz.checks.map((_, index) => index);
-  const offset = [...quiz.quizKey].reduce((sum, char) => sum + char.charCodeAt(0), 0);
-  const index = pool[(offset + progress.attempts) % pool.length];
-  return { check: quiz.checks[index], index, completed: quiz.checks.length - remaining.length, version: `${quiz.quizKey}:${progress.attempts}` };
-}
-
-function understandingQuizStatus(db: DB, taskId: string, quizKey: string): "required" | "deferred" | "passed" {
-  const passed = db
-    .query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_quiz_passed' AND json_extract(payload, '$.review_event_id') = ? LIMIT 1")
-    .get(taskId, quizKey);
-  if (passed) return "passed";
-  const deferred = db
-    .query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_quiz_deferred' AND json_extract(payload, '$.review_event_id') = ? LIMIT 1")
-    .get(taskId, quizKey);
-  return deferred ? "deferred" : "required";
-}
-
-// A quiz pass is invalidated by a changes_requested or an answered decision
-// since the review it was passed on: the change moved, so the director looks
-// again. Hive's OWN housekeeping bounces are the exception. Neither says
-// anything about the change the director read: the merge-conflict one tells the
-// agent to merge main, the quiz-wording one tells it to shorten its own prose.
-// Left in the invalidation set they cost the director the quiz twice on the
-// same diff (HIVE-634: task 6e8a66261e16 passed at 17:12:44Z, hive bounced for
-// conflicts one second later, and the identical checks were re-asked at 18:15;
-// HIVE-635: task 9af57574149a, evt_83e7c5868304 at 07:09:53Z). The `notes` of
-// one of these is a single steer message; a bounce that also carries a human
-// note (steers are joined with a blank line) is NOT mechanical and still
-// invalidates.
-function mechanicalBounceSql(alias: string): string {
-  return `(${alias}type = 'changes_requested'
-      AND ${alias}source IN ('system', 'reconciler')
-      AND (json_extract(${alias}payload, '$.notes') LIKE 'hive: your PR%has merge conflicts%'
-        OR json_extract(${alias}payload, '$.notes') LIKE 'Your understanding-quiz wording is egregiously long%')
-      AND json_extract(${alias}payload, '$.notes') NOT LIKE '%' || char(10) || char(10) || '%')`;
-}
-
-// Older agents sometimes re-submit the exact same review after an unrelated
-// merge failure. That must not erase a quiz the director already completed.
-// Repair the latest duplicate once at startup; future duplicates are rejected
-// idempotently at ingestion below.
-export function repairDuplicateQuizPasses(db: DB): number {
-  const latest = db
-    .query(
-      `SELECT e.id, e.task_id, e.payload, e.rowid
-         FROM events e
-        WHERE e.type = 'review_summary'
-          AND NOT EXISTS (
-            SELECT 1 FROM events newer
-             WHERE newer.task_id = e.task_id AND newer.type = 'review_summary' AND newer.rowid > e.rowid)`
-    )
-    .all() as { id: string; task_id: string; payload: string; rowid: number }[];
-  let repaired = 0;
-  for (const review of latest) {
-    // An intent-owned quiz has one key for the whole task, so a re-emitted
-    // review cannot duplicate a pass and there is nothing here to repair.
-    if (intentUnderstandingQuiz(db, review.task_id)) continue;
-    if (understandingQuizStatus(db, review.task_id, review.id) === "passed") continue;
-    const priors = db
-      .query(
-        `SELECT older.id, older.payload
-           FROM events older
-          WHERE older.task_id = ? AND older.type = 'review_summary'
-            AND older.rowid < ?
-            AND EXISTS (
-              SELECT 1 FROM events passed
-               WHERE passed.task_id = older.task_id AND passed.type = 'understanding_quiz_passed'
-                 AND json_extract(passed.payload, '$.review_event_id') = older.id)
-            AND NOT EXISTS (
-              SELECT 1 FROM events invalidated
-               WHERE invalidated.task_id = older.task_id
-                 AND invalidated.rowid > older.rowid AND invalidated.rowid < ?
-                 AND invalidated.type IN ('changes_requested', 'decision_answered')
-                 AND NOT ${mechanicalBounceSql("invalidated.")})
-          ORDER BY older.rowid DESC`
-      )
-      .all(review.task_id, review.rowid, review.rowid) as { id: string; payload: string }[];
-    // Compare the checks, not the serialised payload: a re-emitted review
-    // rewrites its prose and its whitespace, and none of that changes what the
-    // director was asked (HIVE-545).
-    const checksOf = (payload: string): unknown => {
-      try { return JSON.parse(payload)?.understanding?.checks; } catch { return undefined; }
-    };
-    const reviewChecks = checksOf(review.payload);
-    const prior = priors.find((older) => sameUnderstandingChecks(checksOf(older.payload), reviewChecks));
-    if (!prior) continue;
-    writeEvent(db, {
-      task_id: review.task_id,
-      source: "system",
-      type: "understanding_quiz_passed",
-      payload: {
-        review_event_id: review.id,
-        carried_from_review_event_id: prior.id,
-        reason: "re-emitted review asks the same understanding checks",
-      },
-    });
-    repaired++;
-  }
-  return repaired;
-}
-
-// Quizzes on tasks that already shipped: the post-ship catch-up backlog. The
-// web UI shows these as ONE digest, so the count here is what that digest says,
-// not a number of separate attention items. Quizzes on tasks still in review
-// are excluded — those gate their own review card.
-const POST_SHIP_QUIZ_STATES = ["verifying", "done", "failed"];
-// Same filters as listUnderstandingQuizzes (the list the "Catch up" digest
-// cards are built from) so this count always agrees with what those cards
-// show, including the mechanical-task exclusion (hive-1559). Pass projectId
-// to scope the count to one project, matching how the client groups digests.
-export function pendingPostShipQuizCount(db: DB, projectId?: string): number {
-  const placeholders = POST_SHIP_QUIZ_STATES.map(() => "?").join(",");
-  const rows = db
-    .query(
-      `SELECT e.id, e.task_id, e.payload, t.project_id, t.kind FROM events e JOIN tasks t ON t.id = e.task_id
-        WHERE e.type = 'review_summary'
-          AND t.state IN (${placeholders})
-          AND (? IS NULL OR t.project_id = ?)
-          AND NOT EXISTS (
-            SELECT 1 FROM events newer
-             WHERE newer.task_id = e.task_id AND newer.type = 'review_summary'
-               AND (newer.ts > e.ts OR (newer.ts = e.ts AND newer.rowid > e.rowid)))`
-    )
-    .all(...POST_SHIP_QUIZ_STATES, projectId ?? null, projectId ?? null) as
-    { id: string; task_id: string; payload: string; project_id: string; kind: string }[];
-  return rows.filter((row) => {
-    let payload: any;
-    try { payload = JSON.parse(row.payload); } catch { return false; }
-    const fromIntent = intentUnderstandingQuiz(db, row.task_id);
-    if (!fromIntent && !normalizeUnderstandingChecks(payload?.understanding).length) return false;
-    // Same judgment-class filter the quiz list applies, or the digest promises
-    // more changes to catch up on than the list can show (HIVE-488).
-    if (!understandingChecksRequired(db, { id: row.task_id, kind: row.kind, project_id: row.project_id })) return false;
-    return understandingQuizStatus(db, row.task_id, fromIntent?.quizKey ?? row.id) !== "passed";
-  }).length;
-}
-
-// Quizzes split into two very different classes, and only one of them is
-// something anyone is waiting on:
-//   - live (in_review, verifying): the task has not finished, so the quiz can
-//     still change what happens to it.
-//   - shipped (done, failed): the post-ship catch-up backlog. Real, but nothing
-//     is blocked on it and it only ever grows.
-// The default is LIVE, because every counter that reads this endpoint without
-// thinking about it was reporting the shipped pile as a pending queue
-// (HIVE-542: 104 "pending" quizzes, 1 of them on a live task). The web UI wants
-// both classes — it builds the "Catch up on N shipped changes" digest from the
-// shipped ones — so it asks for `?scope=all` explicitly.
-const UNDERSTANDING_QUIZ_LIVE_STATES = ["in_review", "verifying"];
-
-function listUnderstandingQuizzes(db: DB, url: URL): Response {
-  return json({
-    quizzes: openUnderstandingQuizzes(db, url.searchParams.get("project_id"), url.searchParams.get("scope") === "all"),
-  });
-}
-
-// The open understanding checks, exactly as the inbox sees them. Exported as
-// rows (not a Response) so the attention budget counts the SAME quizzes the
-// director is shown — see server/src/attention.ts.
-export function openUnderstandingQuizzes(db: DB, projectId: string | null, allScopes = false): any[] {
-  const states = allScopes
-    ? UNDERSTANDING_QUIZ_ANSWERABLE_STATES
-    : UNDERSTANDING_QUIZ_LIVE_STATES;
-  const statePlaceholders = states.map(() => "?").join(",");
-  const rows = db
-    .query(
-      `SELECT e.id, e.task_id, e.ts, e.payload, t.number, t.title, t.project_id, t.state, t.kind, t.head_sha
-         FROM events e JOIN tasks t ON t.id = e.task_id
-        WHERE e.type = 'review_summary'
-          AND t.state IN (${statePlaceholders})
-          AND (? IS NULL OR t.project_id = ?)
-          AND NOT EXISTS (
-            SELECT 1 FROM events newer
-             WHERE newer.task_id = e.task_id AND newer.type = 'review_summary'
-               AND (newer.ts > e.ts OR (newer.ts = e.ts AND newer.rowid > e.rowid)))
-        ORDER BY t.number DESC`
-    )
-    .all(...states, projectId, projectId) as any[];
-  const quizzes = rows.flatMap((row) => {
-    let payload: any;
-    try { payload = JSON.parse(row.payload); } catch { return []; }
-    // An accepted intent owns the quiz: same three questions on every head, and
-    // the pass is keyed on the intent, not on this review event (HIVE-638).
-    const fromIntent = intentUnderstandingQuiz(db, row.task_id);
-    const checks = fromIntent ? fromIntent.checks : normalizeUnderstandingChecks(payload?.understanding);
-    const quizKey = fromIntent ? fromIntent.quizKey : row.id;
-    if (!checks.length) return [];
-    // A mechanical change gets no backlog entry even when its agent submitted
-    // checks anyway (hive-1559).
-    if (!understandingChecksRequired(db, { id: row.task_id, kind: row.kind, project_id: row.project_id, head_sha: row.head_sha }))
-      return [];
-    // Not yet answerable = the review pass has not finished for the live head.
-    if (!quizAnswerable(db, { id: row.task_id, state: row.state, head_sha: row.head_sha, project_id: row.project_id })) return [];
-    const understanding = payload?.understanding && typeof payload.understanding === "object" && !Array.isArray(payload.understanding)
-      ? Object.fromEntries(Object.entries(payload.understanding).filter(([key]) => key !== "check" && key !== "checks"))
-      : {};
-    const status = understandingQuizStatus(db, row.task_id, quizKey);
-    if (status === "passed") return [];
-    const active = activeUnderstandingCheck(db, row.task_id, { quizKey, checks });
-    return [{
-      id: row.id,
-      quiz_key: quizKey,
-      ...intentQuizLabel(db, row.task_id, fromIntent?.intent),
-      task_id: row.task_id,
-      ts: row.ts,
-      task_number: row.number,
-      task_title: row.title,
-      task_state: row.state,
-      task_kind: row.kind,
-      project_id: row.project_id,
-      report: { ...payload, understanding },
-      question: active.check.question,
-      options: active.check.options,
-      version: active.version,
-      completed: active.completed,
-      total: checks.length,
-      status,
-    }];
-  });
-  return quizzes;
-}
-
-function answerUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
-  const task = getTask(db, taskId);
-  if (!task) return noTask(taskId);
-  if (task.state === "cancelled") return err("cancelled task has no active understanding check", 409);
-  if (!UNDERSTANDING_QUIZ_ANSWERABLE_STATES.includes(task.state))
-    return err("understanding checks can be answered during review or from the post-ship backlog", 409);
-  if (body?.source !== "director") return err("only the director can answer understanding checks", 403);
-  const quiz = latestUnderstandingQuiz(db, taskId);
-  if (!quiz) return err("understanding check not found", 404);
-  const status = understandingQuizStatus(db, taskId, quiz.quizKey);
-  const active = activeUnderstandingCheck(db, taskId, quiz);
-  const check = active.check;
-  const actor = actorOf(body);
-  const expectedVersion = body?.version;
-  if (expectedVersion !== undefined && typeof expectedVersion !== "string") return err("version must be a string");
-  if (status === "passed" || (expectedVersion !== undefined && expectedVersion !== active.version)) {
-    const winner: any = db
-      .query(
-        `SELECT * FROM events WHERE task_id = ?
-          AND type IN ('understanding_quiz_attempt', 'understanding_quiz_passed')
-          AND json_extract(payload, '$.review_event_id') = ? ORDER BY rowid DESC LIMIT 1`
-      )
-      .get(taskId, quiz.quizKey);
-    if (expectedVersion === undefined)
-      return json({ ok: true, correct: true, passed: true, explanation: check.explanation ?? null });
-    const event = winner ? parseEvent(winner) : null;
-    const index = Number(event?.payload?.check_index);
-    const answerKey = event?.payload?.answer_key ?? null;
-    const answerLabel = Number.isInteger(index)
-      ? quiz.checks[index]?.options.find((option) => option.key === answerKey)?.label ?? answerKey
-      : answerKey;
-    const nextQuiz = {
-      question: check.question,
-      options: check.options,
-      version: active.version,
-      completed: active.completed,
-      total: quiz.checks.length,
-    };
-    // HIVE-625: one director, two mounts. The version moved because of THEIR
-    // own earlier answer, so "already changed by <you>" is a contradiction —
-    // hand the stale mount the current check instead of a 409.
-    if (actor && event?.payload?.actor === actor) {
-      if (status === "passed")
-        return json({ ok: true, correct: true, passed: true, refreshed: true, explanation: check.explanation ?? null });
-      return json({
-        ok: true,
-        refreshed: true,
-        passed: false,
-        explanation: null,
-        completed: active.completed,
-        total: quiz.checks.length,
-        quiz: nextQuiz,
-      });
-    }
-    return staleResponse("understanding check already changed", {
-      status,
-      source: event?.source ?? "system",
-      actor: event?.payload?.actor ?? null,
-      at: event?.ts ?? null,
-      answer_key: answerKey,
-      answer_label: answerLabel,
-      correct: event?.payload?.correct ?? status === "passed",
-      quiz: status === "passed" ? null : nextQuiz,
-    });
-  }
-  const answerKey = typeof body?.answer_key === "string" ? body.answer_key : "";
-  if (!check.options.some((option) => option.key === answerKey)) return err("answer_key must match a quiz option");
-  if (answerKey !== check.answerKey) {
-    writeEvent(db, {
-      task_id: taskId,
-      source: "director",
-      type: "understanding_quiz_attempt",
-      payload: { review_event_id: quiz.quizKey, check_index: active.index, answer_key: answerKey, correct: false, actor },
-    });
-    const next = activeUnderstandingCheck(db, taskId, quiz);
-    return json({
-      ok: false,
-      correct: false,
-      passed: false,
-      explanation: check.explanation ?? null,
-      completed: next.completed,
-      total: quiz.checks.length,
-      quiz: { question: next.check.question, options: next.check.options, version: next.version, completed: next.completed, total: quiz.checks.length },
-    });
-  }
-  writeEvent(db, {
-    task_id: taskId,
-    source: "director",
-    type: "understanding_quiz_attempt",
-    payload: { review_event_id: quiz.quizKey, check_index: active.index, answer_key: answerKey, correct: true, actor, surface: body?.surface === "focus" ? "focus" : undefined },
-  });
-  const next = activeUnderstandingCheck(db, taskId, quiz);
-  if (next.completed < quiz.checks.length) {
-    return json({
-      ok: true,
-      correct: true,
-      passed: false,
-      explanation: check.explanation ?? null,
-      completed: next.completed,
-      total: quiz.checks.length,
-      quiz: { question: next.check.question, options: next.check.options, version: next.version, completed: next.completed, total: quiz.checks.length },
-    });
-  }
-  writeEvent(db, {
-    task_id: taskId,
-    source: "director",
-    type: "understanding_quiz_passed",
-    payload: { review_event_id: quiz.quizKey, check_index: active.index, answer_key: answerKey, actor, surface: body?.surface === "focus" ? "focus" : undefined },
-  });
-  return json({ ok: true, correct: true, passed: true, explanation: check.explanation ?? null, completed: next.completed, total: quiz.checks.length });
-}
-
-// The director's own "quiz me on this one" flag (hive-1559): it makes an
-// otherwise mechanical task judgment-class, so its checks are required again.
-function requireUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
-  const task = getTask(db, taskId);
-  if (!task) return noTask(taskId);
-  if (body?.source !== "director") return err("only the director can require understanding checks", 403);
-  const already = db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_required' LIMIT 1").get(taskId);
-  if (!already)
-    writeEvent(db, { task_id: taskId, source: "director", type: "understanding_required", payload: { actor: actorOf(body) } });
-  return json({ ok: true, understanding_required: true });
-}
-
-// Which merge path settles a quiz: BOTH of them. mergeTask (above) defers the
-// quiz when hive itself lands an auto_merge.kinds task; this defers it when the
-// PR was merged on GitHub and the reconciler only observed it afterwards
-// (HIVE-544). Before this, that second path left the quiz reading "required"
-// forever on a task that had already shipped — the same unanswered catch-up
-// item under a name that reads like a blocker.
-export function deferQuizForExternalMerge(db: DB, taskId: string): void {
-  settleShippedQuiz(db, taskId, "Automatically deferred because the PR was merged outside hive; the task had already shipped.");
-}
-
-// Marks an unanswered quiz as deferred. Returns false (and writes nothing) when
-// there is no quiz, when the task is not judgment-class, or when the quiz was
-// already passed or deferred — so calling it twice is a no-op.
-function settleShippedQuiz(db: DB, taskId: string, note: string): boolean {
-  const task = getTask(db, taskId);
-  if (!task || !understandingChecksRequired(db, task)) return false;
-  const quiz = latestUnderstandingQuiz(db, taskId);
-  if (!quiz || understandingQuizStatus(db, taskId, quiz.quizKey) !== "required") return false;
-  writeEvent(db, {
-    task_id: taskId,
-    source: "system",
-    type: "understanding_quiz_deferred",
-    payload: { review_event_id: quiz.quizKey, note },
-  });
-  return true;
-}
-
-// Backfill for the pile that accumulated before the fix above: tasks that
-// already shipped but whose quiz still reads "required", because nothing on the
-// external-merge path ever settled it. Settle them the same way a merge would.
-// `failed` is deliberately NOT swept: that work never shipped, so its quiz is a
-// real signal, not a catch-up item. Idempotent — a second run settles nothing.
-export function deferShippedQuizzes(db: DB): number {
-  const rows = db
-    .query(
-      `SELECT DISTINCT t.id FROM tasks t JOIN events e ON e.task_id = t.id AND e.type = 'review_summary'
-        WHERE t.state IN ('done', 'verifying')`
-    )
-    .all() as { id: string }[];
-  let swept = 0;
-  for (const row of rows)
-    if (settleShippedQuiz(db, row.id, "Automatically deferred: the task had already shipped when this quiz was still unanswered.")) swept++;
-  return swept;
-}
-
-function deferUnderstandingQuiz(db: DB, taskId: string, body: any): Response {
-  const task = getTask(db, taskId);
-  if (!task) return noTask(taskId);
-  if (task.state !== "in_review") return err("understanding checks can only be deferred while a task is in review", 409);
-  if (body?.source !== "director") return err("only the director can defer understanding checks", 403);
-  if (body?.confirm !== "quiz_later") return err("confirm must be 'quiz_later'");
-  const quiz = latestUnderstandingQuiz(db, taskId);
-  if (!quiz) return err("understanding check not found", 404);
-  const status = understandingQuizStatus(db, taskId, quiz.quizKey);
-  if (status === "passed") return json({ ok: true, status });
-  if (status !== "deferred") {
-    writeEvent(db, {
-      task_id: taskId,
-      source: "director",
-      type: "understanding_quiz_deferred",
-      payload: { review_event_id: quiz.quizKey, actor: actorOf(body) },
-    });
-  }
-  return json({ ok: true, status: "deferred" });
 }
 
 // A checkpoint is a note, not a blocker: the agent kept working after emitting
@@ -6852,7 +6098,8 @@ function listIntents(db: DB, url: URL): Response {
     if (value) { where.push(`${column} = ?`); args.push(value); }
   }
   return json(
-    db.query("SELECT * FROM intents" + (where.length ? " WHERE " + where.join(" AND ") : "") + " ORDER BY created_at DESC").all(...args)
+    (db.query("SELECT * FROM intents" + (where.length ? " WHERE " + where.join(" AND ") : "") + " ORDER BY created_at DESC").all(...args) as Intent[])
+      .map((intent) => withIntentStatus(db, intent))
   );
 }
 
@@ -6905,7 +6152,7 @@ function updateIntent(db: DB, id: string, body: any): Response {
 // The acceptance gate. An unchecked bullet under "## Open questions" is a
 // question nobody answered, and accepting over it is how an ask quietly loses
 // the part that was uncertain — resolve it, or move it into Constraints.
-export async function acceptIntent(db: DB, id: string, body: any, deps: HandlerDeps = {}): Promise<Response> {
+export async function acceptIntent(db: DB, id: string, body: any): Promise<Response> {
   const intent = intentOr404(db, id);
   if (intent instanceof Response) return intent;
   if (intent.status !== "draft") return err(`intent ${id} is already ${intent.status}`, 409);
@@ -6918,19 +6165,7 @@ export async function acceptIntent(db: DB, id: string, body: any, deps: HandlerD
   const t = now();
   db.query("UPDATE intents SET status = 'accepted', accepted_by = ?, accepted_at = ?, updated_at = ? WHERE id = ?")
     .run(String(body?.accepted_by ?? body?.source ?? "director"), t, t, id);
-  let accepted = getIntent(db, id)!;
-  // HIVE-638: mint the understanding quiz HERE, once, from the ask just
-  // accepted. Every later review head reads these same three questions, so a
-  // rebase or a re-emitted review can never re-ask them. A failed model call
-  // stores nothing and the task falls back to today's diff-based checks.
-  if (!intentChecks(accepted).length) {
-    const project: any = db.query("SELECT repo_path FROM projects WHERE id = ?").get(accepted.project_id);
-    const checks = await mintIntentChecks(db, accepted, { model: deps.intentExec, repoPath: project?.repo_path });
-    if (checks?.length) {
-      setIntentChecks(db, id, checks);
-      accepted = getIntent(db, id)!;
-    }
-  }
+  const accepted = getIntent(db, id)!;
   if (accepted.task_id) {
     // The brief the agent reads is regenerated from what was just accepted, so
     // an agent can never be working from words nobody signed off on.
@@ -7034,14 +6269,12 @@ function queueIntentWriteBack(db: DB, intent: Intent): void {
   if (already) return;
   // Everything hive writes is English (PLAIN_ENGLISH), the ticket's language
   // included: the two decision sections are quoted as drafted.
+  const outcome = intentSection(intent.body_md, INTENT_SECTIONS[1]);
+  const constraints = intentSection(intent.body_md, INTENT_SECTIONS[3]);
   const text = [
-    `Hive accepted the intent record for ${intent.source_ref}. Work starts from this.`,
-    "",
-    `## ${INTENT_SECTIONS[1]}`,
-    intentSection(intent.body_md, INTENT_SECTIONS[1]) || "(not stated)",
-    "",
-    `## ${INTENT_SECTIONS[3]}`,
-    intentSection(intent.body_md, INTENT_SECTIONS[3]) || "(not stated)",
+    "Starting on this.",
+    ...(outcome ? ["", `Goal: ${outcome}`] : []),
+    ...(constraints ? ["", `Constraints: ${constraints}`] : []),
   ].join("\n");
   writeEvent(db, {
     task_id: mirror.id,
@@ -7450,9 +6683,11 @@ function staleEvidenceMessage(
 // silently trusted just because nothing marked it closed.
 async function resumePointerMarkerHolds(db: DB, exec: Exec, ids: string[], prUrl: string): Promise<boolean> {
   try {
-    const r = await exec(["gh", "pr", "view", prUrl, "--json", "title,body"]);
+    const r = await exec(["gh", "pr", "view", prUrl, "--json", "title,body,headRefName"]);
     if (r.code !== 0) return false;
     const data = JSON.parse(r.stdout);
+    const branchOwner = /^hive\//.test(String(data.headRefName ?? "")) ? null : taskForHiveBranch(db, null, data.headRefName);
+    if (branchOwner) return ids.includes(branchOwner);
     const bodyId = taskIdFromBody(data.body);
     if (bodyId) return ids.includes(bodyId);
     const titleNumber = taskNumberFromTitle(data.title);
@@ -7593,8 +6828,7 @@ async function prHeadBranch(exec: Exec, prUrl: string): Promise<string | null> {
 // ---------------------------------------------------------------- event ingestion (`hive emit`)
 // hive-1992: `hive emit --json <file>` used to accept ANY path, so agents that
 // wrote to the shared /tmp/review.json published each other's reviews — one
-// task's review card ended up describing a completely different change, and an
-// understanding check had already been passed against the review it replaced.
+// task's review card ended up describing a completely different change.
 // The CLI sends the resolved path; a payload read from outside the calling
 // agent's own sandbox is refused, not warned about.
 //
@@ -7922,7 +7156,7 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
         return json({
           held: true,
           reason: "stale_review",
-          message: "Handoff held: the director answered a decision after the latest review summary. Continue with that input, then regenerate the explanation and understanding checks before emitting ready again.",
+          message: "Handoff held: the director answered a decision after the latest review summary. Continue with that input, then emit a fresh review_summary before emitting ready again.",
         });
       }
       // Review means "truly ready for the director to approve & merge" — a red
@@ -7979,45 +7213,6 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
             message,
           });
         }
-      }
-      // Missing-check gate (HIVE-580). The land gate already refuses a merge
-      // whose latest review carries no understanding check, but it runs in a
-      // different process after the agent's turn is over: four PRs in one day
-      // each cost a failed land attempt, a decision card and a respawn to add
-      // two sentences the agent could have written while it still had the
-      // change in its head.
-      //
-      // FAIL OPEN. This holds only on the signals that say a check is owed no
-      // matter what the auto review turns out to say (understandingCheckCertain
-      // — the same source the merge gate reads, so the two cannot drift). The
-      // rest of the rule needs a verdict that usually does not exist yet at
-      // handoff, and refusing on "cannot tell" would push agents to invent
-      // checks for mechanical work that owes none. Anything let through here is
-      // still caught by the merge gate, which is unchanged.
-      //
-      // It sits BEFORE the CI hold on purpose: a CI-pending handoff is promoted
-      // later by the reconciler, which never passes through here. And AFTER the
-      // verification contract, which transition() enforces at the end of this
-      // path: an agent that both skipped its verification commands and filed no
-      // check must hear that it did not verify its work before it hears
-      // anything about a quiz, so this hold stands aside while a declared
-      // verification is unmet and lets that 409 come through.
-      if (
-        missingVerifications(db, t).length === 0 &&
-        understandingCheckCertain(db, t) &&
-        !latestUnderstandingQuiz(db, taskId)
-      ) {
-        writeEvent(db, { task_id: taskId, source, type: "ready_held", payload: { reason: "missing_understanding_check" } });
-        broadcastTask(db, getTask(db, taskId));
-        return json({
-          held: true,
-          reason: "missing_understanding_check",
-          action: "add understanding.checks to your review, then emit ready again",
-          message:
-            "This task always needs an understanding check, and your latest review has none.\n" +
-            `Add one to your review and emit it again: hive emit ${taskId} review_summary --json ...\n` +
-            "You do not need a respawn for this.",
-        });
       }
       const pr = prUrl ?? t.pr_url;
       if (pr) {
@@ -8169,7 +7364,8 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     if (typeof rawUnderstanding === "string") {
       try { rawUnderstanding = JSON.parse(rawUnderstanding); } catch { rawUnderstanding = null; }
     }
-    let checksProvided = false;
+    // Only the fields that explain the change are kept. `check`/`checks` from
+    // agents still on an older brief are ignored, never rejected.
     if (rawUnderstanding && typeof rawUnderstanding === "object" && !Array.isArray(rawUnderstanding)) {
       const text = (value: unknown, max = 600) =>
         typeof value === "string" && value.trim() ? value.trim().slice(0, max) : undefined;
@@ -8186,78 +7382,10 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
         const affectedAreas = dropRepeats(rawUnderstanding.affected_areas.map((value: unknown) => text(value)).filter(Boolean)).slice(0, 5);
         if (affectedAreas.length) understanding.affected_areas = affectedAreas;
       }
-      const rawCheck = rawUnderstanding.check;
-      // Absent (no `checks`/`check` key at all) and empty (`checks: []`) are
-      // different intents: absent carries the old checks forward, empty clears
-      // them (HIVE-545).
-      checksProvided = Array.isArray(rawUnderstanding.checks) || rawCheck !== undefined;
-      const rawChecks = Array.isArray(rawUnderstanding.checks)
-        ? rawUnderstanding.checks
-        : Array.isArray(rawCheck)
-          ? rawCheck
-          : [];
-      const submittedChecks = rawChecks.length ? rawChecks : rawCheck ? [rawCheck] : [];
-      if (submittedChecks.some(isAgentProcedureQuestion))
-        return err("understanding checks must teach the director about this specific change, not test agent procedures", 400);
-      const checks = dropRepeats<{
-        question: string;
-        options: UnderstandingCheck["options"];
-        answer_key: string;
-        explanation?: string;
-      }>(
-        submittedChecks.flatMap((value: unknown) => {
-          const check = normalizeUnderstandingCheck(value);
-          return check ? [{
-            question: check.question,
-            options: check.options,
-            answer_key: check.answerKey,
-            ...(check.explanation ? { explanation: check.explanation } : {}),
-          }] : [];
-        }),
-        (check) => recurrenceKey(check.question)
-      ).slice(0, 5);
-      // HIVE-638: when an accepted intent owns the quiz, the agent's own checks
-      // are NOT asked — they were written from the diff, and the director is
-      // quizzed on what was asked. They are kept as `agent_checks` so the Report
-      // view still shows what the agent thought was worth understanding.
-      const intentOwnsQuiz = Boolean(intentUnderstandingQuiz(db, taskId));
-      if (intentOwnsQuiz) {
-        if (checks.length) understanding.agent_checks = checks;
-      } else if (checks.length) understanding.checks = checks;
-      else if (checksProvided) understanding.checks = [];
-      // Submitted a quiz that normalises to nothing? Say so. Accepting it
-      // silently is what cost two tasks a round trip each: the agent believed
-      // it had supplied a check, and land only said one was "required"
-      // (hive-1947).
-      if (submittedChecks.length && !checks.length)
-        return err(
-          "understanding checks were submitted but none are usable. Expected " +
-            'understanding.checks: [{"question":"...","options":[{"key":"a","label":"..."},' +
-            '{"key":"b","label":"..."}],"answer_key":"a","explanation":"..."}]. ' +
-            "options entries must be {key,label} objects (bare strings are dropped), " +
-            "each check needs 2+ options, and answer_key must equal one option key. " +
-            "Singular `check` is accepted and stored as checks[].",
-          400,
-        );
       if (Object.keys(understanding).length) payload.understanding = understanding;
     }
     if (!Object.keys(payload).length)
       return err("review_summary needs a structured review section: hive emit <task-id> review_summary --json review.json");
-    // No word on the checks at all? Keep the ones this task already has.
-    const previousChecks = carriedUnderstandingChecks(db, taskId);
-    if (previousChecks && !checksProvided) {
-      const understanding = (payload.understanding ?? {}) as Record<string, unknown>;
-      understanding.checks = previousChecks.checks;
-      payload.understanding = understanding;
-    }
-    // Re-listed the SAME checks instead of omitting them? Still the same quiz,
-    // so the answers still count. Re-wording and re-ordering are what an agent
-    // does on every run; only a real change to a question, its options, or its
-    // correct answer sends the director back to the quiz (HIVE-545).
-    const carried =
-      previousChecks && sameUnderstandingChecks(previousChecks.checks, (payload.understanding as any)?.checks)
-        ? previousChecks
-        : null;
     const latest = db
       .query("SELECT * FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY rowid DESC LIMIT 1")
       .get(taskId) as any;
@@ -8268,41 +7396,6 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
     )
       return json({ event: parseEvent(latest), duplicate: true }, 201);
     const event = writeEvent(db, { task_id: taskId, source, type, payload });
-    // The carried checks are the SAME questions the director already answered,
-    // so the pass carries with them — otherwise a rebase still un-lands the PR,
-    // just with the quiz re-asked instead of deleted. A changes-request or an
-    // answered decision since then means the change moved, so the director
-    // re-answers (the same guard repairDuplicateQuizPasses uses).
-    if (carried && understandingQuizStatus(db, taskId, carried.eventId) === "passed") {
-      const invalidated = db
-        .query(
-          `SELECT 1 FROM events WHERE task_id = ? AND rowid > ?
-             AND type IN ('changes_requested', 'decision_answered')
-             AND NOT ${mechanicalBounceSql("")} LIMIT 1`
-        )
-        .get(taskId, carried.rowid);
-      if (!invalidated)
-        writeEvent(db, {
-          task_id: taskId,
-          source: "system",
-          type: "understanding_quiz_passed",
-          payload: {
-            review_event_id: event.id,
-            carried_from_review_event_id: carried.eventId,
-            reason: "review re-emitted without changing the understanding checks",
-          },
-        });
-    }
-    const understandingChecks = ((payload.understanding as any)?.checks ?? []) as any[];
-    // Long wording is worth a steer only while the quiz is still ahead of the
-    // director. Once they have passed it, shortening the questions makes them
-    // DIFFERENT questions: the pass cannot carry across a re-wording, because
-    // nothing can tell "same question, fewer words" from "new question", and
-    // carrying it would record the director as having answered text they never
-    // saw. So the pass survives the bounce (mechanicalBounceSql above) and the
-    // rewrite that would sink it is never asked for (HIVE-635).
-    if (understandingChecks.some(isEgregiousCheckWording) && understandingQuizStatus(db, taskId, event.id) !== "passed")
-      queueSteerEvent(db, taskId, QUIZ_WORDING_STEER, "egregious quiz wording");
     return json({ event }, 201);
   }
 
@@ -8599,7 +7692,7 @@ function ciFreshness(db: DB, task: any, decisionId: string): any {
 // fetch/broadcast time; skipped implicitly for terminal cards that callers
 // never pass here.
 export function withBundle(db: DB, d: any): any {
-  return { ...d, bundle: decisionBundle(db, d.task_id, d.id), plan: decisionPlan(db, d.task_id, d.id) };
+  return { ...withAdvice(db, d), bundle: decisionBundle(db, d.task_id, d.id), plan: decisionPlan(db, d.task_id, d.id) };
 }
 
 // A card "cites CI" when the task's checks are actually not passing AND the
@@ -8730,9 +7823,10 @@ export function createDecision(
   // Enrich AFTER the transition so the bundle's spend/PR reflect current state.
   const decision = withBundle(db, parseDecision(row));
   broadcast({ type: "decision", decision });
-  // Every open decision parks an agent until the director answers it, so all of
-  // them are urgent. They used to batch unless risk was "high", which meant the
-  // common case waited up to HIVE_DIGEST_MS for a summary line.
+  // A card the advisor will judge is pushed by the advisor, and only if it
+  // turns out to be the director's (advisor.ts). Every other open card parks
+  // an agent until the director answers it, so it is urgent now.
+  if (advisorWillJudge(db, row)) return decision;
   enqueue(db, {
     kind: "decision",
     task_id: d.task_id,

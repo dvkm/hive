@@ -5,9 +5,9 @@ import type { ChatMessage, ChatThread } from "../lib/api";
 import { toast } from "../lib/ui";
 import { Bubble } from "./Chat";
 
-// Supervisors board: one live chat column per supervisor session, side by side.
+// Chief of staff sessions board: one live chat column per session, side by side.
 // Unlike the floating drawer (one thread at a time), this is the fleet-command
-// view — several projects at once, and several supervisors on the SAME project
+// view: several projects at once, and several sessions on the SAME project
 // when you want parallel conversations. Columns are the user's layout (kept in
 // localStorage); the threads themselves live on the server.
 
@@ -100,11 +100,11 @@ function SupervisorColumn({
       <header className="sup-col-head">
         <span className="chip">{projectName}</span>
         <span className="sup-col-title" title={title ?? undefined}>
-          {title || (col.thread_id ? "conversation" : "new supervisor")}
+          {title || (col.thread_id ? "conversation" : "new session")}
         </span>
         <span className="spacer" />
         {col.thread_id && (
-          <button className="chat-iconbtn" title="End this supervisor session and remove" onClick={() => onRemove(col.key, true)}>
+          <button className="chat-iconbtn" title="End this session and remove it" onClick={() => onRemove(col.key, true)}>
             ⏹
           </button>
         )}
@@ -114,16 +114,16 @@ function SupervisorColumn({
       </header>
       <div className="chat-scroll sup-col-scroll" ref={scrollRef}>
         {messages.length === 0 && (
-          <div className="chat-empty muted">Message this supervisor to start the session.</div>
+          <div className="chat-empty muted">Send a message to start the session.</div>
         )}
         {messages.map((m) => (
           <Bubble key={m.id} m={m} />
         ))}
-        {awaiting && <div className="chat-typing muted">supervisor is working…</div>}
+        {awaiting && <div className="chat-typing muted">Chief of staff is working…</div>}
       </div>
       <div className="chat-compose">
         <textarea
-          placeholder={`Message the ${projectName} supervisor…`}
+          placeholder={`Message the Chief of staff for ${projectName}…`}
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={(e) => {
@@ -180,11 +180,11 @@ export default function Supervisors() {
   return (
     <div className="sup-page">
       <div className="page-head">
-        <h1 className="page-title">Supervisors</h1>
+        <h1 className="page-title">Chief of staff</h1>
         <p className="page-sub">
           {cols.length === 0
-            ? "One chat column per supervisor session — run several projects (or the same one twice) side by side."
-            : `${cols.length} supervisor${cols.length === 1 ? "" : "s"} open.`}
+            ? "One chat column per session. Run several projects, or the same one twice, side by side."
+            : `${cols.length} session${cols.length === 1 ? "" : "s"} open.`}
         </p>
         <span className="spacer" />
         {adding ? (
@@ -206,7 +206,7 @@ export default function Supervisors() {
           </select>
         ) : (
           <button className="btn btn-primary" onClick={() => setAdding(true)}>
-            ＋ Add supervisor
+            Add a session
           </button>
         )}
       </div>
@@ -221,7 +221,7 @@ export default function Supervisors() {
             onRemove={onRemove}
           />
         ))}
-        {cols.length === 0 && <div className="muted sup-empty">No supervisors yet — add one to start.</div>}
+        {cols.length === 0 && <div className="muted sup-empty">No sessions yet. Add one to start.</div>}
       </div>
     </div>
   );

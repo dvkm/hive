@@ -1,6 +1,6 @@
-import { createContext, useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { createContext, useContext, useEffect, useRef, useState } from "react";
 import { api, apiToken } from "./api";
-import type { Task, Decision, Project, Notification, Event, Evidence, Incident, Checkpoint, Intent, UnderstandingQuiz, ChatMessage, Away } from "./api";
+import type { Task, Decision, Project, Notification, Event, Evidence, Incident, Intent, ChatMessage, Away } from "./api";
 import { getNeedsYouItems } from "./needsYou";
 import type { NeedsYouItem } from "./needsYou";
 
@@ -19,10 +19,6 @@ export interface Store {
   rev: Record<string, number>; // bumps when a task is touched (task pages refetch on change)
   feedEvents: Event[]; // live events for the activity feed, newest first (capped)
   evidenceMeta: Record<string, { url: string | null; kind: Evidence["kind"] }>; // by evidence id, for live feed thumbnails
-  checkpoints: Checkpoint[]; // open (un-acked) build-time checkpoints, all tasks
-  reloadCheckpoints: () => void;
-  quizzes: UnderstandingQuiz[]; // required or deferred understanding checks
-  reloadQuizzes: () => void;
   intents: Intent[]; // the ask records; drafts are what needs the director
   reloadIntents: () => void;
   needsYou: NeedsYouItem[];
@@ -55,50 +51,6 @@ export interface Store {
   // Fan-out for EVERY incoming chat message regardless of the open thread —
   // the Supervisors board runs one live column per thread. Returns unsubscribe.
   onChatMessage: (cb: (m: ChatMessage) => void) => () => void;
-}
-
-// One understanding-quiz state per task, not one per mount. The same task's
-// quiz renders in the review card, the brief and the task page. Answering in
-// one moves the server's version, so mounts that each kept their own copy sat
-// on a question that had already been answered somewhere else (HIVE-626).
-export type QuizSeed = Pick<UnderstandingQuiz, "task_id" | "question" | "options" | "version" | "completed" | "total">;
-export type QuizState = {
-  quiz: QuizSeed;
-  ignoredVersion: string | null; // a version this task already swapped off, so a stale prop cannot bring it back
-  notice: string | null;
-  round: number; // bumps on every swap; mounts reset their own answer when it moves
-};
-
-// ponytail: one small object per task whose quiz was opened, kept for the
-// session. Nothing to evict, and dropping it on unmount would lose the state
-// when the director moves between the review card and the task page.
-const quizStates = new Map<string, QuizState>();
-const quizSubs = new Map<string, Set<() => void>>();
-
-// Test-only: bun test shares one module instance across every test file, so
-// leftover quiz state from one test's task id leaks into the next test that
-// reuses it. Call this in a beforeEach wherever tests render UnderstandingQuiz.
-export function resetQuizStatesForTests() {
-  quizStates.clear();
-  quizSubs.clear();
-}
-
-export function useQuizState(seed: QuizSeed) {
-  const taskId = seed.task_id;
-  if (!quizStates.has(taskId))
-    quizStates.set(taskId, { quiz: seed, ignoredVersion: null, notice: null, round: 0 });
-  const subscribe = useCallback((cb: () => void) => {
-    let subs = quizSubs.get(taskId);
-    if (!subs) quizSubs.set(taskId, (subs = new Set()));
-    subs.add(cb);
-    return () => void subs!.delete(cb);
-  }, [taskId]);
-  const state = useSyncExternalStore(subscribe, () => quizStates.get(taskId)!);
-  const setState = useCallback((patch: Partial<QuizState>) => {
-    quizStates.set(taskId, { ...quizStates.get(taskId)!, ...patch });
-    quizSubs.get(taskId)?.forEach((cb) => cb());
-  }, [taskId]);
-  return [state, setState] as const;
 }
 
 const FEED_CAP = 400;
@@ -166,10 +118,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const loadProjects = () => api.projects().then((p) => { setProjects(p); setProjectsLoaded(true); });
   const reloadProjects = () => { loadProjects().catch(() => {}); };
   const loadDecisions = () => api.decisions("open").then((d) => { setDecisions(d); setDecisionsLoaded(true); });
-  const [checkpoints, setCheckpoints] = useState<Checkpoint[]>([]);
-  const [quizzes, setQuizzes] = useState<UnderstandingQuiz[]>([]);
   const [intents, setIntents] = useState<Intent[]>([]);
-  const needsYou = getNeedsYouItems(decisions, tasks, checkpoints, quizzes, intents);
+  const needsYou = getNeedsYouItems(decisions, tasks, intents);
   const [offline, setOfflineState] = useState(false);
   const setOffline = (on: boolean) => {
     setOfflineState(on); // optimistic; SSE confirms
@@ -182,10 +132,6 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     setAwayState((a) => ({ ...a, on, active: on })); // optimistic; the response is the truth
     api.setAway(on).then(setAwayState).catch(reloadAway);
   };
-  const loadCheckpoints = () => api.checkpoints().then((r) => setCheckpoints(r.checkpoints));
-  const reloadCheckpoints = () => { loadCheckpoints().catch(() => {}); };
-  const loadQuizzes = () => api.understandingQuizzes().then((r) => setQuizzes(r.quizzes));
-  const reloadQuizzes = () => { loadQuizzes().catch(() => {}); };
   const loadIntents = () => api.intents().then(setIntents);
   const reloadIntents = () => { loadIntents().catch(() => {}); };
 
@@ -248,8 +194,6 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       ),
       keepTrying(loadProjects),
       keepTrying(loadDecisions),
-      keepTrying(loadCheckpoints),
-      keepTrying(loadQuizzes),
       keepTrying(loadIntents),
       keepTrying(loadAway),
       keepTrying(() => api.offline().then((r) => setOfflineState(r.on))),
@@ -310,11 +254,6 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           setFeedEvents((prev) => [ev, ...prev].slice(0, FEED_CAP));
           if (ev.type === "spawn_error") setSpawnError((s) => ({ ...s, [ev.task_id]: true }));
           else if (ev.type === "spawned") setSpawnError((s) => ({ ...s, [ev.task_id]: false }));
-          // Live checkbox list: any checkpoint activity refreshes the open set.
-          if (ev.type === "checkpoint" || ev.type === "checkpoint_ack")
-            api.checkpoints().then((r) => setCheckpoints(r.checkpoints)).catch(() => {});
-          if (["review_summary", "understanding_quiz_attempt", "understanding_quiz_passed", "understanding_quiz_deferred"].includes(ev.type))
-            api.understandingQuizzes().then((r) => setQuizzes(r.quizzes)).catch(() => {});
           bump(ev.task_id);
         } else if (msg.type === "evidence") {
           const evi: Evidence = msg.evidence;
@@ -387,7 +326,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   return (
-    <Ctx.Provider value={{ tasks, projects, reloadProjects, decisions, notifications, ackNotifications, evidenceCount, spawnError, lastActivity, rev, feedEvents, evidenceMeta, checkpoints, reloadCheckpoints, quizzes, reloadQuizzes, intents, reloadIntents, needsYou, offline, setOffline, away, setAway, sse, taskSync, retryTaskSync: () => refreshTasks.current(), projectsLoaded, decisionsLoaded, chatThreadId, chatMessages, chatDelivery, openChatThread, onChatMessage }}>
+    <Ctx.Provider value={{ tasks, projects, reloadProjects, decisions, notifications, ackNotifications, evidenceCount, spawnError, lastActivity, rev, feedEvents, evidenceMeta, intents, reloadIntents, needsYou, offline, setOffline, away, setAway, sse, taskSync, retryTaskSync: () => refreshTasks.current(), projectsLoaded, decisionsLoaded, chatThreadId, chatMessages, chatDelivery, openChatThread, onChatMessage }}>
       {children}
     </Ctx.Provider>
   );

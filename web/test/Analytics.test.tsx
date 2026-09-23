@@ -14,13 +14,11 @@ test("analytics calls aggregate usage processed tokens and shows every component
   expect(analytics).not.toContain('label="Total tokens"');
 });
 
-test("brief and task usage summaries call the aggregate processed and expose its components", () => {
-  for (const file of ["Brief.tsx", "Task.tsx"]) {
-    const text = source(file);
-    expect(text).toContain("processed");
-    expect(text).toContain("fresh");
-    expect(text).toContain("cached");
-    expect(text).toContain("output");
-    expect(text).toContain("cache write");
-  }
+test("the task usage summary calls the aggregate processed and exposes its components", () => {
+  const text = source("Task.tsx");
+  expect(text).toContain("processed");
+  expect(text).toContain("fresh");
+  expect(text).toContain("cached");
+  expect(text).toContain("output");
+  expect(text).toContain("cache write");
 });

@@ -6,22 +6,19 @@
 export * from "./domain";
 import type {
   AnalyticsSummary,
-  AttentionBudget,
   AuthorityRule,
   AutonomyStats,
   Away,
   BranchCheck,
-  Brief,
   ChatMessage,
   ChatThread,
-  Checkpoint,
   Decision,
   DeploymentsStatus,
+  Digest,
   DiffResult,
   DivergenceRow,
   EvidenceRow,
   FeedEvent,
-  GlanceCard,
   Incident,
   Intent,
   JiraSyncState,
@@ -39,7 +36,6 @@ import type {
   State,
   Task,
   TaskDetail,
-  UnderstandingQuiz,
   UsageRow,
   UsageTotals,
   PreviewState,
@@ -232,36 +228,22 @@ export const api = {
   offline: () => req<{ on: boolean }>(`/api/offline`),
   setOffline: (on: boolean) =>
     req<{ on: boolean; steered: number }>(`/api/offline`, { method: "POST", body: JSON.stringify({ on }) }),
-  // The attention budget: the threshold and what hive paused because of it.
-  // The COUNT the board shows is still actionableItems() locally, so the number
-  // on screen can never disagree with the nav badge.
-  attention: () => req<AttentionBudget>(`/api/attention`),
   away: () => req<Away>(`/api/away`),
   setAway: (on: boolean) => req<Away>(`/api/away`, { method: "POST", body: JSON.stringify({ on }) }),
-  checkpoints: () => req<{ checkpoints: Checkpoint[] }>(`/api/checkpoints`),
   ackCheckpoint: (taskId: string, eventId: string, verdict: "ok" | "flag", note?: string) =>
     req<{ ok: boolean; delivered: boolean; followup_task_id: string | null }>(`/api/tasks/${taskId}/checkpoints/${eventId}/ack`, {
       method: "POST",
       body: JSON.stringify({ verdict, note, source: "director", actor: directorActor() }),
     }),
-  understandingQuizzes: () => req<{ quizzes: UnderstandingQuiz[] }>(`/api/understanding-quizzes?scope=all`),
-  catchup: (limit = 10, projectId?: string) =>
-    req<{ cards: GlanceCard[] }>(`/api/catchup?limit=${limit}${projectId ? `&project_id=${encodeURIComponent(projectId)}` : ""}`),
-  answerUnderstandingQuiz: (taskId: string, answerKey: string, version: string, surface?: "focus") =>
-    req<{ ok: boolean; correct?: boolean; passed: boolean; refreshed?: boolean; explanation: string | null; completed?: number; total?: number; quiz?: Pick<UnderstandingQuiz, "question" | "options" | "version" | "completed" | "total"> }>(`/api/tasks/${taskId}/understanding-quiz/answer`, {
-      method: "POST",
-      body: JSON.stringify({ answer_key: answerKey, version, source: "director", actor: directorActor(), surface }),
-    }),
-  deferUnderstandingQuiz: (taskId: string) =>
-    req<{ ok: boolean; status: "deferred" | "passed" }>(`/api/tasks/${taskId}/understanding-quiz/defer`, {
-      method: "POST",
-      body: JSON.stringify({ confirm: "quiz_later", source: "director", actor: directorActor() }),
-    }),
-  requireUnderstandingQuiz: (taskId: string) =>
-    req<{ ok: boolean; understanding_required: boolean }>(`/api/tasks/${taskId}/understanding-quiz/require`, {
-      method: "POST",
-      body: JSON.stringify({ source: "director", actor: directorActor() }),
-    }),
+  // What happened since the director last looked. `mark` records this look, so
+  // the next window starts here; `since` pins a window already shown.
+  digest: (mark?: boolean, since?: string) => {
+    const q = new URLSearchParams();
+    if (since) q.set("since", since);
+    if (mark) q.set("mark", "1");
+    const qs = q.toString();
+    return req<Digest>(`/api/digest${qs ? "?" + qs : ""}`);
+  },
   cachedTasks,
   tasks: async (q: { state?: State; project_id?: string } = {}) => {
     const p = new URLSearchParams(q as Record<string, string>).toString();
@@ -466,14 +448,6 @@ export const api = {
     const q = new URLSearchParams({ days: String(days) });
     if (project) q.set("project_id", project);
     return req<AutonomyStats>(`/api/stats/autonomy?${q}`);
-  },
-
-  morningBrief: (since?: string, project?: string) => {
-    const q = new URLSearchParams();
-    if (since) q.set("since", since);
-    if (project) q.set("project", project); // scopes the spend rollup; other sections filter in the browser
-    const qs = q.toString();
-    return req<Brief>(`/api/brief${qs ? "?" + qs : ""}`);
   },
 
   // TypeSafe (Jev) key and mode, from the Settings page.

@@ -30,14 +30,9 @@ const INBOX_EVENT_CLASS: Record<string, InboxClass> = {
   blocked_card: "dialog",
   stale: "stale",
 };
-// A review_summary only becomes an inbox item when it carries quiz questions.
-// Both shapes count: the current `checks` array and the older single `check`.
-const QUIZ_SQL =
-  `(e.type = 'review_summary' AND (json_array_length(json_extract(e.payload, '$.understanding.checks')) > 0
-     OR json_type(json_extract(e.payload, '$.understanding.check')) = 'object'))`;
 
-export type InboxClass = "decision" | "quiz" | "checkpoint" | "dialog" | "stale";
-export const INBOX_CLASSES: InboxClass[] = ["decision", "quiz", "checkpoint", "dialog", "stale"];
+export type InboxClass = "decision" | "checkpoint" | "dialog" | "stale";
+export const INBOX_CLASSES: InboxClass[] = ["decision", "checkpoint", "dialog", "stale"];
 
 export interface AutonomyStatsOptions {
   days?: number;
@@ -221,7 +216,7 @@ export async function autonomyStats(db: DB, opts: AutonomyStatsOptions = {}) {
       `SELECT substr(e.ts, 1, 10) AS day, e.type AS type, COUNT(*) AS n
          FROM events e JOIN tasks t ON t.id = e.task_id
         WHERE e.ts >= ? AND e.ts < ?${projectFilter}
-          AND (e.type IN ('needs-decision', 'checkpoint', 'blocked_card', 'stale') OR ${QUIZ_SQL})
+          AND e.type IN ('needs-decision', 'checkpoint', 'blocked_card', 'stale')
         GROUP BY day, e.type`
     )
     .all(from, to, ...projectArg) as { day: string; type: string; n: number }[];
@@ -232,7 +227,7 @@ export async function autonomyStats(db: DB, opts: AutonomyStatsOptions = {}) {
     byDay.set(iso(addDays(since, i)).slice(0, 10), Object.fromEntries(INBOX_CLASSES.map((c) => [c, 0])) as Record<InboxClass, number>);
   }
   for (const row of inboxRows) {
-    const cls = INBOX_EVENT_CLASS[row.type] ?? "quiz";
+    const cls = INBOX_EVENT_CLASS[row.type];
     const day = byDay.get(row.day);
     if (day) day[cls] += row.n;
     totals[cls] += row.n;

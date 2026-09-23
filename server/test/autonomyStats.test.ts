@@ -141,18 +141,17 @@ test("inbox load: one row per day, split by class", async () => {
   ev(db, task, "checkpoint", at(2, 3), { note: "shortcut taken" });
   ev(db, task, "blocked_card", at(1, 1), { decision_id: "dec_3" });
   ev(db, task, "stale", at(1, 2), {});
-  ev(db, task, "review_summary", at(1, 3), { understanding: { checks: [{ question: "q" }] } });
-  // A review with no quiz questions is not an inbox item.
+  // A review summary is not an inbox item.
   ev(db, task, "review_summary", at(1, 4), { done: ["x"] });
   // Outside the window.
   ev(db, task, "stale", at(40), {});
 
   const s = await autonomyStats(db, { days: 7, now: clock, exec: null });
   expect(s.inbox_load.by_day.length).toBe(7);
-  expect(s.inbox_load.totals).toEqual({ decision: 2, quiz: 1, checkpoint: 1, dialog: 1, stale: 1, total: 6 });
+  expect(s.inbox_load.totals).toEqual({ decision: 2, checkpoint: 1, dialog: 1, stale: 1, total: 5 });
   const twoDaysAgo = s.inbox_load.by_day.find((d) => d.day === at(2).slice(0, 10))!;
-  expect(twoDaysAgo).toMatchObject({ decision: 2, checkpoint: 1, quiz: 0, dialog: 0, stale: 0, total: 3 });
-  expect(s.inbox_load.per_day).toBeCloseTo(6 / 7);
+  expect(twoDaysAgo).toMatchObject({ decision: 2, checkpoint: 1, dialog: 0, stale: 0, total: 3 });
+  expect(s.inbox_load.per_day).toBeCloseTo(5 / 7);
 });
 
 test("inbox load: today's events land in the last bucket", async () => {
@@ -249,19 +248,11 @@ test("answering an already-answered card with a different option records a contr
 test("mergeTask records merged_files on the merged event", async () => {
   const { Herdr } = await import("../src/runtime/herdr.ts");
   const { mergeTask } = await import("../src/api.ts");
-  const { writeEvent } = await import("../src/state.ts");
   const { db, projectId } = freshDb();
   const taskId = newId();
   db.query(
     "INSERT INTO tasks (id, project_id, title, state, kind, branch, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)"
   ).run(taskId, projectId, "task", "in_review", "ship", "feat", at(1), at(0));
-  const review = writeEvent(db, {
-    task_id: taskId,
-    source: "agent",
-    type: "review_summary",
-    payload: { understanding: { checks: [{ question: "q", options: [{ key: "a", label: "A" }, { key: "b", label: "B" }], answer_key: "a" }] } },
-  });
-  writeEvent(db, { task_id: taskId, source: "director", type: "understanding_quiz_passed", payload: { review_event_id: review.id, answer_key: "a" } });
 
   const OK = (stdout = ""): ExecResult => ({ code: 0, stdout, stderr: "" });
   const exec: Exec = async (argv) => {
@@ -282,19 +273,11 @@ test("mergeTask records merged_files on the merged event", async () => {
 test("mergeTask records merged_files from the PR's own file list", async () => {
   const { Herdr } = await import("../src/runtime/herdr.ts");
   const { mergeTask } = await import("../src/api.ts");
-  const { writeEvent } = await import("../src/state.ts");
   const { db, projectId } = freshDb();
   const taskId = newId();
   db.query(
     "INSERT INTO tasks (id, project_id, title, state, kind, branch, pr_url, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)"
   ).run(taskId, projectId, "task", "in_review", "ship", "feat", "https://gh/pr/7", at(1), at(0));
-  const review = writeEvent(db, {
-    task_id: taskId,
-    source: "agent",
-    type: "review_summary",
-    payload: { understanding: { checks: [{ question: "q", options: [{ key: "a", label: "A" }, { key: "b", label: "B" }], answer_key: "a" }] } },
-  });
-  writeEvent(db, { task_id: taskId, source: "director", type: "understanding_quiz_passed", payload: { review_event_id: review.id, answer_key: "a" } });
 
   const OK = (stdout = ""): ExecResult => ({ code: 0, stdout, stderr: "" });
   const exec: Exec = async (argv) => {

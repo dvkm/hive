@@ -3,6 +3,11 @@
 Repo: `/Users/david/projects/hive/.claude/worktrees/hive-performance-bottlenecks-26e598`
 Read-only survey, 2026-09-17. Line numbers are from this worktree.
 
+Update 2026-09-23: the understanding quiz is retired. Call site #6 (`mintIntentChecks`) is gone, #12
+no longer receives understanding checks, step 4 of the land gate below no longer exists, and
+`passedByDirector` is gone from step 5. Whether a settled review waits for the director is now
+`directorHold` in `server/src/reviewer.ts`. The rest of this survey is the 2026-09-17 snapshot.
+
 ## Shape of the surface
 
 Every model call in hive is a shell-out: `claude -p <prompt> --output-format json`, spawned via

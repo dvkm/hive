@@ -214,8 +214,7 @@ test("decision exposes structured plan for the UI checklist", async () => {
   expect(decision.plan.questions).toEqual(["Which auth provider?"]);
   expect(decision.plan.rationale).toContain("parallel");
   expect(decision.plan.reason).toBeTruthy();
-  const notification = db.query("SELECT body FROM notifications WHERE decision_id = ?").get(r.decision!.id) as { body: string };
-  expect(notification.body).toContain("Proposed tasks");
+  expect(decision.context).toContain("Proposed tasks");
   // a non-planner card has no plan
   const other = await post("/api/decisions", { task_id: t.id, title: "unrelated", context: "A non-planner test decision.", options: [{ key: "ok", label: "OK" }] });
   expect(other.json.plan).toBeNull();

@@ -65,15 +65,16 @@ test("brief tells the agent to verify browsers headlessly, not via the denied MC
   expect(brief).toContain("--headless");
 });
 
-test("brief excludes project bookkeeping from understanding quizzes", () => {
+test("brief asks for a PR that reads like a teammate's, with no hive markers", () => {
   const { db, taskId } = setup();
   const brief = composeBrief(db, taskId);
   const prose = brief.replace(/\s+/g, " ");
-  expect(prose).toContain("Every question must help them understand this specific");
-  expect(prose).toContain("Never test whether the");
-  expect(prose).toContain("competence belongs in internal checks");
-  expect(prose).toContain("Never quiz project bookkeeping");
-  expect(prose).toContain("does not improve the director's understanding of this review");
+  expect(prose).toContain("No task ids or tracker prefixes");
+  expect(prose).toContain("mentions hive, agents, the director, task ids, local file paths or localhost links");
+  expect(brief).not.toContain("[hive-");
+  expect(brief).not.toContain("hive-task:");
+  expect(brief).not.toContain("hive pr-marker");
+  expect(brief).not.toContain("understanding.checks");
 });
 
 test("brief requires a standalone decision context", () => {

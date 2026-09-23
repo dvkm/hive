@@ -3,15 +3,10 @@
 // A task must not reach the director's review queue until two things hold: its
 // CI is green (the callers check that) and a page exists that EXPLAINS the
 // change. The page is one self-contained interactive HTML file per PR head —
-// background, intuition with diagrams, a code walkthrough, and the same
-// understanding questions the review card asks — written by a Claude Opus
-// one-shot and stored as task evidence (kind 'explanation'). Because it is
-// ordinary evidence, the review card, the task page and the Jira receipt
-// comment all link the same artifact for free.
-//
-// The quiz is NOT generated here: it is rendered from the agent's
-// review_summary `understanding.checks`, which is what the director is asked
-// in the app. One source of truth, no second set of questions to disagree.
+// background, intuition with diagrams, and a code walkthrough — written by a
+// Claude Opus one-shot and stored as task evidence (kind 'explanation').
+// Because it is ordinary evidence, the review card, the task page and the Jira
+// receipt comment all link the same artifact for free.
 import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { DB } from "./db.ts";
@@ -113,23 +108,7 @@ function generationFailed(db: DB, taskId: string, headSha: string | null): boole
   });
 }
 
-// The questions the director is actually asked in the app, from the newest
-// review_summary. The page teaches them; it never invents its own.
-function reviewChecks(db: DB, taskId: string): any[] {
-  const row = db
-    .query("SELECT payload FROM events WHERE task_id = ? AND type = 'review_summary' ORDER BY ts DESC LIMIT 1")
-    .get(taskId) as { payload: string } | undefined;
-  if (!row) return [];
-  try {
-    const u = JSON.parse(row.payload)?.understanding;
-    const checks = Array.isArray(u?.checks) ? u.checks : u?.check ? [u.check] : [];
-    return checks.filter((c: any) => c && c.question && Array.isArray(c.options));
-  } catch {
-    return [];
-  }
-}
-
-export function buildPrompt(task: any, diff: string, checks: any[]): string {
+export function buildPrompt(task: any, diff: string): string {
   return [
     "Write a rich, interactive explanation of the code change below, for a busy",
     "director who will review and merge it. Explore the surrounding code in the",
@@ -143,8 +122,6 @@ export function buildPrompt(task: any, diff: string, checks: any[]): string {
     "  and box-and-arrow data-flow diagrams WITH example data flowing through them.",
     "- Code: a high-level walkthrough of the diff, grouped and ordered so it reads as a",
     "  story rather than file-by-file.",
-    "- Quiz: the questions given below, interactive multiple choice. Clicking an option",
-    "  says whether it is right and explains why that option is right or wrong.",
     "",
     "Rules:",
     "- Output ONE self-contained HTML document and NOTHING else. No markdown fences, no",
@@ -165,15 +142,6 @@ export function buildPrompt(task: any, diff: string, checks: any[]): string {
     `Task: ${task.title ?? ""}`,
     `Pull request: ${task.pr_url}`,
     task.brief ? `Brief:\n${String(task.brief).slice(0, 4000)}` : "",
-    "",
-    checks.length
-      ? [
-          "Quiz questions — use these EXACTLY, same wording, same options, same correct answer.",
-          "These are the questions the director is asked in the app, so the page must not",
-          "invent different ones. Teach every answer in the sections above.",
-          JSON.stringify(checks, null, 2),
-        ].join("\n")
-      : "No quiz questions were supplied — omit the Quiz section entirely rather than inventing questions.",
     "",
     "Diff:",
     diff,
@@ -214,7 +182,7 @@ async function generateExplanation(db: DB, task: any, head: string | null, deps:
   if (!diff.trim()) return fail(d.stderr?.trim() || "gh pr diff returned nothing");
 
   const res = await plannerExec(
-    [claudeBin(), "-p", NO_CUSTOMIZATIONS, "--model", MODEL, NO_WRITE_TOOLS, buildPrompt(task, diff.slice(0, MAX_DIFF_CHARS), reviewChecks(db, task.id)), "--output-format", "json"],
+    [claudeBin(), "-p", NO_CUSTOMIZATIONS, "--model", MODEL, NO_WRITE_TOOLS, buildPrompt(task, diff.slice(0, MAX_DIFF_CHARS)), "--output-format", "json"],
     {
       timeoutMs: TIMEOUT_MS,
       cwd: task.worktree_path,

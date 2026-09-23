@@ -14,7 +14,7 @@ import { isSupervisedTask, neverDispatched } from "./supervision.ts";
 import { isDeferred, unmetDeps, lastAgentActivity, SKIP_REASONS, TERMINAL, type State } from "./state.ts";
 import { taskIdentifier } from "./taskIdentifier.ts";
 import { latestSidecar, latestSidecarBatch, type SidecarReport } from "./sidecar.ts";
-import { reviewGate, reviewGateBatch, type ReviewGate } from "./reviewer.ts";
+import { reviewGate, reviewGateBatch, directorHold, type ReviewGate } from "./reviewer.ts";
 import { isReviewed } from "./dispatcher.ts";
 
 export type HealthStatus = "healthy" | "deferred" | "silent" | "stuck" | "dead";
@@ -341,7 +341,8 @@ export function taskWithHealth(db: DB, task: any, sidecar?: SidecarReport | null
       } catch {}
     }
   }
-  return { ...task, display_id: taskIdentifier(db, task), health: computeHealth(db, task), requeued_to, needs_you_since, never_dispatched: neverDispatched(db, task), review_actionable: review_gate === "needs_you", review_gate, reviewed, skip, deferred_note, sidecar: sidecar !== undefined ? sidecar : latestSidecar(db, task.id) };
+  const review_hold = review_gate === "needs_you" ? directorHold(db, task) : null;
+  return { ...task, display_id: taskIdentifier(db, task), health: computeHealth(db, task), requeued_to, needs_you_since, never_dispatched: neverDispatched(db, task), review_actionable: review_gate === "needs_you", review_gate, review_hold, reviewed, skip, deferred_note, sidecar: sidecar !== undefined ? sidecar : latestSidecar(db, task.id) };
 }
 
 // Batched form of taskWithHealth for list endpoints (task HIVE-447): looks up

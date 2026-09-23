@@ -90,8 +90,8 @@ The herdr adapter also serializes create, reclaim, cleanup, and teardown for the
 
 ## Review-parked agents: release and reattach
 
-An `in_review` task is parked on the DIRECTOR — PR open, CI green, quiz waiting
-on a human. Its agent has nothing to do, but while it lives it holds a pty and a
+An `in_review` task is parked on the DIRECTOR — PR open, CI green, waiting on a
+human. Its agent has nothing to do, but while it lives it holds a pty and a
 dispatch slot. On 2026-08-19 ten such agents held a project at 3 running against
 19 queued, because live agents (`max_agents × 2`) were all review-parked.
 
@@ -109,10 +109,6 @@ Releasing closes the fleet tab and the worktree's own workspace, PRESERVES the
 git worktree and branch (the PR still points at them), nulls `agent_target`, and
 writes an `agent_released` event. Lifecycle is untouched — the task stays
 `in_review`. Per-project opt-out: `config.release_review_agents: false`.
-
-Deliberately NOT gated on the understanding quiz: a quiz is director-only
-(answering or deferring it never reaches the agent), so "quiz still pending" is
-exactly the state the slot would otherwise be held for.
 
 **Reattach** (the dispatcher's first pass each cycle). Every path that hands work
 back to an agent it could not reach now QUEUES a steer — a changes-request

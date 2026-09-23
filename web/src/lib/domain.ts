@@ -83,8 +83,11 @@ export interface Task {
   overlap_hold?: { number: number; files: string[] } | null; // list endpoint only; queued behind a live task that looks like it edits the same files
   requeued_to?: string | null; // successor id when failed + auto-requeued
   review_actionable?: boolean; // in_review AND the director can act on it now (server-computed, HIVE-500)
-  // Why an in_review task is or is not the director's yet; `needs_you` is exactly review_actionable.
-  review_gate?: "needs_you" | "risk_confirmed" | "review_running" | "ci_failing" | "ci_pending" | "no_pr" | null;
+  // Why an in_review task is or is not the director's yet; `needs_you` is exactly review_actionable,
+  // `hive_merging` is a settled review hive lands on its own.
+  review_gate?: "needs_you" | "hive_merging" | "risk_confirmed" | "review_running" | "ci_failing" | "ci_pending" | "no_pr" | null;
+  // On a `needs_you` review: the one plain sentence saying why it waits for the director's Ship.
+  review_hold?: string | null;
   skip?: { reason: string; label: string; permanent: boolean; since: string | null } | null; // queued only: why the dispatcher last skipped it
   never_dispatched?: boolean; // source=external, never spawned — no agent exists or ever will unless manually dispatched
   reviewed?: boolean; // intake tasks only: the director (or intake triage) signalled it is free to dispatch
@@ -152,6 +155,11 @@ export interface Decision {
   // Set on cards no automation may answer — today only "intake_triage", the
   // "which reading should we build?" card raised by intake triage.
   decision_class: string | null;
+  // false while hive's advisor is still deciding whether this card is the
+  // director's at all; the card stays out of Needs you until it says so.
+  for_director?: boolean;
+  // The advisor's one-line reason a card needs the director, when it gave one.
+  advice?: string | null;
   bundle?: DecisionBundle | null;
   plan?: DecisionPlan | null;
 }
@@ -354,6 +362,10 @@ export interface Intent {
   accepted_at: string | null;
   created_at: string;
   updated_at: string;
+  // Hive is still reading the code for this draft; it reaches the director only if a question is left.
+  hive_working?: boolean;
+  // Someone other than the director was asked first (the ticket's reporter), and has not replied yet.
+  waiting_on?: "reporter" | null;
 }
 
 export interface Learning {
@@ -536,11 +548,6 @@ export interface DiffResult {
 export interface BranchCheck {
   unmet_deps: { id: string; number: number; title: string; state: State }[];
   embedded_tasks: { id: string; number: number; title: string }[];
-  understanding_required?: boolean; // judgment-class change; the quiz gates approval (hive-1559)
-  // Which key the director's pass is recorded under: the intent id when an
-  // accepted intent owns the quiz, otherwise the review event (HIVE-638). The
-  // card reads the pass off the task timeline, so it has to match.
-  understanding_quiz_key?: string | null;
   // The risk check runs when the PR reaches review, not at the land attempt, so
   // the card knows before the director spends anything whether Ship can work
   // (HIVE-570). Undefined on an older server: the old land-time gate still applies.
@@ -629,46 +636,29 @@ export interface FeedEvent extends Omit<Event, "task_id"> {
   evidence_kind: Evidence["kind"] | null;
 }
 
-// One done-since row in the brief (task + completion metadata).
-export interface BriefDone {
+// GET /api/digest: what hive handled per project since the director last
+// looked. Lists may be capped; the *_total counts are not.
+export interface DigestProject {
   id: string;
-  title: string;
-  summary: string | null;
-  project_id: string;
-  project_name: string;
-  done_at: string;
-  evidence_count: number;
+  name: string;
+  shipped: { title: string; url: string; merged_at: string; task_id: string | null }[];
+  shipped_total: number;
+  decided: { decision_id: string; task_id: string; question: string; answer: string; why: string | null; at: string }[];
+  stuck: { task_id: string; title: string; reason: string; since: string | null }[];
+  working: { task_id: string; title: string }[];
+  working_total: number;
+  queued: number;
+  waiting_on_others: { task_id: string; title: string; key: string | null; asked_at: string }[];
+  new_requests: { task_id: string; key: string | null; title: string; at: string }[];
+  // Scout reports hive accepted on its own.
+  reports: { task_id: string; title: string; url: string | null; at: string }[];
+  github_error?: string;
 }
 
-export interface BriefIncident extends Incident {
-  project_name: string;
-}
-
-export interface BriefIntake extends Task {
-  project_name: string;
-}
-
-export interface BriefLearning extends Learning {
-  project_name: string;
-}
-
-// The composed re-entry and activity snapshot. Action-state sections (decisions,
-// attention, fleet, intake) are current-state; done/incidents/spend/learnings are
-// windowed by `since`.
-export interface Brief {
-  since: string | null;
-  auto_answered_dialogs: number; // benign agent dialogs the server answered itself
-  done: BriefDone[];
-  director_required_task_ids: string[];
-  failed_or_attention: Task[];
-  decisions: Decision[];
-  fleet: Task[];
-  incidents: BriefIncident[];
-  intake: BriefIntake[];
-  to_review: Task[]; // Hive-owned reviews the director can act on now; tracking-only tasks are excluded.
-  in_review_pending: Task[]; // still in review but not yet the director's: red/running CI, review pipeline unfinished, or no report to read.
-  spend: { totals: UsageTotals; by_model: (UsageTotals & { model: string })[] };
-  learnings_new: BriefLearning[];
+export interface Digest {
+  since: string; // window start the server actually used
+  until: string;
+  projects: DigestProject[];
 }
 
 // Away mode, as returned by GET/POST /api/away. `active` is the live state
@@ -681,19 +671,6 @@ export interface HeldPush {
   url: string;
 }
 
-// GET /api/attention — how many things need the director fleet-wide, the
-// threshold, and which optional generators are paused because of it.
-export interface AttentionBudget {
-  count: number;
-  threshold: number;
-  over: boolean;
-  paused: string[];
-  // What the pause is holding, so a quiet board never hides held work.
-  // Optional: an older server answers without it, and a missing field must not
-  // take the board down.
-  held?: { scouts: number; watchers: number };
-}
-
 export interface Away {
   on: boolean;
   active: boolean;
@@ -701,30 +678,6 @@ export interface Away {
   held: number;
   items?: HeldPush[];
   last_flush?: { at: string; items: HeldPush[] } | null;
-}
-
-// An open (un-acked) build-time checkpoint, as returned by GET /api/checkpoints.
-export interface CheckpointPlan {
-  goal: string;
-  approach: string;
-  files_expected: string[];
-  verification_planned: string;
-}
-
-export interface Checkpoint {
-  id: string;
-  task_id: string;
-  ts: string;
-  task_number: number;
-  task_title: string;
-  task_state: string;
-  project_id: string;
-  note: string;
-  // Plan checkpoints only (HIVE-412/413). `blocking` means the agent is parked
-  // until this is acked; `concerns` is the critic's verdict, [] until it lands.
-  blocking?: boolean;
-  plan?: CheckpointPlan;
-  concerns?: { severity: "note" | "veto"; text: string }[];
 }
 
 export type ReviewItem = string | { what: string; why?: string };
@@ -737,18 +690,6 @@ export interface UnderstandingPacket {
   affected_areas?: string[];
   risk_assessment?: string;
   participate?: string;
-  check?: {
-    question: string;
-    options: { key: string; label: string }[];
-    answer_key: string;
-    explanation?: string;
-  };
-  checks?: {
-    question: string;
-    options: { key: string; label: string }[];
-    answer_key: string;
-    explanation?: string;
-  }[];
 }
 
 export interface ReviewSummary {
@@ -758,53 +699,6 @@ export interface ReviewSummary {
   testing?: string[];
   followups?: string[];
   understanding?: UnderstandingPacket;
-}
-
-// One shipped change, sized for a glance (HIVE-511). `headline` is already
-// capped server-side; the card renders it on one line regardless.
-export interface GlanceCard {
-  task_id: string;
-  number: number;
-  display_id: string;
-  title: string;
-  project_id: string;
-  kind: string;
-  state: string;
-  shipped_at: string;
-  headline: string;
-  merged_by: "auto" | "director" | null;
-  files: number;
-  additions: number;
-  deletions: number;
-  diff_unavailable: boolean;
-  areas: { area: string; churn: number }[];
-  images: { url: string; caption: string | null; phase: "before" | "after" | null }[];
-  explanation_url: string | null;
-}
-
-export interface UnderstandingQuiz {
-  id: string;
-  // The key this quiz's pass is recorded under: the intent id when an accepted
-  // intent owns the quiz, otherwise `id` (HIVE-638).
-  quiz_key?: string;
-  // Set when an accepted intent owns the quiz: the card says which ask it is
-  // checking, and links to that intent.
-  intent_id?: string;
-  intent_slug?: string;
-  task_id: string;
-  ts: string;
-  task_number: number;
-  task_title: string;
-  task_state: State;
-  task_kind: Kind;
-  project_id: string;
-  report: ReviewSummary;
-  question: string;
-  options: { key: string; label: string }[];
-  version: string;
-  completed?: number;
-  total?: number;
-  status: "required" | "deferred";
 }
 
 export interface JiraSyncState {

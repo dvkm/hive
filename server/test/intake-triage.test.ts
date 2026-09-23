@@ -191,14 +191,12 @@ test("the in-flight hold is released even when the classifier throws", async () 
 // answers it for them, the feature has silently defeated itself: the task
 // dispatches on a reading nobody chose. Every auto-answer path must refuse.
 test("a triage card survives every auto-answer sweep", async () => {
-  const { autoAnswerStale } = await import("../src/reconciler.ts");
+  const { advisorWillJudge } = await import("../src/advisor.ts");
   const { evaluateAutoApprove, evaluateAutopilotApprove } = await import("../src/autoapprove.ts");
   const { apiAnswerDecision } = await import("../src/api.ts");
   const { herdr: defaultHerdr } = await import("../src/runtime/herdr.ts");
 
-  // decision_auto_answer_hours: 1 — the sweep would normally take any open
-  // normal-risk card with a recommended option after an hour.
-  const { db, id, task } = setup({ intake_triage: true, decision_auto_answer_hours: 1 }, "watch");
+  const { db, id, task } = setup({ intake_triage: true }, "watch");
   await triageIntake(db, task, { exec: stub(AMBIGUOUS) });
   const card = openCards(db, id)[0];
   expect(card).toBeTruthy();
@@ -206,9 +204,8 @@ test("a triage card survives every auto-answer sweep", async () => {
   // It has a recommended option, so nothing but the class is keeping it safe.
   expect(JSON.parse(card.options).some((o: any) => o.recommended)).toBe(true);
 
-  // 1. the reconciler's stale-card timeout, two days late.
-  autoAnswerStale(db, defaultHerdr, Date.parse(card.ts) + 48 * 3600_000);
-  expect(openCards(db, id)).toHaveLength(1);
+  // 1. the decision advisor never takes a classed card: it goes to the director.
+  expect(advisorWillJudge(db, card)).toBe(false);
 
   // 2. the chat supervisor, on both its balanced and autopilot paths.
   expect(evaluateAutoApprove(db, card, "first-load").allow).toBe(false);

@@ -29,7 +29,7 @@
 import type { DB } from "./db.ts";
 import { getTask, TERMINAL, type State } from "./state.ts";
 import { parseWorktreeList } from "./runtime/herdr.ts";
-import { taskIdFromBranch } from "./reaper.ts";
+import { taskForHiveBranch } from "./taskIdentifier.ts";
 import { activeProjects } from "./testProjects.ts";
 import type { Exec } from "./exec.ts";
 import { defaultExec, projectBaseBranch } from "./exec.ts";
@@ -171,7 +171,7 @@ async function gardenRepo(
     for (const l of merged.stdout.split("\n").map((x) => x.trim()).filter(Boolean)) mergedSet.add(l);
 
   for (const b of parseBranchList(refs.stdout)) {
-    const taskId = taskIdFromBranch(b.branch);
+    const taskId = taskForHiveBranch(db, project.id, b.branch);
     const ghostTaskId = taskId ? null : taskIdFromGhostBranch(b.branch);
     const owner = taskId ?? ghostTaskId;
     const task = owner ? getTask(db, owner) : null;
@@ -256,7 +256,7 @@ async function gardenRepo(
   // 3) matching origin branches, opt-in. One ls-remote up front, then one
   //    batched push --delete: 400 sequential pushes is minutes of network.
   if (opts.remote && report.deleted_local.length) {
-    const ls = await exec(["git", "-C", repo, "ls-remote", "--heads", "origin", "hive/*"]);
+    const ls = await exec(["git", "-C", repo, "ls-remote", "--heads", "origin"]);
     if (ls.code !== 0) {
       report.skipped.push({ what: "origin", reason: `ls-remote failed: ${ls.stderr.trim().slice(0, 200)}` });
       return report;
