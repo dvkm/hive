@@ -52,20 +52,11 @@ async function post(handler: ReturnType<typeof makeHandler>, path: string, body:
   return { status: res.status, json: await res.json() };
 }
 
-// The handoff also holds when the review carries no understanding check
-// (HIVE-580). These tests are about evidence freshness, so they file one and
-// get on with it.
-const CHECKS = {
-  checks: [
-    {
-      question: "What does this change do?",
-      options: [{ key: "a", label: "the work" }, { key: "b", label: "nothing" }],
-      answer_key: "a",
-    },
-  ],
-};
+// These tests are about evidence freshness, so they file a review the way an
+// agent does and get on with it.
+const UNDERSTANDING = { essence: "a change" };
 const fileReview = (handler: ReturnType<typeof makeHandler>, id: string) =>
-  post(handler, `/api/tasks/${id}/events`, { type: "review_summary", done: ["did the thing"], understanding: CHECKS });
+  post(handler, `/api/tasks/${id}/events`, { type: "review_summary", done: ["did the thing"], understanding: UNDERSTANDING });
 
 test("evidence is stamped with the worktree HEAD sha, and the ready gate rejects stale evidence", async () => {
   const head = { sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" };
@@ -208,7 +199,7 @@ test("an observation is not commit-bound, so a later commit does not hold the ha
   expect(e.json.evidence.meta.commit_sha).toBeUndefined();
 
   head.sha = "7777777777777777777777777777777777777777";
-  const review = await post(s.handler, `/api/tasks/${id}/events`, { type: "review_summary", done: ["ran the query"], understanding: CHECKS });
+  const review = await post(s.handler, `/api/tasks/${id}/events`, { type: "review_summary", done: ["ran the query"], understanding: UNDERSTANDING });
   expect(review.status).toBe(201);
   const ready = await post(s.handler, `/api/tasks/${id}/events`, { type: "ready", pr_url: "https://gh/pr/6" });
   expect(ready.json.task.state).toBe("in_review");

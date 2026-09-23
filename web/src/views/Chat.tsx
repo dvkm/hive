@@ -6,19 +6,13 @@ import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import { faComment } from "@fortawesome/free-solid-svg-icons";
 import { useStore } from "../lib/store";
 import { api } from "../lib/api";
-import type { Brief, ChatMessage, ChatThread, Decision, Event, Task } from "../lib/api";
+import type { ChatMessage, Decision, Task } from "../lib/api";
 import { relTime } from "../lib/time";
-import { eventText } from "../lib/eventText";
-import { STATE_LABEL } from "../lib/labels";
-import { NowStrip } from "./Board";
-import { StatusDot, toast } from "../lib/ui";
+import { toast } from "../lib/ui";
 import { DecisionCard } from "./DecisionCard";
-import { actionableItems, isInMotion } from "../lib/needsYou";
 
-// One portfolio-wide Chief of Staff conversation appears on the home route and
-// in a persistent drawer elsewhere. Its replies and the director's echoed
-// messages arrive live over SSE; detailed supervisor activity stays behind the
-// home view's progressive disclosure.
+// One portfolio-wide Chief of staff conversation, in a drawer on every page.
+// Its replies and the director's echoed messages arrive live over SSE.
 
 const CHIEF_LAST_SEEN = "hive.chief.lastSeen";
 
@@ -77,314 +71,52 @@ export function Bubble({ m }: { m: ChatMessage }) {
   );
 }
 
-const VISIBLE_MANAGER_EVENTS = new Set([
-  "steer",
-  "spawned",
-  "agent_status",
-  "assistant_text",
-  "tool_use",
-  "agent_turn_end",
-  "needs-decision",
-  "auto_approved",
-  "auto_approve_declined",
-  "dialog_auto_approved",
-  "dialog_auto_declined",
-  "spawn_error",
-  "steer_error",
-]);
-
-function ManagerActivity({
-  thread,
-  events,
-  tasks,
-  awaiting,
-  managerTask,
-  onRefresh,
-}: {
-  thread: ChatThread | null;
-  events: Event[];
-  tasks: Task[];
-  awaiting: boolean;
-  managerTask: Task | null;
-  onRefresh: () => void;
-}) {
-  const taskId = thread?.task_id ?? null;
-  const status = String(events.find((e) => e.type === "agent_status")?.payload.status ?? "");
-  const stopped = !!managerTask && ["done", "failed", "cancelled"].includes(managerTask.state);
-  const working = !stopped && (awaiting || status === "working");
-  const [replaying, setReplaying] = useState<string | null>(null);
-  const delegated = (taskId ? tasks.filter((t) => t.parent_task_id === taskId && t.source !== "chat_supervisor") : [])
-    .sort((a, b) => b.updated_at.localeCompare(a.updated_at))
-    .slice(0, 6);
-  const activity = events.filter((e) => VISIBLE_MANAGER_EVENTS.has(e.type)).slice(0, 12);
-  const meeting = thread?.meetings?.[0];
-  const verification = thread?.verifications?.[0];
-  const retrospective = thread?.retrospectives?.[0];
-  const commitments = (thread?.commitments ?? []).filter((item) => !["done", "dropped"].includes(item.status));
-
-  const replay = async () => {
-    if (!thread || !verification || replaying) return;
-    setReplaying(verification.event_id);
-    try {
-      const result = await api.replayVerification(thread.id, verification.event_id);
-      if (result.delivery === "failed") toast(result.error ?? "Could not wake the manager");
-      else toast("Verification replay queued");
-      onRefresh();
-    } catch (e: any) {
-      toast(e?.message ?? "Could not replay verification");
-    } finally {
-      setReplaying(null);
-    }
-  };
-
-  return (
-    <aside className="manager-activity" aria-label="Chief of Staff activity">
-      <div className="manager-activity-head">
-        <span>Chief of Staff activity</span>
-        <span className={`manager-live ${working ? "manager-live-working" : ""}`}>
-          <span className="manager-live-dot" />
-          {!taskId ? "not started" : stopped ? "stopped" : working ? "working" : "watching"}
-        </span>
-      </div>
-
-      <section className="manager-activity-section manager-run-section">
-        <div className="manager-section-title">
-          <h2>Run ledger</h2>
-          {thread && <span className={`manager-phase manager-phase-${thread.phase}`}>{thread.phase}</span>}
-        </div>
-        {!thread ? (
-          <p className="manager-activity-empty">The ledger starts with your first message.</p>
-        ) : (
-          <div className="manager-run-ledger">
-            <div className="manager-run-field">
-              <span>Objective</span>
-              <p>{thread.objective || "Manager is defining the outcome."}</p>
-            </div>
-            {!!thread.acceptance_criteria.length && (
-              <div className="manager-run-field">
-                <span>Success means</span>
-                <ul>{thread.acceptance_criteria.map((criterion, i) => <li key={i}>{criterion}</li>)}</ul>
-              </div>
-            )}
-            {thread.next_action && <div className="manager-run-field"><span>Next</span><p>{thread.next_action}</p></div>}
-            {thread.waiting_on && <div className="manager-run-field manager-run-waiting"><span>Waiting on</span><p>{thread.waiting_on}</p></div>}
-            {thread.outcome && <div className="manager-run-field"><span>Outcome</span><p>{thread.outcome}</p></div>}
-          </div>
-        )}
-      </section>
-
-      {commitments.length > 0 && (
-        <section className="manager-activity-section manager-commitments">
-          <h2>Open loops <span>{commitments.length}</span></h2>
-          <div className="manager-commitment-list">
-            {commitments.map((item) => (
-              <div className={`manager-commitment manager-commitment-${item.status}`} key={item.id}>
-                <div className="manager-commitment-head">
-                  <span>{item.title}</span>
-                  <b>{item.status.replace("_", " ")}</b>
-                </div>
-                <div className="manager-commitment-meta">
-                  {item.owner_task_id ? <Link to={`/tasks/${item.owner_task_id}`}>{item.owner_title || "assigned worker"}</Link> : <span>Chief of Staff</span>}
-                  {item.source_task_id ? <Link to={`/tasks/${item.source_task_id}`}>source task</Link> : <span title={item.source_message_text || undefined}>from your request</span>}
-                  {item.depends_on.length > 0 && <span>{item.depends_on.length} prerequisite{item.depends_on.length === 1 ? "" : "s"}</span>}
-                </div>
-              </div>
-            ))}
-          </div>
-        </section>
-      )}
-
-      {(meeting || verification || retrospective) && (
-        <section className="manager-activity-section manager-records">
-          <h2>Management record</h2>
-          {meeting && (
-            <div className="manager-record">
-              <div className="manager-record-head"><span>{meeting.stage === "decided" ? "Decision memo" : "Meeting"}</span><b>{meeting.stage}</b></div>
-              <p>{meeting.topic}</p>
-              {(meeting.recommendation || meeting.decision) && <strong className="manager-memo-recommendation">{meeting.recommendation || meeting.decision}</strong>}
-              {meeting.summary && <small>Rationale: {meeting.summary}</small>}
-              {!!meeting.dissent?.length && <small>Dissent: {meeting.dissent.join("; ")}</small>}
-              {!!meeting.evidence?.length && <small>Evidence: {meeting.evidence.join("; ")}</small>}
-              {!!meeting.risks?.length && <small>Risk: {meeting.risks.join("; ")}</small>}
-            </div>
-          )}
-          {verification && (
-            <div className={`manager-record manager-verification-${verification.status}`}>
-              <div className="manager-record-head"><span>Verification</span><b>{verification.status}</b></div>
-              <p>{verification.method}</p>
-              {verification.result && <small>{verification.result}</small>}
-              {verification.status !== "started" && (
-                <button className="link-btn" disabled={!!replaying} onClick={replay}>{replaying ? "replaying…" : "Replay this check"}</button>
-              )}
-            </div>
-          )}
-          {retrospective && (
-            <div className="manager-record">
-              <div className="manager-record-head"><span>Retrospective</span></div>
-              <p>{retrospective.summary}</p>
-            </div>
-          )}
-        </section>
-      )}
-
-      <section className="manager-activity-section">
-        <h2>Trajectory</h2>
-        {activity.length === 0 ? (
-          <p className="manager-activity-empty">{taskId ? "Waiting for the next action." : "Start a conversation to create a manager session."}</p>
-        ) : (
-          <div className="manager-event-list" aria-live="polite">
-            {activity.map((e) => (
-              <div className="manager-event" key={e.id}>
-                <span className="manager-event-dot" />
-                <div>
-                  <div className="manager-event-text" title={eventText(e)}>{eventText(e)}</div>
-                  <div className="manager-event-meta"><span>{e.type.replace(/[_-]+/g, " ")}</span><time title={e.ts}>{relTime(e.ts)}</time></div>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </section>
-
-      <section className="manager-activity-section manager-work-section">
-        <h2>Delegated work <span>{delegated.length || ""}</span></h2>
-        {delegated.length === 0 ? (
-          <p className="manager-activity-empty">No work delegated yet.</p>
-        ) : (
-          <div className="manager-work-list">
-            {delegated.map((task) => (
-              <Link to={`/tasks/${task.id}`} className="manager-work" key={task.id}>
-                <StatusDot state={task.state} health={task.health} />
-                <span className="manager-work-title">{task.title}</span>
-                <span className="manager-work-state">{STATE_LABEL[task.state]}</span>
-              </Link>
-            ))}
-          </div>
-        )}
-      </section>
-    </aside>
-  );
-}
-
-function ChiefBriefing({
-  thread,
-  awaiting,
-}: {
-  thread: ChatThread | null;
-  awaiting: boolean;
-}) {
-  const { tasks, needsYou } = useStore();
-  const [since] = useState(() => localStorage.getItem(CHIEF_LAST_SEEN));
-  const [brief, setBrief] = useState<Brief | null>(null);
-  const needsYouKey = needsYou.map((item) => item.id).join(",");
-  useEffect(() => {
-    let live = true;
-    api.morningBrief(since ?? undefined).then((result) => live && setBrief(result)).catch(() => live && setBrief(null));
-    return () => {
-      live = false;
-    };
-  }, [since, needsYouKey]);
-  useEffect(() => localStorage.setItem(CHIEF_LAST_SEEN, new Date().toISOString()), []);
-
-  // The same count the nav badge and the board strip show (lib/needsYou.ts).
-  // This used to count only decisions the server flagged director-required, so
-  // the landing page said "3 items need you" while the nav said 8 (HIVE-556).
-  const actionCount = actionableItems(needsYou, tasks).length;
-  const working = tasks.filter(isInMotion);
-  const finishedCount = since ? brief?.done.length ?? 0 : 0;
-  const commitments = (thread?.commitments ?? []).filter((item) => !["done", "dropped"].includes(item.status));
-  const headline = !brief
-    ? "Getting you caught up…"
-    : actionCount > 0
-      ? `${actionCount} ${actionCount === 1 ? "item needs" : "items need"} you.`
-      : awaiting
-        ? "Hive is handling it."
-      : "Nothing needs you.";
-  const detail = actionCount > 0
-    ? "Everything else keeps moving while your Chief waits for your call."
-    : thread?.outcome
-      || (commitments.length > 0 ? `Your Chief is tracking ${commitments.length} open ${commitments.length === 1 ? "loop" : "loops"} for you.` : null)
-      || (working.length > 0 ? `${working.length} ${working.length === 1 ? "item is" : "items are"} moving without your attention.` : null)
-      || "Tell Hive the outcome you want. Your Chief of Staff will coordinate the rest.";
-
-  return (
-    <section className="chief-briefing" aria-label="Re-entry briefing">
-      <div className="chief-briefing-copy">
-        <h1>{headline}</h1>
-        <p>{detail}</p>
-      </div>
-      {commitments.length > 0 && (
-        <div className="chief-commitments">
-          <div className="chief-commitments-label">Hive is handling</div>
-          <ul>
-            {commitments.slice(0, 3).map((item) => (
-              <li key={item.id}>
-                <span>{item.title}</span>
-                <b className={`chief-commitment-${item.status}`}>{item.status.replace("_", " ")}</b>
-              </li>
-            ))}
-          </ul>
-          {commitments.length > 3 && <small>{commitments.length - 3} more open loops in activity details</small>}
-        </div>
-      )}
-      {(actionCount > 0 || working.length > 0 || finishedCount > 0) && (
-        <div className="chief-briefing-foot">
-          <div className="chief-briefing-facts">
-            {actionCount > 0 && <Link to="/inbox">Handle {actionCount === 1 ? "1 item" : `${actionCount} items`}</Link>}
-            {working.length > 0 && <Link to="/work">{working.length} in motion</Link>}
-            {finishedCount > 0 && <span>{finishedCount} finished</span>}
-          </div>
-        </div>
-      )}
-    </section>
-  );
-}
-
-export default function Chat({ embedded = false }: { embedded?: boolean }) {
-  const { projects, projectsLoaded, tasks, decisions, feedEvents, chatThreadId, chatMessages, chatDelivery, openChatThread } = useStore();
-  const [lastSeen] = useState(() => localStorage.getItem(CHIEF_LAST_SEEN));
-  const [drawerOpen, setDrawerOpen] = useState(false);
+export default function Chat() {
+  const { projects, projectsLoaded, decisions, feedEvents, chatThreadId, chatMessages, chatDelivery, openChatThread } = useStore();
+  const [open, setOpen] = useState(false);
+  const [lastSeen, setLastSeen] = useState<string | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [text, setText] = useState("");
   const [sending, setSending] = useState(false);
   const [managerTaskId, setManagerTaskId] = useState<string | null>(null);
   const [managerTask, setManagerTask] = useState<Task | null>(null);
-  const [managerThread, setManagerThread] = useState<ChatThread | null>(null);
-  const [managerEvents, setManagerEvents] = useState<Event[]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
-  const open = embedded || drawerOpen;
+
+  // What was new is judged against the previous visit; closing the drawer
+  // counts as having read it.
+  const openDrawer = () => {
+    setLastSeen(localStorage.getItem(CHIEF_LAST_SEEN));
+    setOpen(true);
+  };
+  const closeDrawer = () => {
+    localStorage.setItem(CHIEF_LAST_SEEN, new Date().toISOString());
+    setOpen(false);
+  };
 
   const refreshManager = useCallback(() => {
     if (!chatThreadId) return;
-    api.chatThread(chatThreadId).then((thread) => {
-      setManagerThread(thread);
-      setManagerTaskId(thread.task_id);
-    }).catch(() => {});
+    api.chatThread(chatThreadId).then((thread) => setManagerTaskId(thread.task_id)).catch(() => {});
   }, [chatThreadId]);
 
-  // There is one durable Chief of Staff thread across every project. Reopen it
-  // wherever the panel appears so switching pages never switches managers.
+  // There is one durable Chief of staff thread across every project. Reopen it
+  // whenever the drawer opens so switching pages never switches threads.
   useEffect(() => {
     if (!open || !projects.length) return;
     api
       .chatThreads()
       .then((ts) => {
         const latest = ts.find((thread) => !thread.project_id) ?? null;
-        setManagerThread(latest);
         setManagerTaskId(latest?.task_id ?? null);
         openChatThread(latest?.id ?? null);
       })
       .catch(() => {
-        setManagerThread(null);
         setManagerTaskId(null);
         openChatThread(null);
       });
   }, [open, projects.length]);
 
-  // Ledger, commitment and verification updates all write an event on the
-  // supervisor task, and every one of those arrives on the SSE feed — so the
-  // thread refetches on change instead of on a timer. chatDelivery covers a
-  // respawn, which binds the thread to a NEW task id no old event carries.
+  // A respawn binds the thread to a NEW task id that no old event carries, so
+  // the thread refetches on its own events and on delivery changes.
   const managerEventCursor = feedEvents.find((e) => e.task_id === managerTaskId)?.id ?? "";
   useEffect(() => {
     if (!open || !chatThreadId) return;
@@ -395,18 +127,9 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
     let live = true;
     if (!managerTaskId) {
       setManagerTask(null);
-      setManagerEvents([]);
       return;
     }
-    api.task(managerTaskId).then((d) => {
-      if (!live) return;
-      setManagerTask(d);
-      setManagerEvents(d.events);
-    }).catch(() => {
-      if (!live) return;
-      setManagerTask(null);
-      setManagerEvents([]);
-    });
+    api.task(managerTaskId).then((d) => live && setManagerTask(d)).catch(() => live && setManagerTask(null));
     return () => {
       live = false;
     };
@@ -423,7 +146,7 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
       // SSE (chat_delivery, plus a visible message on the thread when it fails).
       // First message of a new thread: adopt the id so SSE replies land here.
       if (r.thread_id !== chatThreadId) openChatThread(r.thread_id);
-      api.chatThread(r.thread_id).then((thread) => { setManagerThread(thread); setManagerTaskId(thread.task_id); }).catch(() => {});
+      api.chatThread(r.thread_id).then((thread) => setManagerTaskId(thread.task_id)).catch(() => {});
     } catch (e: any) {
       toast(`Chat failed: ${e?.message ?? e}`);
       setText(body); // don't eat the message on a hard failure
@@ -432,18 +155,13 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
     }
   };
 
-  // Supervisor is thinking whenever the last thing said was the director's.
+  // Working whenever the last thing said was the director's.
   const managerStopped = !!managerTask && ["done", "failed", "cancelled"].includes(managerTask.state);
   const awaiting = !managerStopped && chatMessages.length > 0 && chatMessages[chatMessages.length - 1].role === "director";
   const deliveryLabel =
-    chatDelivery === "spawning" ? "supervisor starting…"
-    : chatDelivery === "queued" || chatDelivery === "delivering" ? "delivering…"
+    chatDelivery === "spawning" ? "Chief of staff is starting…"
+    : chatDelivery === "queued" || chatDelivery === "delivering" ? "Delivering…"
     : null;
-  const activityEvents = useMemo(() => {
-    const rows = new Map(managerEvents.map((e) => [e.id, e]));
-    for (const e of feedEvents) if (e.task_id === managerTaskId) rows.set(e.id, e);
-    return [...rows.values()].sort((a, b) => b.ts.localeCompare(a.ts));
-  }, [managerEvents, feedEvents, managerTaskId]);
   const focusedMessages = useMemo(() => {
     const openDecisionIds = new Set(decisions.map((decision) => decision.id));
     const ids = new Set<string>();
@@ -469,11 +187,7 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
   useEffect(() => {
     const scroll = scrollRef.current;
     if (!open || !scroll) return;
-    if (chatMessages.length === 0) {
-      scroll.scrollTo({ top: 0 });
-      return;
-    }
-    if (historyOpen) {
+    if (chatMessages.length === 0 || historyOpen) {
       scroll.scrollTo({ top: 0 });
       return;
     }
@@ -487,104 +201,78 @@ export default function Chat({ embedded = false }: { embedded?: boolean }) {
 
   if (!open)
     return (
-      <button className="chat-fab" title="Message your Chief of Staff" aria-label="Message your Chief of Staff" onClick={() => setDrawerOpen(true)}>
+      <button className="chat-fab" title="Message your Chief of staff" aria-label="Message your Chief of staff" onClick={openDrawer}>
         <FontAwesomeIcon icon={faComment} />
       </button>
     );
 
-  const conversation = (
-    <div className={embedded ? "manager-chat" : "chat-panel"}>
-      <header className={embedded ? "manager-head" : "chat-head"}>
-        {embedded && (
-          <div className="manager-heading">
-            <div className="manager-eyebrow">Chief of staff</div>
-            <div className={`chief-presence ${awaiting ? "chief-presence-working" : ""}`}>
-              <span className="manager-live-dot" />
-              {awaiting ? "Coordinating" : "Standing by"}
-            </div>
-          </div>
-        )}
+  return (
+    <div className="chat-panel">
+      <header className="chat-head">
+        <span className="chat-title">Chief of staff</span>
         <div className="chat-head-actions">
-          {!embedded && (
-            <button className="chat-iconbtn" title="Close panel" onClick={() => setDrawerOpen(false)}>
-              ✕
-            </button>
-          )}
+          <button className="chat-iconbtn" title="Close" aria-label="Close" onClick={closeDrawer}>
+            ✕
+          </button>
         </div>
       </header>
-      <div className={embedded ? "manager-body" : "chat-body"}>
-        {embedded && <NowStrip />}
-        {embedded && <ChiefBriefing thread={managerThread} awaiting={awaiting} />}
-        <div className={embedded ? `manager-conversation${chatMessages.length > 0 && visibleMessages.length === 0 ? " manager-conversation-quiet" : ""}` : undefined}>
-          <div className="chat-scroll" ref={scrollRef}>
-            {hiddenMessageCount > 0 && (
-              <button className="chat-history-toggle" onClick={() => setHistoryOpen((current) => !current)}>
-                {historyOpen ? "Show current conversation" : `${hiddenMessageCount} earlier ${hiddenMessageCount === 1 ? "message" : "messages"}`}
-              </button>
-            )}
-            {chatMessages.length === 0 && (
-              <div className={embedded ? "manager-empty" : "chat-empty muted"}>
-                {projects.length ? (
-                  embedded ? (
-                    <>
-                      <div className="manager-empty-title">Start with the result you want.</div>
-                      <div className="manager-empty-copy">You can stay high level. Your Chief of Staff will recover context, route the work, and follow through.</div>
-                      <div className="manager-prompts">
-                        {["Give me the brief", "Handle the low-risk work", "What needs my decision?"].map((prompt) => (
-                          <button key={prompt} onClick={() => setText(prompt)}>{prompt}</button>
-                        ))}
-                      </div>
-                    </>
-                  ) : (
-                    "Ask your Chief of Staff to start work, catch you up, or resolve a blocker."
-                  )
-                ) : projectsLoaded ? (
-                  // Only once the list has really landed: an empty list from a
-                  // failed fetch would greet an established install with
-                  // first-run onboarding.
-                  <div className="manager-project-empty">
-                    <div className="manager-project-mark" aria-hidden="true">01</div>
-                    <div>
-                      <div className="manager-empty-title">Connect your first project.</div>
-                      <div className="manager-empty-copy">Give Hive one repository, then your Chief of Staff can plan, delegate, and follow the work through.</div>
-                    </div>
-                    <Link className="manager-project-cta" to="/projects">Add a project <span aria-hidden="true">→</span></Link>
-                  </div>
-                ) : null}
-              </div>
-            )}
-            {visibleMessages.map((m) => (
-              <Bubble key={m.id} m={m} />
-            ))}
-            {(awaiting || deliveryLabel) && <div className="chat-typing muted">{deliveryLabel ?? "manager is working…"}</div>}
-          </div>
-          <div className="chat-compose">
-            <textarea
-              placeholder={projects.length ? "Tell Hive the outcome you want…" : "Add a project to start"}
-              value={text}
-              disabled={!projects.length}
-              onChange={(e) => setText(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  send();
-                }
-              }}
-            />
-            <button className="btn btn-primary" onClick={send} disabled={sending || !text.trim() || !projects.length}>
-              Send
+      <div className="chat-body">
+        <div className="chat-scroll" ref={scrollRef}>
+          {hiddenMessageCount > 0 && (
+            <button className="chat-history-toggle" onClick={() => setHistoryOpen((current) => !current)}>
+              {historyOpen ? "Show current conversation" : `${hiddenMessageCount} earlier ${hiddenMessageCount === 1 ? "message" : "messages"}`}
             </button>
-          </div>
+          )}
+          {chatMessages.length === 0 && (
+            <div className="chat-empty muted">
+              {projects.length ? (
+                "Ask your Chief of staff to start work, catch you up, or clear a blocker."
+              ) : projectsLoaded ? (
+                // Only once the list has really landed: an empty list from a
+                // failed fetch would greet an established install with
+                // first-run onboarding.
+                <FirstProject />
+              ) : null}
+            </div>
+          )}
+          {visibleMessages.map((m) => (
+            <Bubble key={m.id} m={m} />
+          ))}
+          {(awaiting || deliveryLabel) && <div className="chat-typing muted">{deliveryLabel ?? "Chief of staff is working…"}</div>}
         </div>
-        {embedded && (
-          <details className="chief-details">
-            <summary>Operations log</summary>
-            <ManagerActivity thread={managerThread} events={activityEvents} tasks={tasks} awaiting={awaiting} managerTask={managerTask} onRefresh={refreshManager} />
-          </details>
-        )}
+        <div className="chat-compose">
+          <textarea
+            placeholder={projects.length ? "Tell Hive the outcome you want…" : "Add a project to start"}
+            value={text}
+            disabled={!projects.length}
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                send();
+              }
+            }}
+          />
+          <button className="btn btn-primary" onClick={send} disabled={sending || !text.trim() || !projects.length}>
+            Send
+          </button>
+        </div>
       </div>
     </div>
   );
+}
 
-  return embedded ? <div className="manager-page">{conversation}</div> : conversation;
+// A fresh install has nothing to supervise yet: the one thing to do is add a
+// repository. Shared by the Home page and the chat drawer.
+export function FirstProject() {
+  return (
+    <div className="manager-project-empty">
+      <div className="manager-project-mark" aria-hidden="true">01</div>
+      <div>
+        <div className="manager-empty-title">Connect your first project.</div>
+        <div className="manager-empty-copy">Give Hive one repository. Then your Chief of staff can plan, delegate, and follow the work through.</div>
+      </div>
+      <Link className="manager-project-cta" to="/projects">Add a project <span aria-hidden="true">→</span></Link>
+    </div>
+  );
 }

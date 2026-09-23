@@ -1,7 +1,6 @@
 // HIVE-348: merge EXECUTION is single-flight per target branch.
 import { test, expect } from "bun:test";
 import { openDb, newId, now, type DB } from "../src/db.ts";
-import { writeEvent } from "../src/state.ts";
 import { mergeTask } from "../src/api.ts";
 import { landOnce, markLand } from "../src/landQueue.ts";
 import { withMergeLock } from "../src/mergeLock.ts";
@@ -46,27 +45,6 @@ test("different target branches still land in parallel", async () => {
   expect(seen).toEqual(["staging", "main"]);
 });
 
-// The merge gate wants a passed understanding check; these tests are about
-// ordering, not the quiz, so seed a passed one.
-function passQuiz(db: DB, taskId: string): void {
-  const review = writeEvent(db, {
-    task_id: taskId,
-    source: "agent",
-    type: "review_summary",
-    payload: {
-      understanding: {
-        check: { question: "q", options: [{ key: "a", label: "a" }, { key: "b", label: "b" }], answer_key: "a" },
-      },
-    },
-  });
-  writeEvent(db, {
-    task_id: taskId,
-    source: "director",
-    type: "understanding_quiz_passed",
-    payload: { review_event_id: review.id, answer_key: "a" },
-  });
-}
-
 // Two tasks in one project, merged concurrently through the real mergeTask.
 // Both take the local fast-forward path, so both shell out to git against the
 // same checkout — exactly the overlap that once let one merge's reset + re-merge
@@ -85,7 +63,6 @@ function seedTwo(): { db: DB; a: string; b: string } {
        VALUES (?,?,?,?,'ship',?,'passing',?,?)`
     ).run(id, projectId, `task ${branch}`, "in_review", branch, t, t);
     db.query("INSERT INTO evidence (id, task_id, ts, kind, caption) VALUES (?,?,?,?,?)").run(newId(), id, t, "note", "ok");
-    passQuiz(db, id);
     return id;
   };
   return { db, a: mk("feat-a"), b: mk("feat-b") };

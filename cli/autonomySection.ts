@@ -34,7 +34,7 @@ export function renderAutonomy(stats: AutonomyStats): string[] {
   );
 
   const trend = sparkbar(inbox.by_day.map((d) => d.total));
-  const mix = (["decision", "quiz", "checkpoint", "dialog", "stale"] as const)
+  const mix = (["decision", "checkpoint", "dialog", "stale"] as const)
     .filter((c) => inbox.totals[c] > 0)
     .map((c) => `${inbox.totals[c]} ${c}`)
     .join(", ");

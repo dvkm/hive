@@ -99,7 +99,7 @@ test("a second PR blocked by the same outage inherits the director's ruling inst
   expect(second.status).toBe("answered");
   expect(second.answer_key).toBe("merge");
   // No second interruption for the same outage.
-  expect(db.query("SELECT COUNT(*) AS n FROM notifications WHERE kind = 'decision'").get()).toEqual({ n: 1 } as any);
+  expect(db.query("SELECT COUNT(*) AS n FROM notifications WHERE decision_id = ?").get(second.id)).toEqual({ n: 0 } as any);
 
   // Once the outage's diagnostic task is closed, the ruling has expired with
   // it: the next PR asks the director again instead of inheriting a stale call.

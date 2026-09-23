@@ -18,6 +18,7 @@ import type { Exec } from "./exec.ts";
 import { defaultExec, projectBaseBranch } from "./exec.ts";
 import { resolveConfiguredCommand } from "./platform.ts";
 import { enqueue } from "./notifications.ts";
+import { taskForHiveBranch } from "./taskIdentifier.ts";
 import { createHash } from "node:crypto";
 
 // Per-project stack lifecycle command. Two symmetric hooks share this runner:
@@ -481,7 +482,7 @@ export async function cleanupTask(
   let remote: { deleted: boolean; reason: string } | null = null;
   if (task.branch && repoPath && !preservedWorktree && config.delete_remote_branches !== false) {
     remote = await herdr
-      .deleteRemoteBranch({ repoPath, branch: task.branch, defaultBranch })
+      .deleteRemoteBranch({ repoPath, branch: task.branch, defaultBranch, owned: taskForHiveBranch(db, task.project_id, task.branch) === taskId })
       .catch((e: any) => ({ deleted: false, reason: String(e?.message ?? e).slice(0, 200) }));
   }
 
@@ -592,12 +593,8 @@ export async function cleanupTask(
 // Release = close the session, KEEP the worktree and branch (the PR still needs
 // them), drop agent_target so the dispatcher stops counting it. Feedback brings
 // an agent back onto the same branch with that feedback in its brief (the
-// reattach pass in dispatcher.ts).
-//
-// Deliberately NOT gated on the understanding quiz: a quiz is director-only
-// (answering or deferring it never reaches the agent), so "quiz still pending"
-// is exactly the state the slot would be held for. `idle` is the same signal
-// advanceIfFinished already reads as "this agent has nothing left to do".
+// reattach pass in dispatcher.ts). `idle` is the same signal advanceIfFinished
+// already reads as "this agent has nothing left to do".
 export async function releaseReviewAgent(
   db: DB,
   herdr: Herdr = defaultHerdr,

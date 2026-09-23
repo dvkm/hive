@@ -403,8 +403,8 @@ function saveEvidence(db: DB, taskId: string, file: string, caption: string, pha
   copyFileSync(file, path);
   const id = newId("ev");
   const url = `/evidence/${taskId}/${fileName}`;
-  // `render_phase` is what lets the catchup card show the pair side by side
-  // (HIVE-511). Anything without it is a lone screenshot, as before.
+  // `render_phase` says which side of a before/after pair this is (HIVE-511).
+  // Anything without it is a lone screenshot, as before.
   const meta = { rendered_at_review: true, render_phase: phase };
   db.query(
     "INSERT INTO evidence (id, task_id, ts, kind, path, url, caption, meta) VALUES (?,?,?,?,?,?,?,?)"
@@ -485,8 +485,8 @@ async function baseCommit(db: DB, task: { project_id?: string | null }, root: st
 }
 
 // Render the SAME routes as they looked BEFORE the change (HIVE-511), so the
-// catchup card can show a before/after pair — the highest-value visual there is
-// for UI work.
+// review has a before/after pair — the highest-value visual there is for UI
+// work.
 //
 // The base checkout is a detached git worktree created INSIDE the task's
 // worktree, for one reason: the seatbelt only grants writes under that root, so

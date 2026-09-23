@@ -60,7 +60,6 @@ import { defaultExec } from "../exec.ts";
 import { taskDiff } from "../diff.ts";
 import type { TaskDiff } from "../diff.ts";
 import { renderProofAttempted, renderProofTrusted, renderProofsOnce } from "./renderProof.ts";
-import { taskIdentifier } from "../taskIdentifier.ts";
 import {
   NEEDS_DECISION_LABEL,
   assertJiraWriteAllowed,
@@ -1892,17 +1891,20 @@ export function pendingOutbound(db: DB, taskId: string): { comments: number; rec
            AND ${latestReceiptSql("r")}
        )`
   ).get(taskId) as { n: number };
-  const receipts = db.query(
-    `SELECT COUNT(*) AS n FROM evidence v
-     WHERE v.task_id = ?
-       AND NOT EXISTS (
-         SELECT 1 FROM events r WHERE r.task_id = v.task_id AND r.type = 'jira_sync'
-           AND json_extract(r.payload, '$.action') = 'receipt'
-           AND ${receiptSourceSql("r")} = v.id
-           AND ${settledReceiptSql("r")}
-           AND ${latestReceiptSql("r")}
-       )`
-  ).get(taskId) as { n: number };
+  // Only evidence that gets a receipt at all (receiptText) can be pending.
+  const receipts = {
+    n: (db.query(
+      `SELECT v.url FROM evidence v
+       WHERE v.task_id = ?
+         AND NOT EXISTS (
+           SELECT 1 FROM events r WHERE r.task_id = v.task_id AND r.type = 'jira_sync'
+             AND json_extract(r.payload, '$.action') = 'receipt'
+             AND ${receiptSourceSql("r")} = v.id
+             AND ${settledReceiptSql("r")}
+             AND ${latestReceiptSql("r")}
+         )`
+    ).all(taskId) as { url: string | null }[]).filter((v) => publicUrl(v.url)).length,
+  };
   const rows = db.query(
     `SELECT r.ts, r.payload FROM events r
      WHERE r.task_id = ? AND r.type = 'jira_sync'
@@ -1997,11 +1999,10 @@ export async function linkTaskToJira(
   if (!token) throw new Error("JIRA_API_TOKEN is not resolvable for this project");
   const client = new JiraClient(cfg, token, deps.fetch ?? fetch);
   const reporter = await client.myself();
-  const displayId = taskIdentifier(db, task);
   const created = await client.createSubtask({
     parentKey: parent,
-    summary: `${displayId} · ${task.title}`,
-    description: `hive-task: ${task.id}\n\nHive task: ${hiveBaseUrl()}/tasks/${task.id}`,
+    summary: task.title,
+    description: task.pr_url ? `PR: ${task.pr_url}` : "",
     reporterAccountId: reporter.accountId,
     hiveTaskId: task.id,
   });
@@ -2025,10 +2026,7 @@ export async function linkTaskToJira(
   broadcastTask(db, getTask(db, task.id));
 
   const warnings: string[] = [];
-  const links = [
-    ["Hive task", `${hiveBaseUrl()}/tasks/${task.id}`],
-    ...(task.pr_url ? [["Pull request", String(task.pr_url)]] : []),
-  ];
+  const links = task.pr_url ? [["Pull request", String(task.pr_url)]] : [];
   for (const [title, url] of links) {
     try { await client.addRemoteLink(created.key, title, url); }
     catch (error) { warnings.push(String(error instanceof Error ? error.message : error)); }
@@ -2787,6 +2785,7 @@ async function syncCommentsAndReceipts(
     }
     if (deliveryContained(db, task.id, "receipt", row.id)) continue;
     const text = receiptText(task, row);
+    if (!text) continue;
     const action = cfg.write ? "receipt" : "receipt_shadow";
     if (!cfg.write && syncEntryRecorded(db, task.id, action, row.id)) continue;
     await guardedWrite(ctx, {
@@ -3058,9 +3057,13 @@ export function reviewContextText(db: DB, task: any, jiraStatus: string): string
     .query(`SELECT kind, url, caption FROM evidence WHERE task_id IN (${marks}) ORDER BY ts`)
     .all(...ids) as { kind: string; url: string | null; caption: string | null }[];
   // #1249: the explanation page gets its own line rather than a slot in the
-  // capped evidence list — it is the one link a reporter actually wants.
-  const explain = resolveEvidenceUrl(allEvidence.filter((row) => row.kind === "explanation").at(-1)?.url ?? null);
-  const evidence = allEvidence.filter((row) => row.kind !== "explanation");
+  // capped evidence list — it is the one link a reporter actually wants. Only
+  // links a Jira reader can open are printed (see publicUrl).
+  const explain = publicUrl(allEvidence.filter((row) => row.kind === "explanation").at(-1)?.url ?? null);
+  const evidence = allEvidence.filter((row) => row.kind !== "explanation" && publicUrl(row.url));
+  // Screenshots are UPLOADED to the issue (see syncAttachments), so they count
+  // even though their hive links are never printed.
+  const proofs = attachedProofs(db, task.id);
 
   // The headline is the review's own one-line summary of what was done. The
   // internal state-change reason ("hive work for WEB-156 is in_review") is
@@ -3070,7 +3073,7 @@ export function reviewContextText(db: DB, task: any, jiraStatus: string): string
   // Nothing a reporter can act on (no PR, no explanation, no evidence, no
   // summary) means no comment. The status transition itself is already visible
   // on the ticket.
-  if (!headline && !pr && !evidence.length && !explain) return null;
+  if (!headline && !pr && !evidence.length && !explain && !proofs.length) return null;
 
   const caveats = [
     ...list(review?.iffy).map((item) =>
@@ -3081,36 +3084,38 @@ export function reviewContextText(db: DB, task: any, jiraStatus: string): string
     ...list(review?.decisions).map((item) => String(item ?? "").trim()),
   ].filter(Boolean);
 
+  const summary = clampText(headline ?? "details are in the PR", CONTEXT_TEXT_MAX);
   const lines = [
-    `${task.state === "done"
-      ? "Hive finished this and the director verified it; please check the live result and move the ticket to Done"
-      : "Hive moved this to In Review"}: ` +
-      clampText(headline ?? "see the Hive task for what changed", CONTEXT_TEXT_MAX),
+    task.state === "done"
+      ? `Done: ${summary}\nCould you check it and move this ticket to Done if it looks right?`
+      : `In review: ${summary}`,
   ];
   if (pr && !lines[0].includes(pr)) lines.push(`PR: ${pr}`);
   if (explain) lines.push(`What changed, explained: ${explain}`);
   if (caveats.length) lines.push(`Heads-up: ${clampText(caveats.join("; "), CONTEXT_TEXT_MAX)}`);
-  // Screenshots are UPLOADED to the issue (see syncAttachments); everything
-  // else is linked back to hive, which already serves it.
-  const proofs = attachedProofs(db, task.id);
   if (proofs.length) {
     lines.push("", `Screenshot${proofs.length === 1 ? "" : "s"} attached to this issue:`);
     for (const proof of proofs) lines.push(`- ${proof.filename}${proof.caption ? ` — ${proof.caption}` : ""}`);
   }
   if (evidence.length) {
     lines.push("", "Evidence:");
-    for (const row of evidence.slice(0, CONTEXT_EVIDENCE_LIMIT)) {
-      const url = resolveEvidenceUrl(row.url);
-      const label = row.caption?.trim() || row.kind;
-      lines.push(url ? `- ${label}: ${url}` : `- ${label}`);
-    }
-    if (evidence.length > CONTEXT_EVIDENCE_LIMIT)
-      lines.push(`- +${evidence.length - CONTEXT_EVIDENCE_LIMIT} more in Hive`);
+    for (const row of evidence.slice(0, CONTEXT_EVIDENCE_LIMIT)) lines.push(`- ${row.caption?.trim() || row.kind}: ${publicUrl(row.url)}`);
   }
-  // A loopback URL is a dead link for everyone reading Jira; only a public
-  // hive (HIVE_PUBLIC_URL, e.g. the Tailscale address) is worth printing.
-  if (!isLoopbackUrl(hiveBaseUrl())) lines.push("", `Hive task: ${hiveBaseUrl()}/tasks/${task.id}`);
   return clampText(lines.join("\n"), JIRA_COMMENT_MAX_LENGTH);
+}
+
+// An evidence link a person reading Jira can actually open, or null. Anything
+// hive serves itself is left out: a loopback URL is a dead link for everyone
+// else, and a private hive address is one too.
+function publicUrl(value: unknown): string | null {
+  const url = resolveEvidenceUrl(value);
+  if (!url || isLoopbackUrl(url)) return null;
+  try {
+    if (new URL(url).host === new URL(hiveBaseUrl()).host) return null;
+  } catch {
+    return null;
+  }
+  return url;
 }
 
 export function isLoopbackUrl(value: string): boolean {
@@ -3146,30 +3151,17 @@ function queueReviewContext(ctx: Ctx, task: any): void {
   });
 }
 
-// What a receipt says on the Jira ticket. Written for a human reading Jira with
-// no hive context: what it is, what produced it, and where to click.
+// What a receipt says on the Jira ticket: what it is and where to click. Null
+// when there is nothing a Jira reader could open, so no comment is posted.
 export function receiptText(
-  task: { id: string; number?: number; title?: string; state?: string },
+  _task: { id: string; number?: number; title?: string; state?: string },
   row: { kind: string; url: string | null; caption: string | null; ts: string }
-): string {
-  const base = hiveBaseUrl();
+): string | null {
+  const link = publicUrl(row.url);
+  if (!link || link.length > JIRA_COMMENT_MAX_LENGTH / 2) return null;
   const label = row.kind === "report" ? "report" : row.kind === "explanation" ? "walkthrough of this change" : row.kind;
-  const directLink = resolveEvidenceUrl(row.url);
-  const hiveLink = `${base}/tasks/${task.id}`;
-  const receipt = [
-    `Hive attached a ${label}: ${row.caption?.trim() || "(no caption)"}`,
-    "",
-    `Task: #${task.number ?? "?"} ${task.title ?? ""} (${task.state ?? "?"})`,
-    `Open in Hive: ${hiveLink}`,
-    ...(directLink ? [`Direct link: ${directLink}`] : []),
-    `Recorded: ${row.ts}`,
-  ].join("\n");
-  if (receipt.length <= JIRA_COMMENT_MAX_LENGTH) return receipt;
-  return [
-    "Hive attached evidence. Caption and direct link omitted because the receipt exceeded Jira's limit.",
-    "",
-    `Open in Hive: ${hiveLink}`,
-  ].join("\n");
+  const caption = clampText(row.caption?.trim() || label, JIRA_COMMENT_MAX_LENGTH - link.length - 20);
+  return `Added a ${label}: ${caption}\n${link}`;
 }
 
 // Draft the intent record for a ticket hive just imported (HIVE-637).

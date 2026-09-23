@@ -5,6 +5,14 @@ import { Ctx, type Store } from "../src/lib/store";
 import type { LandGraph, Task } from "../src/lib/api";
 import { Card, LandChips, queueOrder } from "../src/views/Board";
 
+// Card reads the shared project filter, which lives in localStorage and
+// broadcasts on window.
+(globalThis as unknown as { window: typeof globalThis }).window = globalThis;
+Object.defineProperty(globalThis, "localStorage", {
+  configurable: true,
+  value: { getItem: () => null, setItem: () => {} },
+});
+
 const fakeStore = {
   projects: [],
   evidenceCount: {},
@@ -151,10 +159,33 @@ test("land chips name the dependency and the conflicting PR", async () => {
     ],
   };
   const text = await chips(c, graph, [a, b, c]);
-  expect(text).toContain("queued to land");
-  expect(text).toContain("lands after #11");
+  expect(text).toContain("queued to merge");
+  expect(text).toContain("merges after #11");
   expect(text).toContain("conflicts with #12");
   expect(await chips(b, graph, [a, b, c])).toContain("conflicts with #13");
+});
+
+// The review column says what holds each card: the director's own Ship (with
+// the server's reason on hover), or hive merging it without him.
+const gateChip = async (t: Task) => {
+  let renderer!: ReturnType<typeof create>;
+  await act(async () => {
+    renderer = create(tree(t));
+  });
+  return renderer.root
+    .findAll((n) => n.type === "span" && String(n.props.className ?? "").startsWith("chip") && typeof n.props.title === "string")
+    .map((n) => ({ text: n.children.join(""), title: String(n.props.title) }))
+    .find((c) => c.text === "Needs you" || c.text === "Hive is merging");
+};
+
+test("a review waiting for the director says Needs you, with the reason on hover", async () => {
+  const chip = await gateChip(task("gate-you", { state: "in_review", review_gate: "needs_you", review_hold: "It touches billing, so it waits for your Ship." }));
+  expect(chip).toEqual({ text: "Needs you", title: "It touches billing, so it waits for your Ship." });
+});
+
+test("a settled review hive lands on its own says Hive is merging", async () => {
+  const chip = await gateChip(task("gate-hive", { state: "in_review", review_gate: "hive_merging" }));
+  expect(chip?.text).toBe("Hive is merging");
 });
 
 test("a review card with no edges and no mark shows no land line at all", async () => {

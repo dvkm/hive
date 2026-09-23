@@ -62,7 +62,7 @@ export function queueJiraCancellationComment(db: DB, taskId: string, source: str
     task_id: taskId,
     source,
     type: "jira_comment",
-    payload: { direction: "outbound", linked_cancelled: true, text: "Hive marked this task cancelled." },
+    payload: { direction: "outbound", linked_cancelled: true, text: "Work on this was cancelled." },
   });
 }
 
@@ -716,8 +716,8 @@ export function changesRequestUnaddressed(db: DB, taskId: string): boolean {
   return true; // still unaddressed
 }
 
-// A director answer can invalidate the report and its quiz. Never hand the
-// task back for review until the agent has summarized the answer's effect.
+// A director answer can invalidate the report. Never hand the task back for
+// review until the agent has summarized the answer's effect.
 export function decisionAnswerUnaddressed(db: DB, taskId: string): boolean {
   const answer = db.query("SELECT rowid FROM events WHERE task_id = ? AND type = 'decision_answered' ORDER BY rowid DESC LIMIT 1").get(taskId) as { rowid: number } | undefined;
   if (!answer) return false;
@@ -1127,25 +1127,13 @@ export function transition(
   // ticket In Progress, finishing it puts the ticket Done.
   if (task.jira_mirror_task_id) advanceJiraMirror(db, task.jira_mirror_task_id, source);
   if (to === "cancelled") openCancelledDependencyDecision(db, updated, source);
-  // Notify on notable terminal-ish outcomes (batched into the digest).
+  // Notify on notable terminal-ish outcomes (batched into the digest). A task
+  // reaching review is not announced here: most reviews hive lands on its own,
+  // and the reconciler pushes the few that need the director (notifyDirectorReviews).
   if (to === "done")
     enqueue(db, { kind: "done", task_id: taskId, title: `Task done: ${task.title}`, body: task.summary ?? undefined });
   else if (to === "failed")
     enqueue(db, { kind: "failed", task_id: taskId, title: `Task failed: ${task.title}`, body: opts.reason ?? undefined });
-  // A task landing in review is waiting on the director and nobody else: the
-  // agent is parked until it is approved, sent back, or its understanding check
-  // is answered. That is urgent by definition, not digest material.
-  // A tracking-only row has no PR, no review and no understanding check, so the
-  // review prompt below would be false. It reaches in_review only as a Jira
-  // mirror following its children (advanceJiraMirror).
-  else if (to === "in_review" && !isTrackingOnlyTask(task))
-    enqueue(db, {
-      kind: "review",
-      urgency: "urgent",
-      task_id: taskId,
-      title: `Review task ${task.number}: ${task.title}`,
-      body: "Approve, request changes, or answer the understanding check.",
-    });
   // Auto-teardown on an unambiguously-final state. failed is excluded (still retriable).
   if ((to === "done" || to === "cancelled") && terminalHook) {
     try {

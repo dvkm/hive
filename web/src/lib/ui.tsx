@@ -92,7 +92,7 @@ export function BlockedBy({ depends_on, tasks }: { depends_on: string[]; tasks: 
     .join("\n");
   return (
     <span className="chip chip-blocked" title={`Blocked by:\n${tip}`}>
-      ⛔ blocked by {label}
+      blocked by {label}
     </span>
   );
 }

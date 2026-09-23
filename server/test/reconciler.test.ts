@@ -5,6 +5,7 @@ import { reconcileOnce, ciStatusOf, ciStatusProbed } from "../src/reconciler.ts"
 import { Herdr } from "../src/runtime/herdr.ts";
 import { addClient, removeClient } from "../src/bus.ts";
 import { taskWithHealth, needsAttention } from "../src/health.ts";
+import { directorHold } from "../src/reviewer.ts";
 import { queuedSteers } from "../src/steer.ts";
 import type { Exec, ExecResult } from "../src/exec.ts";
 
@@ -928,20 +929,6 @@ test("autoMergeReady skips a never-dispatched external task even when CI is gree
   expect(getTask(db, id).state).toBe("in_review"); // never-dispatched external: not hive's to merge
 });
 
-test("autoAnswerStale skips a never-dispatched external task's open decision", async () => {
-  const { autoAnswerStale } = await import("../src/reconciler.ts");
-  const { db, projectId } = freshDb({ decision_auto_answer_hours: 4 });
-  const id = makeTask(db, projectId, { source: "external" });
-  const did = newId("dec");
-  db.query(
-    "INSERT INTO decisions (id, task_id, ts, title, risk, options, status) VALUES (?,?,?,?,'normal',?, 'open')"
-  ).run(did, id, new Date(Date.now() - 5 * 3600_000).toISOString(), "should never auto-answer",
-    JSON.stringify([{ key: "go", label: "Go", recommended: true }, { key: "no", label: "No" }]));
-  const herdr = new Herdr(stub(() => OK()), "herdr");
-  autoAnswerStale(db, herdr, Date.now());
-  expect((db.query("SELECT status FROM decisions WHERE id = ?").get(did) as any).status).toBe("open");
-});
-
 test("sweepVerifying flags a verifying task with no evidence once, and leaves an evidenced one alone", async () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId, { state: "queued" });
@@ -973,39 +960,24 @@ test("sweepVerifying flags a verifying task with no evidence once, and leaves an
   expect(db.query("SELECT * FROM events WHERE task_id = ? AND type='verify_wedged'").all(second).length).toBe(0);
 });
 
-test("autoMergeReady merges opted-in, green, clean-review, uncontested tasks without requiring a quiz", async () => {
+test("autoMergeReady merges opted-in, green, clean-review, uncontested tasks on its own", async () => {
   const { autoMergeReady } = await import("../src/reconciler.ts");
   const { db, projectId } = freshDb({ auto_merge: { kinds: ["chore"] } });
-  const mk = (extra: any, quiz: "passed" | "required" | "missing" = "passed") => {
-    const id = makeTask(db, projectId, { kind: "chore", ...extra });
+  const mk = () => {
+    const id = makeTask(db, projectId, { kind: "chore" });
     transition(db, id, "in_progress");
     transition(db, id, "in_review");
     db.query("UPDATE tasks SET ci_status = 'passing', branch = 'hive/x' WHERE id = ?").run(id);
     db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
       newId("evd"), id, now(), "log", "/tmp/e.log", "proof"
     );
-    const review = writeEvent(db, {
-      task_id: id,
-      source: "agent",
-      type: "review_summary",
-      payload: quiz === "missing" ? { done: ["done"] } : {
-        understanding: {
-          check: {
-            question: "Why is this safe to merge?",
-            options: [{ key: "review", label: "The review is clean." }, { key: "guess", label: "It is a guess." }],
-            answer_key: "review",
-          },
-        },
-      },
-    });
-    if (quiz === "passed")
-      writeEvent(db, { task_id: id, source: "director", type: "understanding_quiz_passed", payload: { review_event_id: review.id, answer_key: "review" } });
+    writeEvent(db, { task_id: id, source: "agent", type: "review_summary", payload: { done: ["done"] } });
     return id;
   };
-  const clean = mk({}, "missing");
-  const risky = mk({});
-  const mechanical = mk({}, "required");
-  const sensitive = mk({}, "required");
+  const clean = mk();
+  const risky = mk();
+  const mechanical = mk();
+  const sensitive = mk();
   writeEvent(db, { task_id: clean, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: [], questions: [] } });
   writeEvent(db, { task_id: risky, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: ["a real risk"], questions: [] } });
   writeEvent(db, { task_id: mechanical, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: [], questions: [], files: ["server/src/rows.ts"] } });
@@ -1016,14 +988,12 @@ test("autoMergeReady merges opted-in, green, clean-review, uncontested tasks wit
     return argv.includes("symbolic-ref") ? OK("main\n") : OK();
   });
   await autoMergeReady(db, { exec: git });
-  expect(getTask(db, clean).state).toBe("verifying"); // merged; waits for the director to accept it
-  expect(getTask(db, risky).state).toBe("in_review"); // risks → human review
-  // Mechanical change (hive-1559): its quiz is not judgment-class, so nothing is
-  // deferred into the post-ship backlog. A sensitive path still parks one there.
+  expect(getTask(db, clean).state).toBe("verifying"); // merged with no director
+  expect(getTask(db, risky).state).toBe("in_review"); // an unrefuted risk → the director's Ship
   expect(getTask(db, mechanical).state).toBe("verifying");
-  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_quiz_deferred'").get(mechanical)).toBeNull();
-  expect(getTask(db, sensitive).state).toBe("verifying");
-  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_quiz_deferred'").get(sensitive)).toBeTruthy();
+  // A migration is authority work: it waits for the director's own Ship.
+  expect(getTask(db, sensitive).state).toBe("in_review");
+  expect(directorHold(db, getTask(db, sensitive))).toBe("It changes migration code.");
 });
 
 // HIVE-407: risks and questions are suspicions until the per-risk check re-reads
@@ -1090,36 +1060,6 @@ test("autoMergeReady merges a caution whose risks were all refuted, and parks on
   expect(getTask(db, staleVerdicts).state).toBe("in_review"); // verdicts belong to an older head
 });
 
-test("autoMergeReady leaves a quiz-passed task for an explicit ship or request-changes choice, whatever surface passed it (HIVE-421)", async () => {
-  const { autoMergeReady } = await import("../src/reconciler.ts");
-  const { db, projectId } = freshDb({ auto_merge: { kinds: ["chore"] } });
-  const id = makeTask(db, projectId, { kind: "chore" });
-  transition(db, id, "in_progress");
-  transition(db, id, "in_review");
-  db.query("UPDATE tasks SET ci_status = 'passing', branch = 'hive/x' WHERE id = ?").run(id);
-  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
-    newId("evd"), id, now(), "log", "/tmp/e.log", "proof"
-  );
-  const review = writeEvent(db, {
-    task_id: id,
-    source: "agent",
-    type: "review_summary",
-    payload: { understanding: { check: { question: "safe?", options: [{ key: "yes", label: "yes" }, { key: "no", label: "no" }], answer_key: "yes" } } },
-  });
-  // No surface field: this is the review card / task page pass, which used to
-  // slip past the Focus-only guard and auto-merge on the next sweep.
-  writeEvent(db, {
-    task_id: id,
-    source: "director",
-    type: "understanding_quiz_passed",
-    payload: { review_event_id: review.id, answer_key: "yes" },
-  });
-  writeEvent(db, { task_id: id, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: [], questions: [] } });
-
-  await autoMergeReady(db, { exec: stub(() => { throw new Error("a passed quiz must not auto-merge"); }) });
-  expect(getTask(db, id).state).toBe("in_review");
-});
-
 test("autoMergeReady never auto-merges a PR-backed task on a review taken against an earlier head (HIVE-307)", async () => {
   const { autoMergeReady } = await import("../src/reconciler.ts");
   const { db, projectId } = freshDb({ auto_merge: { kinds: ["chore"] } });
@@ -1130,13 +1070,7 @@ test("autoMergeReady never auto-merges a PR-backed task on a review taken agains
   db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
     newId("evd"), id, now(), "log", "/tmp/e.log", "proof"
   );
-  const review = writeEvent(db, {
-    task_id: id,
-    source: "agent",
-    type: "review_summary",
-    payload: { understanding: { check: { question: "safe?", options: [{ key: "review", label: "yes" }], answer_key: "review" } } },
-  });
-  writeEvent(db, { task_id: id, source: "director", type: "understanding_quiz_passed", payload: { review_event_id: review.id, answer_key: "review" } });
+  writeEvent(db, { task_id: id, source: "agent", type: "review_summary", payload: { done: ["done"] } });
   // The review on file is against the OLD (pre-force-push) head.
   writeEvent(db, {
     task_id: id,
@@ -1164,13 +1098,7 @@ test("autoMergeReady holds a task while a queued-input recovery is in flight (#1
     db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
       newId("evd"), id, now(), "log", "/tmp/e.log", "proof"
     );
-    const review = writeEvent(db, {
-      task_id: id,
-      source: "agent",
-      type: "review_summary",
-      payload: { understanding: { check: { question: "safe?", options: [{ key: "review", label: "yes" }], answer_key: "review" } } },
-    });
-    writeEvent(db, { task_id: id, source: "director", type: "understanding_quiz_passed", payload: { review_event_id: review.id, answer_key: "review" } });
+    writeEvent(db, { task_id: id, source: "agent", type: "review_summary", payload: { done: ["done"] } });
     writeEvent(db, { task_id: id, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: [], questions: [] } });
     return id;
   };
@@ -1198,13 +1126,7 @@ test("autoMergeReady holds a task with work still queued for its agent", async (
   db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
     newId("evd"), id, now(), "log", "/tmp/e.log", "proof"
   );
-  const review = writeEvent(db, {
-    task_id: id,
-    source: "agent",
-    type: "review_summary",
-    payload: { understanding: { check: { question: "safe?", options: [{ key: "review", label: "yes" }], answer_key: "review" } } },
-  });
-  writeEvent(db, { task_id: id, source: "director", type: "understanding_quiz_passed", payload: { review_event_id: review.id, answer_key: "review" } });
+  writeEvent(db, { task_id: id, source: "agent", type: "review_summary", payload: { done: ["done"] } });
   writeEvent(db, { task_id: id, source: "system", type: "auto_review", payload: { verdict: "looks_good", summary: "s", risks: [], questions: [] } });
   queueSteerEvent(db, id, "Please address the requested follow-up before merging.", "agent turn complete");
 
@@ -1235,15 +1157,7 @@ test("autoMergeReady rechecks queued work at every destructive merge boundary", 
     db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
       newId("evd"), id, now(), "log", "/tmp/e.log", "proof"
     );
-    writeEvent(db, {
-      task_id: id,
-      source: "agent",
-      type: "review_summary",
-      payload: { understanding: { check: { question: "safe?", options: [{ key: "review", label: "yes" }, { key: "guess", label: "no" }], answer_key: "review" } } },
-    });
-    // No quiz pass: a passed quiz parks the task for an explicit Ship click
-    // (HIVE-421), and this test is about the pre-mutation recheck. An auto-ship
-    // kind defers the unanswered check instead.
+    writeEvent(db, { task_id: id, source: "agent", type: "review_summary", payload: { done: ["done"] } });
     writeEvent(db, {
       task_id: id,
       source: "system",
@@ -1297,79 +1211,6 @@ test("autoMergeReady rechecks queued work at every destructive merge boundary", 
     expect(getTask(db, id).state).toBe("in_review");
     expect(queuedSteers(db, id).length).toBe(1);
   }
-});
-
-test("autoAnswerStale answers timed-out normal-risk cards with the recommendation, never high-risk", async () => {
-  const { autoAnswerStale } = await import("../src/reconciler.ts");
-  const { db, projectId } = freshDb({ decision_auto_answer_hours: 4 });
-  const id = makeTask(db, projectId, {});
-  const mkDecision = (risk: string) => {
-    const did = newId("dec");
-    db.query(
-      "INSERT INTO decisions (id, task_id, ts, title, risk, options, status) VALUES (?,?,?,?,?,?, 'open')"
-    ).run(did, id, new Date(Date.now() - 5 * 3600_000).toISOString(), "t?", risk,
-      JSON.stringify([{ key: "go", label: "Go", recommended: true }, { key: "no", label: "No" }]));
-    return did;
-  };
-  const normal = mkDecision("normal");
-  const high = mkDecision("high");
-  // The live gap (HIVE-527): risk is free text, so an exact != 'high' test let
-  // a card whose risk was a whole sentence through the sweep.
-  const prose = mkDecision("high — if these keys are real, anyone with repo read access can use them");
-  const herdr = new Herdr(stub(() => OK()), "herdr");
-  autoAnswerStale(db, herdr, Date.now());
-  expect((db.query("SELECT status, answer_key FROM decisions WHERE id = ?").get(normal) as any).answer_key).toBe("go");
-  expect((db.query("SELECT status FROM decisions WHERE id = ?").get(high) as any).status).toBe("open");
-  expect((db.query("SELECT status FROM decisions WHERE id = ?").get(prose) as any).status).toBe("open");
-});
-
-test("autoAnswerStale escalates a timed-out high-risk card once instead of answering it", async () => {
-  const { autoAnswerStale } = await import("../src/reconciler.ts");
-  const { db, projectId } = freshDb({ decision_auto_answer_hours: 4 });
-  const id = makeTask(db, projectId, {});
-  const did = newId("dec");
-  db.query(
-    "INSERT INTO decisions (id, task_id, ts, title, risk, options, status) VALUES (?,?,?,?,'high',?, 'open')"
-  ).run(did, id, new Date(Date.now() - 5 * 3600_000).toISOString(), "rotate prod keys?",
-    JSON.stringify([{ key: "go", label: "Go", recommended: true }, { key: "no", label: "No" }]));
-  const herdr = new Herdr(stub(() => OK()), "herdr");
-  autoAnswerStale(db, herdr, Date.now());
-  autoAnswerStale(db, herdr, Date.now());
-  // Still open, and escalated exactly once — a 30s sweep must not re-push.
-  expect((db.query("SELECT status FROM decisions WHERE id = ?").get(did) as any).status).toBe("open");
-  expect(db.query("SELECT COUNT(*) n FROM events WHERE task_id = ? AND type = 'decision_escalated'").get(id) as any).toEqual({ n: 1 });
-  expect(db.query("SELECT COUNT(*) n FROM notifications WHERE decision_id = ? AND urgency = 'urgent'").get(did) as any).toEqual({ n: 1 });
-});
-
-test("autoAnswerStale skips options that need director-supplied input (flag or keyword), notifies once", async () => {
-  const { autoAnswerStale } = await import("../src/reconciler.ts");
-  const { db, projectId } = freshDb({ decision_auto_answer_hours: 4 });
-  const id = makeTask(db, projectId, {});
-  const stale = new Date(Date.now() - 5 * 3600_000).toISOString();
-  const mk = (opts: any[]) => {
-    const did = newId("dec");
-    db.query(
-      "INSERT INTO decisions (id, task_id, ts, title, risk, options, status) VALUES (?,?,?,?,'normal',?, 'open')"
-    ).run(did, id, stale, "creds?", JSON.stringify(opts));
-    return did;
-  };
-  // keyword signal: the incident's exact shape — recommended option asks for a token
-  const byKeyword = mk([
-    { key: "creds", label: "give me admin credentials", detail: "attach a token so I can authenticate", recommended: true },
-    { key: "skip", label: "Skip" },
-  ]);
-  // explicit flag signal
-  const byFlag = mk([
-    { key: "go", label: "Do it", recommended: true, requires_input: true },
-    { key: "no", label: "No" },
-  ]);
-  const herdr = new Herdr(stub(() => OK()), "herdr");
-  autoAnswerStale(db, herdr, Date.now());
-  expect((db.query("SELECT status, answer_key FROM decisions WHERE id = ?").get(byKeyword) as any).status).toBe("open");
-  expect((db.query("SELECT status FROM decisions WHERE id = ?").get(byFlag) as any).status).toBe("open");
-  // notified once per task, not every tick
-  autoAnswerStale(db, herdr, Date.now());
-  expect(db.query("SELECT COUNT(*) n FROM events WHERE task_id = ? AND type = 'auto_answer_skipped'").get(id) as any).toEqual({ n: 1 });
 });
 
 test("flagStale emits one stale event past the threshold, then stops", async () => {
@@ -1701,7 +1542,10 @@ test("advanceFinished: a scout with report evidence + idle agent -> in_review", 
 
   await reconcileOnce(db, { herdr: statusHerdr("idle"), exec: stub(() => ({ code: 1, stdout: "", stderr: "no gh" })) });
 
-  expect(getTask(db, id).state).toBe("in_review");
+  // Handed off to review, and a report is information rather than a change to
+  // approve, so hive accepts it in the same lap.
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'state_change' AND json_extract(payload, '$.to') = 'in_review'").get(id)).toBeTruthy();
+  expect(getTask(db, id).state).toBe("verifying");
 });
 
 test("reconciler backfills a requeue when its failed predecessor's PR is linked later", async () => {
@@ -2110,13 +1954,15 @@ test("autoMergeReady stops retrying a merge that is refused at the same head, an
   db.query("INSERT INTO evidence (id, task_id, ts, kind, path, caption) VALUES (?,?,?,?,?,?)").run(
     newId("evd"), id, now(), "log", "/tmp/e.log", "proof"
   );
-  // Sensitive path with no quiz submitted: judgment-class, so every merge
-  // attempt is refused with the same 409.
+  // Waiting on a dependency that has not merged: every merge attempt is
+  // refused with the same 409.
+  const dep = makeTask(db, projectId, { kind: "chore" });
+  db.query("UPDATE tasks SET depends_on = ? WHERE id = ?").run(JSON.stringify([dep]), id);
   writeEvent(db, {
     task_id: id,
     source: "system",
     type: "auto_review",
-    payload: { verdict: "looks_good", summary: "s", risks: [], questions: [], files: ["db/migrations/007.sql"] },
+    payload: { verdict: "looks_good", summary: "s", risks: [], questions: [], files: ["server/src/rows.ts"] },
   });
   const git: Exec = stub((argv) => {
     if (argv.includes("rev-parse")) return OK(argv.at(-1) === "main" ? "base-sha\n" : "branch-sha\n");

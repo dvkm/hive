@@ -715,9 +715,10 @@ export function stripDataText(cmd: string): string {
 function forcePushOwnBranch(cmd: string, env: Record<string, string | undefined>): boolean {
   const tid = env.HIVE_TASK_ID;
   if (!tid) return false;
-  const own = `hive/${tid}`;
+  const own = env.HIVE_BRANCH || `hive/${tid}`;
+  const named = new RegExp(`(^|[\\s:+'"])${own.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}($|[\\s:'"])`);
   const pushes = segments(cmd).filter((s) => /git\s+push\b/.test(s));
-  return pushes.length > 0 && pushes.every((s) => s.includes(own));
+  return pushes.length > 0 && pushes.every((s) => named.test(s));
 }
 
 // `docker rm` / `podman rm` remove containers, `git rm` stages recoverable

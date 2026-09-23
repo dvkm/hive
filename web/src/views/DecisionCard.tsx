@@ -65,14 +65,14 @@ export function MicButton({ onText }: { onText: (text: string) => void }) {
       title={listening ? "Stop dictating" : "Dictate the note"}
       onClick={toggle}
     >
-      {listening ? "◉ Listening…" : "🎤 Speak"}
+      {listening ? "Listening…" : "Speak"}
     </button>
   );
 }
 
 // One decision card: options (recommended first), risk/blast radius, autosaved
-// draft note, Submit. Shared by the Chief exchange, Needs you, and detailed
-// decision views so the card is answerable wherever it appears (product rule 3).
+// draft note, Submit. Shared by Home, the chat drawer and the task page so the
+// card is answerable wherever it appears (product rule 3).
 // `onDone` lets the host optimistically archive it after a submit.
 export function DecisionCard({ d, onDone }: { d: Decision; onDone: (id: string) => void }) {
   const recommended = d.options.find((o) => o.recommended);

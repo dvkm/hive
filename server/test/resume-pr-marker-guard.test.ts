@@ -50,7 +50,7 @@ test("dispatch is refused when the resume PR's marker names a different (or no) 
   const herdr = new Herdr(exec, "herdr");
   const r = await spawnAgent(db, herdr, taskId, { exec });
   expect(r.ok).toBe(false);
-  expect((r as any).error).toMatch(/no longer carries a hive-task marker/);
+  expect((r as any).error).toMatch(/is not on this task's \(or its parent's\) branch/);
 });
 
 test("dispatch proceeds when the resume PR's marker names this task", async () => {

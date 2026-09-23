@@ -636,64 +636,74 @@ async function parkBySilence(db: DB, taskId: string): Promise<void> {
 }
 const scoutsIn = (db: DB) => db.query("SELECT * FROM tasks WHERE source = 'recovery-scout'").all() as any[];
 
-test("the second park in a lineage spawns exactly one scout carrying both failed ids", async () => {
-  const { db, projectId } = freshDb();
+// A silent agent is retried first, so a lineage only parks once its retries ran
+// out: original → first retry → second retry, and the second retry goes silent.
+function lineageAtCap(db: DB, projectId: string): { orig: string; req1: string; req2: string } {
   const orig = makeTask(db, projectId);
   const req1 = makeTask(db, projectId, { source: "requeue", parent: orig, agent: "a1" });
+  const req2 = makeTask(db, projectId, { source: "requeue", parent: req1, agent: "a2" });
+  return { orig, req1, req2 };
+}
 
-  await parkBySilence(db, req1);
+test("the park at the retry cap spawns exactly one scout carrying every failed id", async () => {
+  const { db, projectId } = freshDb();
+  const { orig, req1, req2 } = lineageAtCap(db, projectId);
+
+  await parkBySilence(db, req2);
 
   const scouts = scoutsIn(db);
   expect(scouts).toHaveLength(1);
   expect(scouts[0].kind).toBe("scout");
   expect(scouts[0].state).toBe("queued");
   expect(scouts[0].title).toBe("Why does t keep failing?");
-  expect(scouts[0].brief).toContain(orig); // both attempts' ids are in the corpse
+  expect(scouts[0].brief).toContain(orig); // every attempt's id is in the corpse
   expect(scouts[0].brief).toContain(req1);
-  expect(scouts[0].brief).toContain("/wt/" + req1); // worktree path
-  expect(scouts[0].brief).toContain("herdr agent read a1"); // transcript location
+  expect(scouts[0].brief).toContain(req2);
+  expect(scouts[0].brief).toContain("/wt/" + req2); // worktree path
+  expect(scouts[0].brief).toContain("herdr agent read a2"); // transcript location
   expect(scouts[0].brief).toContain("recovery_nudge"); // the recovery timeline
   expect(scouts[0].brief).toContain("Report only");
   // marker lives on the ORIGINAL task, so later parks in the chain can find it
   const marker: any = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'scout_spawned'").get(orig);
   expect(JSON.parse(marker.payload).scout_task_id).toBe(scouts[0].id);
   // and the parked card points at it
-  const dec: any = db.query("SELECT * FROM decisions WHERE task_id = ?").get(req1);
+  const dec: any = db.query("SELECT * FROM decisions WHERE task_id = ?").get(req2);
   expect(dec.context).toContain(scouts[0].id);
 });
 
-test("a first park spawns no scout, and a third failure in the lineage spawns no second one", async () => {
+test("a silent first attempt is retried, not parked, and a later park in the lineage spawns no second scout", async () => {
   const { db, projectId } = freshDb();
   const lone = makeTask(db, projectId, { agent: "solo" });
   await parkBySilence(db, lone);
-  expect(scoutsIn(db)).toHaveLength(0); // one failure is not yet a pattern
+  expect(scoutsIn(db)).toHaveLength(0);
+  expect(db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'recovery_card'").get(lone)).toBeNull();
+  expect(db.query("SELECT 1 FROM tasks WHERE parent_task_id = ? AND source = 'requeue'").get(lone)).toBeTruthy();
 
-  const orig = makeTask(db, projectId);
-  const req1 = makeTask(db, projectId, { source: "requeue", parent: orig, agent: "a1" });
-  await parkBySilence(db, req1);
+  const { req2 } = lineageAtCap(db, projectId);
+  await parkBySilence(db, req2);
   expect(scoutsIn(db)).toHaveLength(1);
 
-  const req2 = makeTask(db, projectId, { source: "requeue", parent: req1, agent: "a2" });
-  await parkBySilence(db, req2);
+  // The director requeued it once more by hand, and it went silent again.
+  const req3 = makeTask(db, projectId, { source: "requeue", parent: req2, agent: "a3" });
+  await parkBySilence(db, req3);
   expect(scoutsIn(db)).toHaveLength(1); // still exactly one, for the whole lineage
   expect(db.query("SELECT 1 FROM events WHERE type = 'scout_spawned'").all()).toHaveLength(1);
 });
 
 test("a later park links the scout's report once the scout has written one", async () => {
   const { db, projectId } = freshDb();
-  const orig = makeTask(db, projectId);
-  const req1 = makeTask(db, projectId, { source: "requeue", parent: orig, agent: "a1" });
-  await parkBySilence(db, req1);
+  const { req2 } = lineageAtCap(db, projectId);
+  await parkBySilence(db, req2);
   const scout = scoutsIn(db)[0];
   db.query("INSERT INTO evidence (id, task_id, ts, kind, path, url, caption, meta) VALUES (?,?,?,?,?,?,?,?)")
     .run(newId("ev"), scout.id, now(), "report", "/tmp/report.md", `/evidence/${scout.id}/report.md`, "root cause", "{}");
 
-  const req2 = makeTask(db, projectId, { source: "requeue", parent: req1, agent: "a2" });
-  await parkBySilence(db, req2);
+  const req3 = makeTask(db, projectId, { source: "requeue", parent: req2, agent: "a3" });
+  await parkBySilence(db, req3);
 
-  const dec: any = db.query("SELECT * FROM decisions WHERE task_id = ?").get(req2);
+  const dec: any = db.query("SELECT * FROM decisions WHERE task_id = ?").get(req3);
   expect(dec.context).toContain(`/evidence/${scout.id}/report.md`);
-  const card: any = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'recovery_card'").get(req2);
+  const card: any = db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'recovery_card'").get(req3);
   expect(JSON.parse(card.payload).scout_report_url).toBe(`/evidence/${scout.id}/report.md`);
 });
 
@@ -878,7 +888,7 @@ test("undelivered nudges never trip the cap: three lost nudges still nudge, neve
   expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'recovery_card'").all(id).length).toBe(0);
 });
 
-test("silent past the nudge cap → fail + decision card", async () => {
+test("silent past the nudge cap → restarted like a dead agent: retried, no card for the director", async () => {
   const { db, projectId } = freshDb();
   const id = makeTask(db, projectId, { agent: "a4" });
   putEvent(db, id, "status", { note: "working" });
@@ -892,8 +902,24 @@ test("silent past the nudge cap → fail + decision card", async () => {
 
   expect(sends.length).toBe(0); // no more nudging
   expect(getTask(db, id).state).toBe("failed");
-  const card = db.query("SELECT * FROM events WHERE task_id = ? AND type = 'recovery_card'").all(id);
-  expect(card.length).toBe(1);
+  expect(db.query("SELECT * FROM events WHERE task_id = ? AND type = 'recovery_card'").all(id)).toHaveLength(0);
+  expect(db.query("SELECT 1 FROM tasks WHERE parent_task_id = ? AND source = 'requeue'").get(id)).toBeTruthy();
+});
+
+test("a busy-looking agent with no activity for twice the hung window is restarted", async () => {
+  const { db, projectId } = freshDb();
+  const id = makeTask(db, projectId, { agent: "a5" });
+  // inert's stale window is 1h, so the restart line is 8h of silence.
+  const long = new Date(Date.now() - 9 * 60 * 60 * 1000).toISOString();
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
+    .run(newId("ev"), id, long, "agent", "status", JSON.stringify({ note: "running the build" }));
+  putEvent(db, id, "stale", { silent_ms: 999 });
+  const { herdr } = herdrProbe("alive", "working");
+
+  await reconcileOnce(db, { ...inert, herdr });
+
+  expect(getTask(db, id).state).toBe("failed");
+  expect(db.query("SELECT 1 FROM tasks WHERE parent_task_id = ? AND source = 'requeue'").get(id)).toBeTruthy();
 });
 
 // ---- worktree reclaim at death-detection time ----

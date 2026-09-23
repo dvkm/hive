@@ -167,7 +167,11 @@ test("pending outbound work is visible before it is sent, so nobody re-submits i
     JSON.stringify({ direction: "outbound", text: "not sent yet", delivery: "queued" })
   );
   db.query("INSERT INTO evidence (id, task_id, ts, kind, path, url, caption, meta) VALUES (?,?,?,?,?,?,?,'{}')").run(
-    newId("ev"), jiraTask, now(), "report", "/tmp/r", "/evidence/x/r.md", "the report"
+    newId("ev"), jiraTask, now(), "report", "/tmp/r", "https://ci.example.com/r.md", "the report"
+  );
+  // hive's own evidence link never goes on a ticket, so it is never pending either.
+  db.query("INSERT INTO evidence (id, task_id, ts, kind, path, url, caption, meta) VALUES (?,?,?,?,?,?,?,'{}')").run(
+    newId("ev"), jiraTask, now(), "report", "/tmp/s", "/evidence/x/s.md", "a report hive serves"
   );
   const r = await get(`/api/tasks/${jiraTask}/jira`);
   expect(r.json.pending).toEqual({ comments: 1, receipts: 1, unknown: [] });

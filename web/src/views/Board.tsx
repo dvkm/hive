@@ -2,15 +2,12 @@ import { useEffect, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
 import { api } from "../lib/api";
 import { useStore } from "../lib/store";
-import type { AttentionBudget, DivergenceRow, Health, Kind, LandGraph, State, Task } from "../lib/api";
+import type { DivergenceRow, Health, Kind, LandGraph, State, Task } from "../lib/api";
 import { Attach, BlockedBy, CiBadge, Empty, HEALTH_LABEL, needsLook, PRIORITIES, PriorityChip, priorityRank, SidecarChip, STATE_LABEL, StatusDot, toast } from "../lib/ui";
 import { useRelTime } from "../lib/time";
 import { useProjectFilter, setProjectFilter } from "../lib/projectFilter";
-import { actionableItems, isJiraMirror, isTrackingOnly, orderFocusItems, trackedSubtasks } from "../lib/needsYou";
-import type { NeedsYouItem } from "../lib/needsYou";
+import { isJiraMirror, isTrackingOnly, mirrorStillWorking, trackedSubtasks } from "../lib/needsYou";
 import { taskLabel } from "../lib/references";
-import { intentSection } from "../lib/intent";
-import { Comb, HexTile, combCells } from "../lib/comb";
 
 // A compact "why this card needs attention" line: e.g. "agent gone" or
 // "no activity 22m". Server-provided reason + live-ticking since-age.
@@ -36,9 +33,11 @@ const COLUMNS: { state: State; label: string }[] = [
 
 // What still holds an in_review card, from the server's review gate. CI chips
 // already render in the card foot, so those two gates draw nothing extra here.
+// A `needs_you` card's hover is the server's own reason (review_hold) when it sent one.
 export const REVIEW_GATE_CHIP: Record<string, { label: string; title: string; className: string } | undefined> = {
-  needs_you: { label: "needs you", title: "The pre-review is done and nothing holds it: your turn.", className: "chip chip-kind" },
-  risk_confirmed: { label: "risk confirmed", title: "The risk check confirmed a finding on this commit; the agent has to clear it before this can merge.", className: "chip chip-error" },
+  needs_you: { label: "Needs you", title: "This one waits for your Ship.", className: "chip chip-yours" },
+  hive_merging: { label: "Hive is merging", title: "The checks passed and nothing needs you. Hive merges it on its own.", className: "chip" },
+  risk_confirmed: { label: "risk confirmed", title: "The risk check confirmed a finding on this commit. The agent has to clear it before this can merge.", className: "chip chip-error" },
   review_running: { label: "pre-review running", title: "Hive's pre-review has not finished on this commit yet.", className: "chip" },
   no_pr: { label: "no PR yet", title: "No pull request or report yet.", className: "chip" },
 };
@@ -62,11 +61,11 @@ const COL_EMPTY: Record<string, { title: string; hint: string }> = {
   },
   in_review: {
     title: "Nothing in review",
-    hint: "Agents land here once a PR is open. Each card says what still holds it; \"needs you\" means it is your turn.",
+    hint: "Agents land here once a PR is open. Each card says what still holds it.",
   },
   done: {
     title: "Nothing finished yet",
-    hint: "Tasks arrive once they're merged, verified, and carry evidence.",
+    hint: "Work shows up here once it is merged.",
   },
 };
 
@@ -110,6 +109,7 @@ export function Card({ task }: { task: Task }) {
   // "intent is still a draft" surviving the intent's acceptance) — the
   // deferred chip below, with the director's own note, is the true reason.
   const deferred = !!task.deferred_until && Date.parse(task.deferred_until) > Date.now();
+  const gateChip = task.review_gate ? REVIEW_GATE_CHIP[task.review_gate] : undefined;
 
   return (
     <Link to={`/tasks/${task.id}`} state={{ backgroundLocation: location }} className="card">
@@ -128,7 +128,7 @@ export function Card({ task }: { task: Task }) {
           // Intake triage read this request two ways and parked it on one
           // question. "queued" alone reads as "an agent will pick this up",
           // which is exactly wrong: nothing moves until the director answers.
-          <span className="chip chip-intake" title="Intake triage found more than one reading. Pick which one to build — nothing is built until you answer.">
+          <span className="chip chip-intake" title="Intake triage found more than one reading. Pick which one to build. Nothing is built until you answer.">
             awaiting one answer
           </span>
         ) : task.source === "intake_gchat" && !task.reviewed && (
@@ -143,7 +143,7 @@ export function Card({ task }: { task: Task }) {
         {trackingOnly && <span className="chip">{STATE_LABEL[task.state]}</span>}
         {task.state === "queued" && spawnError[task.id] && (
           <span className="chip chip-error" title="A previous spawn failed; see the task timeline">
-            ⚠ spawn failed
+            spawn failed
           </span>
         )}
         {task.state === "queued" && task.overlap_hold && (
@@ -172,9 +172,9 @@ export function Card({ task }: { task: Task }) {
         {/* The column holds every task in review; the chip says whether it is
             the director's turn or what still holds it (a confirmed risk sat
             under "Ready to Merge" before this). */}
-        {task.state === "in_review" && !trackingOnly && task.review_gate && REVIEW_GATE_CHIP[task.review_gate] && (
-          <span className={REVIEW_GATE_CHIP[task.review_gate]!.className} title={REVIEW_GATE_CHIP[task.review_gate]!.title}>
-            {REVIEW_GATE_CHIP[task.review_gate]!.label}
+        {task.state === "in_review" && !trackingOnly && gateChip && (
+          <span className={gateChip.className} title={(task.review_gate === "needs_you" && task.review_hold) || gateChip.title}>
+            {gateChip.label}
           </span>
         )}
         <BlockedBy depends_on={task.depends_on} tasks={tasks} />
@@ -228,8 +228,8 @@ export function Card({ task }: { task: Task }) {
   );
 }
 
-// ---- land queue (task #1257) --------------------------------------------
-// Tick the PRs you want landed, hit the button once, and hive merges them in
+// ---- merge queue (task #1257) --------------------------------------------
+// Tick the PRs you want merged, hit the button once, and hive merges them in
 // graph order: declared dependencies first, and never two conflicting branches
 // in the same sweep. The chips say why a card will wait.
 function useLandGraph(signature: string, project: string): LandGraph {
@@ -252,17 +252,17 @@ export function LandChips({ task, graph, tasks }: { task: Task; graph: LandGraph
   const clash = conflicts.map((e) => ({ ...e, peer: e.from === task.id ? e.to : e.from }));
   return (
     <div className="card-meta card-land">
-      {task.land_queued_at && <span className="chip chip-land" title="Approved to land; waiting for its turn in the queue">⏳ queued to land</span>}
+      {task.land_queued_at && <span className="chip chip-land" title="Approved to merge. It waits for its turn.">queued to merge</span>}
       {after.length > 0 && (
-        <span className="chip chip-blocked" title="Declared dependency: this lands only after those have merged">
-          lands after {after.join(", ")}
+        <span className="chip chip-blocked" title="Declared dependency: this merges only after those have merged">
+          merges after {after.join(", ")}
         </span>
       )}
       {clash.length > 0 && (
         <span
           className="chip chip-blocked"
           title={clash
-            .map((e) => `Both PRs change ${(e.files ?? []).join(", ") || "the same files"} — read them together before landing (${name(e.peer)})`)
+            .map((e) => `Both PRs change ${(e.files ?? []).join(", ") || "the same files"}. Read them together before merging (${name(e.peer)}).`)
             .join("\n")}
         >
           conflicts with {clash.map((e) => name(e.peer)).join(", ")}
@@ -324,359 +324,14 @@ export function DivergenceChips({ task, rows, tasks }: { task: Task; rows: Diver
   );
 }
 
-// ONE rendering of "what needs you" on this page. It used to be three: a
-// dismissible brief banner, a Needs attention tray, and the cards themselves,
-// so the same fact was read three times before any work was visible
-// (HIVE-556). The number and the set come from lib/needsYou.ts, the same
-// source as the nav badge, so the two can never disagree.
-//
-// Nothing is hidden: the strip links to /inbox, where every one of these items
-// has its full card and its buttons.
-const STRIP_LABELS: Record<string, [string, string]> = {
-  decision: ["decision", "decisions"],
-  intent: ["intent to accept", "intents to accept"],
-  checkpoint: ["checkpoint", "checkpoints"],
-  quiz_digest: ["catch-up", "catch-ups"],
-  review: ["to review", "to review"],
-  attention: ["issue", "issues"],
-};
-
-export function NeedsYouStrip() {
-  const { needsYou, tasks } = useStore();
-  const projectFilter = useProjectFilter();
-  const items = actionableItems(needsYou, tasks, projectFilter);
-  if (items.length === 0) return null;
-  const parts = Object.entries(STRIP_LABELS).flatMap(([kind, [one, many]]) => {
-    const n = items.filter((item) => item.kind === kind).length;
-    return n > 0 ? [`${n} ${n === 1 ? one : many}`] : [];
-  });
-  return (
-    <Link to="/inbox" className="needs-you-strip">
-      <span className="needs-you-strip-count">{items.length}</span>
-      <span className="needs-you-strip-text">
-        needs you<span className="needs-you-strip-parts"> · {parts.join(" · ")}</span>
-      </span>
-      <span className="needs-you-strip-go">Open →</span>
-    </Link>
-  );
-}
-
-// ---- attention-first work view (HIVE-356) -------------------------------
-// The board's default. Four of the five kanban columns were status, not action:
-// Queued, Working, Ready to merge and Done all say what the machine is doing,
-// and only one of them ever needs the director. So the page leads with the
-// things that need him, in the order hive would hand them over, and collapses
-// everything the agents are handling to one line each.
-//
-// The needs-you set and its order are NOT redefined here: actionableItems() and
-// orderFocusItems() (lib/needsYou.ts) are the same functions behind the nav
-// badge and the inbox, so the number on this page cannot disagree with them.
-// The old columns are still one click away under View.
-
-// Where a row goes when it's clicked, and the one line it says. Everything an
-// item needs to be worth ten seconds: what kind of ask it is, which task, and
-// what it wants.
-function focusRow(item: NeedsYouItem): { kind: string; to: string; label: string; detail: string; ts: string } {
-  const label = (task: Task) => `${taskLabel(task)} ${task.title}`;
-  switch (item.kind) {
-    case "intent":
-      return {
-        kind: "Intent",
-        to: item.intent.task_id ? `/tasks/${item.intent.task_id}` : "/inbox",
-        label: intentSection(item.intent.body_md, "Problem").split("\n")[0] || "Untitled ask",
-        detail: "Accept this ask before the work starts",
-        ts: item.intent.updated_at,
-      };
-    case "decision":
-      return {
-        kind: "Decision",
-        to: `/tasks/${item.decision.task_id}#dcard-${item.decision.id}`,
-        label: item.decision.title,
-        detail: "Waiting on your answer",
-        ts: item.decision.ts,
-      };
-    case "checkpoint":
-      return {
-        kind: "Checkpoint",
-        to: `/tasks/${item.checkpoint.task_id}`,
-        label: item.checkpoint.task_title,
-        detail: item.checkpoint.note,
-        ts: item.checkpoint.ts,
-      };
-    case "quiz_digest":
-      return {
-        kind: "Catch up",
-        to: "/inbox",
-        label: `${item.quizzes.length} shipped ${item.quizzes.length === 1 ? "change" : "changes"}`,
-        detail: "Read what shipped, one at a time",
-        ts: item.quizzes[0]?.ts ?? "",
-      };
-    case "review":
-      return {
-        kind: "Review",
-        to: `/tasks/${item.task.id}`,
-        label: label(item.task),
-        detail: item.task.ci_status === "passing" ? "Tests green — yours to merge" : "Ready for your review",
-        ts: item.task.needs_you_since ?? item.task.updated_at,
-      };
-    // hive stops here and never closes a task itself (HIVE-604), so this row is
-    // the whole handover: what landed, what checked out, and Accept to close it.
-    case "verify":
-      return {
-        kind: "Verify",
-        to: `/tasks/${item.task.id}`,
-        label: label(item.task),
-        detail: prNumber(item.task.pr_url)
-          ? `Merged #${prNumber(item.task.pr_url)}${item.task.ci_status === "passing" ? ", tests green" : ""} — check it, then accept`
-          : "Landed — check it, then accept",
-        ts: item.task.needs_you_since ?? item.task.updated_at,
-      };
-    default:
-      return {
-        kind: "Issue",
-        to: `/tasks/${item.task.id}`,
-        label: label(item.task),
-        detail: item.task.health?.reason || (item.task.state === "failed" ? "Failed — needs routing" : "Needs a look"),
-        ts: item.task.health?.since ?? item.task.needs_you_since ?? item.task.updated_at,
-      };
-  }
-}
-
-function prNumber(prUrl: string | null): string {
-  return String(prUrl ?? "").match(/\/pull\/(\d+)/)?.[1] ?? "";
-}
-
-// The one action a verify row needs: the director has looked, so close it.
-// This is the ONLY way a task reaches done — nothing in hive moves it there.
-function AcceptButton({ task }: { task: Task }) {
-  const [busy, setBusy] = useState(false);
-  const accept = async (e: React.MouseEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setBusy(true);
-    try {
-      await api.transition(task.id, "done", "verified by the director");
-      toast(`${taskLabel(task)} accepted`);
-    } catch (err) {
-      toast((err as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  };
-  return (
-    <button className="btn btn-primary focus-accept" onClick={accept} disabled={busy} title="Mark this verified and close it">
-      {busy ? "…" : "Accept"}
-    </button>
-  );
-}
-
-function FocusRow({ item }: { item: NeedsYouItem }) {
-  const location = useLocation();
-  const row = focusRow(item);
-  const age = useRelTime(row.ts);
-  // Only /tasks/:id has a modal route (App.tsx). Handing backgroundLocation to
-  // any other path keeps the board rendered underneath and nothing on top, so
-  // the click looks like it did nothing.
-  const modal = row.to.startsWith("/tasks/");
-  const link = (
-    <Link className="focus-row" to={row.to} state={modal ? { backgroundLocation: location } : undefined}>
-      <span className={`focus-kind focus-kind-${row.kind.toLowerCase().replace(" ", "-")}`}>{row.kind}</span>
-      <span className="focus-label">{row.label}</span>
-      <span className="focus-detail">{row.detail}</span>
-      <span className="focus-age">{age}</span>
-    </Link>
-  );
-  // A button inside an <a> is not valid HTML, so the accept action sits beside
-  // the row rather than inside it.
-  if (item.kind !== "verify") return link;
-  return (
-    <div className="focus-row-wrap">
-      {link}
-      <AcceptButton task={item.task} />
-    </div>
-  );
-}
-
-// One line for one task an agent is on. No chips, no buttons: this half of the
-// page exists to be skipped, not read.
-function StatusRow({ task }: { task: Task }) {
-  const location = useLocation();
-  const { lastActivity } = useStore();
-  const age = useRelTime(task.health?.since || lastActivity[task.id] || task.updated_at);
-  return (
-    <Link className="status-row" to={`/tasks/${task.id}`} state={{ backgroundLocation: location }}>
-      <StatusDot state={task.state} health={task.health} />
-      <span className="status-row-id">{taskLabel(task)}</span>
-      <span className="status-row-title">{task.title}</span>
-      <span className="status-row-state">{STATE_LABEL[task.state]}</span>
-      <span className="status-row-age">{age}</span>
-    </Link>
-  );
-}
-
-// Over budget: more is waiting on the director than one person tracks, so hive
-// has stopped ADDING optional work. It never stops or throttles what is already
-// running — the point is that supply stops outrunning the human, not that the
-// fleet gets smaller.
-//
-// The banner also says WHAT is being held, and that it is held rather than
-// dropped. A board that is quiet because nothing needs you and a board that is
-// quiet because hive is sitting on things look identical, and only one of them
-// means you can stop reading. Nothing is ever taken out of the count to make
-// the number look better: the pause holds supply, never display.
-// `held` is optional on purpose: an older server answers /api/attention without
-// it, and a missing field must not take the whole board down with it.
-export function heldLine(held?: { scouts: number; watchers: number }): string {
-  const parts = [
-    (held?.scouts ?? 0) > 0 ? `${held!.scouts} scout${held!.scouts === 1 ? "" : "s"}` : "",
-    (held?.watchers ?? 0) > 0 ? `${held!.watchers} watched change${held!.watchers === 1 ? "" : "s"}` : "",
-  ].filter(Boolean);
-  if (!parts.length) return "Nothing is being held yet.";
-  return `Holding ${parts.join(" and ")} — nothing is dropped, they are filed once you are back under.`;
-}
-
-export function AttentionBudgetBanner({ count }: { count: number }) {
-  const [budget, setBudget] = useState<AttentionBudget | null>(null);
-  useEffect(() => {
-    let live = true;
-    api.attention().then((b) => live && setBudget(b)).catch(() => {});
-    return () => { live = false; };
-  }, [count]);
-  if (!budget || budget.threshold <= 0 || count <= budget.threshold) return null;
-  return (
-    <div className="attn-budget" role="status">
-      <strong>{count} things need you.</strong>{" "}
-      That is over your budget of {budget.threshold}.
-      {budget.paused.length > 0 && ` Hive paused ${budget.paused.join(" and ")}; nothing already running was stopped.`}
-      {(budget.held?.scouts ?? 0) + (budget.held?.watchers ?? 0) > 0 && ` ${heldLine(budget.held)}`}
-    </div>
-  );
-}
-
-type BoardView = "focus" | "columns" | "tracked";
+type BoardView = "columns" | "tracked";
 const VIEW_KEY = "hive.board.view";
-const readView = (): BoardView => {
-  const saved = localStorage.getItem(VIEW_KEY);
-  return saved === "columns" || saved === "tracked" ? saved : "focus";
-};
-
-// The now strip: three counts in hexagons and today's comb, one cell per task
-// drawn as the honey lifecycle (lib/comb.tsx). Work passes its scoped tasks;
-// Home reads the store itself.
-export function NowStrip({ visible }: { visible?: Task[] }) {
-  const { needsYou, tasks } = useStore();
-  const projectFilter = useProjectFilter();
-  const scoped = visible ?? (projectFilter ? tasks.filter((t) => t.project_id === projectFilter) : tasks);
-  const live = scoped.filter((task) => !isTrackingOnly(task));
-  const needs = actionableItems(needsYou, tasks, projectFilter).length;
-  const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
-  const today = (task: Task) => Date.parse(task.updated_at) >= dayAgo;
-  const count = (state: State) => live.filter((task) => task.state === state).length;
-  const running = count("in_progress") + count("in_review");
-  const landed = live.filter((task) => task.state === "done" && today(task)).length;
-  const failed = live.filter((task) => task.state === "failed" && today(task)).length;
-  const queued = count("queued");
-  const cells = combCells({
-    capped: landed,
-    full: count("verifying"),
-    question: count("needs_decision"),
-    filling: count("in_review"),
-    bee: count("in_progress"),
-    cracked: failed,
-    empty: queued,
-  });
-  return (
-    <div className="now-strip">
-      <div className="now-tiles">
-        <HexTile n={needs} label="need you" tone={needs ? "amber" : "muted"} />
-        <HexTile n={running} label="running" tone={running ? "blue" : "muted"} />
-        <HexTile n={failed} label="failed" tone={failed ? "red" : "muted"} />
-      </div>
-      {cells.length > 0 && (
-        <>
-          <div className="now-divider" />
-          <div className="now-comb">
-            <Comb cells={cells} size={28} label={`${landed} landed, ${running} running, ${queued} queued`} />
-            <span>
-              Today's comb · {landed} capped · {running} in flight · {queued} empty
-            </span>
-          </div>
-        </>
-      )}
-    </div>
-  );
-}
-
-export function WorkFocus({ visible }: { visible: Task[] }) {
-  const { needsYou, tasks } = useStore();
-  const projectFilter = useProjectFilter();
-  const items = orderFocusItems(actionableItems(needsYou, tasks, projectFilter), tasks);
-  // What agents are actually on. Queued work is not being handled by anyone, so
-  // it is a single count, not thirty rows. `verifying` left this lane with
-  // HIVE-604: nothing is handling it, it is waiting on the director, and it is
-  // already a needs-you row above.
-  const handling = visible.filter((task) => !isTrackingOnly(task) && task.state === "in_progress");
-  // In review but not yours yet: CI still running, review pass not finished.
-  // Visible, deliberately not counted — the actionable ones are already above.
-  const pending = visible.filter(
-    (task) => !isTrackingOnly(task) && task.state === "in_review" && !items.some((item) => "task" in item && item.task.id === task.id)
-  );
-  const queued = visible.filter((task) => !isTrackingOnly(task) && task.state === "queued").length;
-  // Today's finished work, not hive's lifetime total: 1300-odd done tasks is a
-  // fact about the database, not about this morning.
-  const dayAgo = Date.now() - 24 * 60 * 60 * 1000;
-  const done = visible.filter(
-    (task) => !isTrackingOnly(task) && task.state === "done" && Date.parse(task.updated_at) >= dayAgo
-  ).length;
-
-  return (
-    <div className="work-focus">
-      <AttentionBudgetBanner count={items.length} />
-      <NowStrip visible={visible} />
-      <section className="focus-lane">
-        <header className="focus-lane-head">
-          <h2>Needs you</h2>
-          <span className="focus-lane-count">{items.length}</span>
-          {items.length > 0 && <Link className="focus-lane-go" to="/inbox">Work through them →</Link>}
-        </header>
-        {items.length === 0 ? (
-          <Empty
-            compact
-            title="Nothing needs you."
-            hint="Agents park here when they hit a call only you can make, or a branch is ready to merge."
-          />
-        ) : (
-          <div className="focus-rows">
-            {items.map((item) => <FocusRow key={`${item.kind}:${item.id}`} item={item} />)}
-          </div>
-        )}
-      </section>
-
-      <section className="status-lane">
-        <header className="status-lane-head">
-          <h2>Hive is handling</h2>
-          <span className="status-lane-counts">
-            {queued} queued · {handling.length + pending.length} in flight · {done} done today
-          </span>
-        </header>
-        {handling.length + pending.length === 0 ? (
-          <div className="muted status-lane-empty">No agents working right now.</div>
-        ) : (
-          <div className="status-rows">
-            {[...handling, ...pending].map((task) => <StatusRow key={task.id} task={task} />)}
-          </div>
-        )}
-      </section>
-    </div>
-  );
-}
+const readView = (): BoardView => (localStorage.getItem(VIEW_KEY) === "tracked" ? "tracked" : "columns");
 
 export default function Board() {
   const { tasks, projects } = useStore();
   const [adding, setAdding] = useState(false);
-  // Attention-first by default (HIVE-356). The five columns are still here for
-  // anyone who wants them; the choice sticks so the board opens the way it was
-  // left.
+  // The choice sticks so the board opens the way it was left.
   const [view, setView] = useState<BoardView>(readView);
   const chooseView = (next: BoardView) => {
     setView(next);
@@ -696,13 +351,14 @@ export default function Board() {
     ? scoped.filter((task) => matches(task) || (isTrackingOnly(task) && trackedSubtasks(task, scoped).some(matches)))
     : scoped;
   const byState = (s: State) => {
-    let list = visible.filter((t) => !isTrackingOnly(t) && t.state === s);
+    // Merged work is finished from the director's side, so `verifying` sits in
+    // Done: hive closes it without the director.
+    let list = visible.filter((t) => !isTrackingOnly(t) && (t.state === s || (s === "done" && t.state === "verifying")));
     // list is already newest-updated first from the API / SSE upserts.
     if (s === "queued") list = queueOrder(list);
     if (s === "done") list = list.slice(0, 10);
     return list;
   };
-  const verifying = visible.filter((task) => !isTrackingOnly(task) && task.state === "verifying");
   // Refetch the ordering graph whenever the review column changes: an edge is
   // only meaningful between two PRs that are both still open.
   const reviewIds = visible.filter((t) => t.state === "in_review").map((t) => t.id).sort().join(",");
@@ -720,18 +376,17 @@ export default function Board() {
     try {
       const { changed } = await api.landQueue(landSel);
       setLandSel([]);
-      toast(`${changed.length} queued to land`);
+      toast(`${changed.length} queued to merge`);
     } catch (err) {
       toast((err as Error).message);
     }
   };
-  const tracked = visible.filter((task) => isTrackingOnly(task) && BOARD_STATES.has(task.state));
+  // One card per ticket: while a Jira mirror's work is live, the work task's
+  // card is the one to act on.
+  const tracked = visible.filter((task) => isTrackingOnly(task) && BOARD_STATES.has(task.state) && !mirrorStillWorking(task, tasks));
 
   return (
     <div className="board-wrap">
-      {/* The focus view leads with the same items in full, so the strip would
-          say the same thing twice. */}
-      {view !== "focus" && <NeedsYouStrip />}
       <div className="board-switch">
         <span className="board-switch-label">Project</span>
         <button className={`board-chip ${projectFilter ? "" : "board-chip-on"}`} onClick={() => setFilter("")}>
@@ -747,7 +402,6 @@ export default function Board() {
           </button>
         ))}
         <span className="board-switch-label board-view-label">View</span>
-        <button className={`board-chip ${view === "focus" ? "board-chip-on" : ""}`} onClick={() => chooseView("focus")}>Focus</button>
         <button className={`board-chip ${view === "columns" ? "board-chip-on" : ""}`} onClick={() => chooseView("columns")}>Columns</button>
         <button className={`board-chip ${view === "tracked" ? "board-chip-on" : ""}`} onClick={() => chooseView("tracked")}>Tracked {tracked.length}</button>
         <input
@@ -763,22 +417,8 @@ export default function Board() {
           }}
         />
       </div>
-      {view === "focus" ? (
-        <WorkFocus visible={visible} />
-      ) : view === "columns" ? (
+      {view === "columns" ? (
         <>
-          {verifying.length > 0 && (
-            <section className="verification-strip" aria-label="Waiting for you to verify">
-              <span className="verification-title">Waiting for you to verify</span>
-              {verifying.map((task) => (
-                <Link className="verification-item" to={`/tasks/${task.id}`} key={task.id}>
-                  <StatusDot state={task.state} health={task.health} />
-                  <span>{taskLabel(task)}</span>
-                  <span className="verification-task-title">{task.title}</span>
-                </Link>
-              ))}
-            </section>
-          )}
           <div className="board">
           {COLUMNS.map(({ state, label }) => {
             const list = byState(state);
@@ -800,7 +440,7 @@ export default function Board() {
                     )}
                     {state === "in_review" && landSel.length > 0 && (
                       <button className="btn btn-primary btn-new" onClick={queueLand} title="Hive merges these in dependency order, one conflicting branch at a time">
-                        Land {landSel.length}
+                        Merge {landSel.length}
                       </button>
                     )}
                     <span className="col-count">{list.length}</span>
@@ -810,7 +450,7 @@ export default function Board() {
                   {list.map((t) =>
                     state === "in_review" ? (
                       <div className="land-row" key={t.id}>
-                        <label className="land-pick" title="Select for the land queue">
+                        <label className="land-pick" title="Select to merge">
                           <input type="checkbox" checked={landSel.includes(t.id)} onChange={() => toggleLand(t.id)} />
                         </label>
                         <div className="land-card">
@@ -887,7 +527,7 @@ export function NewTaskModal({ onClose }: { onClose: () => void }) {
     try {
       if (mode === "braindump") {
         await api.intake({ project_id: project, text: dump.trim() });
-        toast("Braindump sent — Claude is drafting a breakdown for you to approve");
+        toast("Braindump sent. Claude is drafting a breakdown for you to approve.");
       } else {
         await api.createTask(
           { project_id: project, title: title.trim(), brief: brief.trim() || undefined, kind, priority },

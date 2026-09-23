@@ -195,21 +195,61 @@ function requestText(db: DB, intent: Intent, anchor: any): IntentSourceText | nu
   return null;
 }
 
-// Drafts nobody has looked into yet. One investigation per intent, ever: the
-// `intent_investigated` event is the ledger, and a failed run writes it too, so
-// a broken model call never retries every minute.
+export function investigatorOn(): boolean {
+  return process.env.HIVE_INTENT_INVESTIGATE !== "0";
+}
+
+// The mirror task a Jira ask belongs to, where the ticket's comments live.
+export function mirrorOf(db: DB, intent: Intent): { id: string } | null {
+  if (intent.source !== "jira" || !intent.source_ref) return null;
+  return (
+    (db
+      .query("SELECT id FROM tasks WHERE project_id = ? AND jira_key = ? AND jira_link_kind = 'mirror' LIMIT 1")
+      .get(intent.project_id, intent.source_ref) as { id: string } | undefined) ?? null
+  );
+}
+
+// When hive asked the ticket's reporter about this ask (advisor.ts), or null.
+export function askedReporterAt(db: DB, intentId: string): string | null {
+  const row = db
+    .query("SELECT ts FROM events WHERE type = 'asked_reporter' AND json_extract(payload, '$.intent_id') = ? ORDER BY ts DESC LIMIT 1")
+    .get(intentId) as { ts: string } | undefined;
+  return row?.ts ?? null;
+}
+
+// The reporter's first comment on the ticket after hive asked, or null.
+export function reporterReplyAt(db: DB, intent: Intent): string | null {
+  const asked = askedReporterAt(db, intent.id);
+  const mirror = asked ? mirrorOf(db, intent) : null;
+  if (!asked || !mirror) return null;
+  const row = db
+    .query(
+      `SELECT ts FROM events WHERE task_id = ? AND type = 'jira_comment'
+         AND json_extract(payload, '$.direction') = 'inbound' AND ts > ? ORDER BY ts LIMIT 1`
+    )
+    .get(mirror.id, asked) as { ts: string } | undefined;
+  return row?.ts ?? null;
+}
+
+// Does this draft need a (fresh) read of the code? Once when it arrives, and
+// once more after the reporter answers the questions hive asked on the ticket.
+// The `intent_investigated` event is the ledger, and a failed run writes it
+// too, so a broken model call never retries every minute.
+export function investigationDue(db: DB, intent: Intent): boolean {
+  if (intent.status !== "draft" || !["jira", "director"].includes(intent.source) || !anchorTask(db, intent)) return false;
+  const last = db
+    .query("SELECT ts FROM events WHERE type = 'intent_investigated' AND json_extract(payload, '$.intent_id') = ? ORDER BY ts DESC LIMIT 1")
+    .get(intent.id) as { ts: string } | undefined;
+  if (!last) return true;
+  const replied = reporterReplyAt(db, intent);
+  return !!replied && replied > last.ts;
+}
+
 export function pendingInvestigations(db: DB, limit: number): Intent[] {
   const rows = db
-    .query(
-      `SELECT i.* FROM intents i
-        WHERE i.status = 'draft' AND i.source IN ('jira', 'director')
-          AND NOT EXISTS (
-            SELECT 1 FROM events e
-             WHERE e.type = 'intent_investigated' AND json_extract(e.payload, '$.intent_id') = i.id)
-        ORDER BY i.created_at LIMIT 50`
-    )
+    .query(`SELECT i.* FROM intents i WHERE i.status = 'draft' AND i.source IN ('jira', 'director') ORDER BY i.created_at LIMIT 200`)
     .all() as Intent[];
-  return rows.filter((intent) => anchorTask(db, intent)).slice(0, limit);
+  return rows.filter((intent) => investigationDue(db, intent)).slice(0, limit);
 }
 
 async function investigateIntent(db: DB, intent: Intent, deps: InvestigatorDeps): Promise<void> {

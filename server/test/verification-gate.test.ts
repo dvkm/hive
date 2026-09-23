@@ -117,10 +117,8 @@ test("evidence from before the newest commit is stale and rejected", async () =>
 
 test("the agent's own `ready` emit is gated the same way", async () => {
   const id = await workingTask();
-  // No PR: the emit path's CI and explanation gates step aside. This task also
-  // owes an understanding check and has filed none, so it trips both gates —
-  // and the unmet contract is the one it must hear about (HIVE-580 stands
-  // aside for it), not the quiz.
+  // No PR: the emit path's CI and explanation gates step aside, so the unmet
+  // contract is the refusal the agent hears.
   db.query("UPDATE tasks SET pr_url = NULL WHERE id = ?").run(id);
   attach(id, "unit");
   const res = await post(`/api/tasks/${id}/events`, { type: "ready", note: "handing off" });
@@ -176,25 +174,6 @@ async function inReviewTask(kind: string, projectConfig: unknown): Promise<strin
   transition(db, id, "in_progress", { source: "director" });
   transition(db, id, "in_review", { source: "director", skipVerification: true });
   db.query("UPDATE tasks SET ci_status = 'passing', branch = 'hive/x' WHERE id = ?").run(id);
-  // A kind outside auto_merge.kinds needs a passed understanding check before
-  // merge, which is a separate gate — satisfy it so these tests observe the
-  // verification contract alone.
-  const review = writeEvent(db, {
-    task_id: id,
-    source: "agent",
-    type: "review_summary",
-    payload: {
-      understanding: {
-        check: { question: "Safe?", options: [{ key: "a", label: "Yes" }, { key: "b", label: "No" }], answer_key: "a" },
-      },
-    },
-  });
-  writeEvent(db, {
-    task_id: id,
-    source: "director",
-    type: "understanding_quiz_passed",
-    payload: { review_event_id: review.id, answer_key: "a" },
-  });
   return id;
 }
 

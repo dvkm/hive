@@ -12,12 +12,8 @@ import { eventText, isFailureEvent } from "../lib/eventText";
 import { CheckpointList } from "./Checkpoints";
 import { DecisionCard } from "./DecisionCard";
 import { ReportView } from "./ReportView";
-import { UnderstandingQuiz } from "./UnderstandingQuiz";
-import { PrReference, TaskRef, TaskReference, prLabel, taskLabel } from "../lib/references";
+import { PrReference, TaskReference, prLabel, taskLabel } from "../lib/references";
 import { oneLine, whyItWasNeeded, withoutPromoted } from "../lib/reviewFocus";
-import { intentSection } from "../lib/intent";
-import { isJiraMirror } from "../lib/needsYou";
-import { RequestChanges } from "./RequestChanges";
 
 // Staleness marker: captured-at time always shows; the commit SHA (recorded
 // by the CLI from the agent's worktree at capture time) compares against the
@@ -499,19 +495,13 @@ export function explainStateOf(evidence: Evidence[], events: Event[], headSha: s
 // reason it was needed. The diff-stat and the before/after table that used to
 // sit here were engineer readouts (the table fired on 1.4% of review lines);
 // counts live in the trail now.
-function ReviewFocus({ changed, why, changedLabel = "What changed", asked }: { changed: string; why: string; changedLabel?: string; asked?: string }) {
-  if (!changed && !why && !asked) return null;
+function ReviewFocus({ changed, why }: { changed: string; why: string }) {
+  if (!changed && !why) return null;
   return (
     <div className="review-focus">
-      {asked && (
-        <div className="focus-block">
-          <span className="focus-eyebrow">What was asked</span>
-          <p className="focus-lead">{asked}</p>
-        </div>
-      )}
       {changed && (
         <div className="focus-block">
-          <span className="focus-eyebrow">{changedLabel}</span>
+          <span className="focus-eyebrow">What changed</span>
           <p className="focus-lead">{changed}</p>
         </div>
       )}
@@ -632,33 +622,6 @@ function DiffFileView({ f, wrap }: { f: DiffFile; wrap: boolean }) {
 
 type ActionMode = null | "changes" | "reject";
 
-// Approved-to-land, then understood. The mark was made BEFORE the director knew
-// what the change does, so the queue stops and asks rather than merging on the
-// next sweep (HIVE-421). "Land now" re-marks it, which puts the approval after
-// the quiz again; "Unmark" takes it out of the queue. Either tap sets landActed,
-// so the hold clears on the tap itself, because the task prop and the events
-// still carry the pre-tap state until the refetch lands.
-export function isLandHeld(o: {
-  landActed: boolean;
-  landQueuedAt?: string | null;
-  quizStatus: string;
-  passedThisSession: boolean;
-  events: Event[];
-  reviewEventId: string | null;
-}): boolean {
-  if (o.landActed || !o.landQueuedAt || o.quizStatus !== "passed") return false;
-  if (o.passedThisSession) return true;
-  const lastIndexOf = (match: (e: Event) => boolean) => {
-    for (let i = o.events.length - 1; i >= 0; i--) if (match(o.events[i])) return i;
-    return -1;
-  };
-  return (
-    lastIndexOf((e) => e.type === "understanding_quiz_passed" && e.payload.review_event_id === o.reviewEventId) >
-    lastIndexOf((e) => e.type === "land_queued")
-  );
-}
-
-
 // ---------------------------------------------------------------- preview
 // A running copy of the branch, so UI work is verified by LOOKING at it instead
 // of by reading a diff or waiting for staging (HIVE-629). Renders nothing at
@@ -723,7 +686,7 @@ function PreviewPanel({ task, screenshots }: { task: Task; screenshots: Evidence
         )}
         {state.status === "expired" && (
           <button className="preview-action" disabled={busy} onClick={() => act(true)}>
-            미리보기 만료됨 · 다시 만들기
+            Preview expired · Rebuild
           </button>
         )}
         {state.status === "failed" && (
@@ -780,42 +743,22 @@ function PreviewPanel({ task, screenshots }: { task: Task; screenshots: Evidence
   );
 }
 
-// The one review surface, shared by the task page, the /review queue, and the
-// Needs you view. Renders: title/project/summary, PR+CI status, a compact diff
-// stat with an expandable inline diff, and the three primary actions
-// (approve & merge, request changes, reject). `onDone` lets the parent hide or
-// refresh the card after an action resolves.
-export function ReviewCard({
-  task,
-  onDone,
-  surface,
-}: {
-  task: Task;
-  onDone?: () => void;
-  surface?: "focus" | "task";
-}) {
-  const { projects, tasks = [], quizzes: understandingQuizzes } = useStore();
-  const project = projects.find((p) => p.id === task.project_id);
+// The review surface on the task page: PR+CI status, what changed and why, a
+// compact diff stat with an expandable inline diff, and the three primary
+// actions (approve & merge, request changes, reject). `onDone` lets the parent
+// refresh after an action resolves.
+export function ReviewCard({ task, onDone }: { task: Task; onDone?: () => void }) {
+  const { tasks = [] } = useStore();
   const [diff, setDiff] = useState<DiffResult | null>(null);
   const [diffErr, setDiffErr] = useState("");
   const [expanded, setExpanded] = useState(false);
   const [wrap, setWrap] = useState(false);
   const [busy, setBusy] = useState(false);
-  // Tapping Land now / Unmark settles the question; the task prop still carries
-  // the old land_queued_at until the parent refetches, so hide the prompt here.
-  const [landActed, setLandActed] = useState(false);
   const [mode, setMode] = useState<ActionMode>(null);
   const [notes, setNotes] = useState("");
   const [review, setReview] = useState<ReviewSummary | null>(null);
-  const [reviewEventId, setReviewEventId] = useState<string | null>(null);
-  const [reviewLoaded, setReviewLoaded] = useState(false);
-  const [quizOverride, setQuizOverride] = useState<"passed" | "deferred" | null>(null);
   const [mergeErr, setMergeErr] = useState("");
   const [branchCheck, setBranchCheck] = useState<BranchCheck | null>(null);
-  // The director chose to merge despite the confirmed risks. That re-opens the
-  // understanding check the risk had silenced: the server still refuses a merge
-  // whose quiz is owed, so hiding it here would be a dead end (HIVE-570).
-  const [riskOverride, setRiskOverride] = useState(false);
   const [evidence, setEvidence] = useState<Evidence[]>([]);
   const [verification, setVerification] = useState<VerificationItem[]>([]);
   const [events, setEvents] = useState<Event[]>([]);
@@ -826,13 +769,9 @@ export function ReviewCard({
     setDiff(null);
     setDiffErr("");
     setReview(null);
-    setReviewEventId(null);
-    setReviewLoaded(false);
-    setQuizOverride(null);
     setEvidence([]);
     setVerification([]);
     setBranchCheck(null);
-    setRiskOverride(false);
     // Same-route navigation between tasks re-renders this component in place
     // (no remount) — without this, a "Request changes" editor left open on
     // the previous task keeps rendering, notes and all, against the new one.
@@ -855,10 +794,7 @@ export function ReviewCard({
       .then((t) => {
         if (!live) return;
         const ev = latestReviewSummaryEvent(t.events ?? []);
-        if (ev) {
-          setReview(ev.payload as ReviewSummary);
-          setReviewEventId(ev.id);
-        }
+        if (ev) setReview(ev.payload as ReviewSummary);
         setEvidence(t.evidence ?? []);
         setVerification(t.verification ?? []);
         setEvents(t.events ?? []);
@@ -868,8 +804,7 @@ export function ReviewCard({
           : "";
         setMergeErr(mergeReason);
       })
-      .catch(() => {})
-      .finally(() => live && setReviewLoaded(true));
+      .catch(() => {});
     return () => {
       live = false;
     };
@@ -885,28 +820,10 @@ export function ReviewCard({
   // chores have nothing to merge; accepting the report is the whole review.
   const isScout = task.kind === "scout";
   const reportOnly = isScout || (task.kind === "chore" && diff?.files.length === 0);
-  const rawQuiz = review?.understanding?.checks?.[0] ?? review?.understanding?.check;
-  const listedQuiz = understandingQuizzes.find((item) => item.task_id === task.id);
-  const quiz = listedQuiz ?? (rawQuiz && Array.isArray(rawQuiz.options) && rawQuiz.options.length >= 2 ? rawQuiz : undefined);
-  // The pass is recorded under the intent id when an accepted intent owns the
-  // quiz, and under the review event otherwise (HIVE-638). The server says
-  // which; an older server says nothing and the review event still applies.
-  const quizKey = branchCheck?.understanding_quiz_key ?? listedQuiz?.quiz_key ?? reviewEventId;
-  const recordedQuizStatus = quizKey && events.some(
-    (event) => event.type === "understanding_quiz_passed" && event.payload.review_event_id === quizKey
-  )
-    ? "passed"
-    : quizKey && events.some(
-        (event) => event.type === "understanding_quiz_deferred" && event.payload.review_event_id === quizKey
-      )
-      ? "deferred"
-      : "required";
-  const quizStatus = quizOverride ?? recordedQuizStatus;
   // The risk check already ran, back when the PR reached review (HIVE-570). If
-  // it confirmed something, Ship cannot work, so the card must say so BEFORE it
-  // asks for anything — the director used to answer the quiz, press Ship, and
-  // only then be told the merge was refused.
-  const confirmedRisks = riskOverride ? [] : branchCheck?.confirmed_risks ?? [];
+  // it confirmed something, Ship cannot work, so the card says so before the
+  // director presses anything.
+  const confirmedRisks = branchCheck?.confirmed_risks ?? [];
   const riskUnfinished = branchCheck?.risk_check_unfinished ?? null;
   const riskBlocked = reportOnly
     ? ""
@@ -919,29 +836,9 @@ export function ReviewCard({
           `${riskUnfinished.unverified + riskUnfinished.checked} finding${riskUnfinished.unverified + riskUnfinished.checked === 1 ? "" : "s"} ` +
           `got no verdict${riskUnfinished.reason ? ` (${riskUnfinished.reason})` : ""}. Nothing was confirmed. It retries on its own.`
         : "";
-  // Mechanical changes are not judgment-class (hive-1559): no quiz is minted,
-  // and its absence blocks nothing. Undefined (older server) keeps the old gate.
-  // A confirmed risk also silences the quiz: it is the most expensive thing hive
-  // asks of the director, and this change is not going to merge as it stands.
-  const quizRequired = branchCheck?.understanding_required !== false && !confirmedRisks.length;
-  // Would the check still block this merge if the risk were not blocking it
-  // first? That decides whether "Merge anyway" can merge or has to ask first.
-  const quizOwed = branchCheck?.understanding_required !== false && quizStatus === "required";
-  const missingQuiz = reviewLoaded && (!quiz || !reviewEventId);
-  const quizBlocked = !quizRequired
-    ? ""
-    : !reviewLoaded
-    ? "Loading the understanding check"
-    : missingQuiz
-      ? task.never_dispatched
-        ? "No understanding check, and this tracking-only task has never been dispatched to an agent to add one."
-        : "Understanding check is missing. Ask the agent to refresh its review."
-      : quizStatus === "required"
-        ? "Pass the understanding check, or explicitly save it for later."
-        : "";
   const explain = explainStateOf(evidence, events, task.head_sha);
   // Live, not the agent's evidence prose (task #1000): recomputed on every
-  // review via GET .../branch-check, same as CI/quiz below.
+  // review via GET .../branch-check, same as CI below.
   const unmetDeps = branchCheck?.unmet_deps ?? [];
   const referencedTaskLabel = (ref: { id: string; number: number }) => {
     const fullTask = tasks.find((candidate) => candidate.id === ref.id);
@@ -960,15 +857,7 @@ export function ReviewCard({
         : !task.pr_url && !task.branch
           ? "No PR and no branch — nothing to merge"
           : "";
-  const mergeBlocked = riskBlocked || quizBlocked || depBlocked || deliveryBlocked;
-  const landHeld = isLandHeld({
-    landActed,
-    landQueuedAt: task.land_queued_at,
-    quizStatus,
-    passedThisSession: quizOverride === "passed",
-    events,
-    reviewEventId: quizKey,
-  });
+  const mergeBlocked = riskBlocked || depBlocked || deliveryBlocked;
   const embeddedTasks = branchCheck?.embedded_tasks ?? [];
   const failures = [...events]
     .reverse()
@@ -1016,7 +905,7 @@ export function ReviewCard({
   const recommendation = openDecisions.length
     ? "Make the open decision first"
     : mergeBlocked
-      ? reportOnly ? "Understand before accepting" : "Wait to merge"
+      ? "Wait to merge"
       : openQuestions
         ? reportOnly
           ? `Answer the open question${openQuestions === 1 ? "" : "s"}, then accept`
@@ -1026,9 +915,7 @@ export function ReviewCard({
           : "Approve and merge";
   const recommendationReason = openDecisions.length
     ? `${openDecisions.length} decision${openDecisions.length === 1 ? "" : "s"} still need your judgment.`
-    : quizRequired && missingQuiz
-      ? "This older review has no understanding check."
-      : mergeBlocked ||
+    : mergeBlocked ||
       (openQuestions
         ? `Nothing else is blocking, but ${openQuestions === 1 ? "one question needs" : `${openQuestions} questions need`} an answer only you have.`
         : reportOnly
@@ -1036,31 +923,10 @@ export function ReviewCard({
         : task.ci_status === "passing"
           ? "CI passed and Hive found no blocking issue."
           : "Hive completed its review and is ready for your approval.");
-  // Focus is a queue: picking an action moves to the next item right away
-  // instead of holding the card through the round trip. A failure still toasts
-  // its reason. Elsewhere (task page, review queue) the card stays put until the
-  // call lands, so the error can render on the card itself.
-  const start = () => {
-    setBusy(true);
-    if (surface === "focus") onDone?.();
-  };
-  const finish = () => {
-    if (surface !== "focus") onDone?.();
-  };
-  // Flagging the card makes it judgment-class, so its checks are required again.
-  const requireQuiz = async () => {
-    if (busy) return;
-    setBusy(true);
-    try {
-      await api.requireUnderstandingQuiz(task.id);
-      setBranchCheck((prev) => (prev ? { ...prev, understanding_required: true } : prev));
-    } finally {
-      setBusy(false);
-    }
-  };
+  // The card stays put until the call lands, so an error renders on the card.
   const merge = async (strategy?: "local_ff", overrideConfirmedRisks?: boolean) => {
     if (busy) return;
-    start();
+    setBusy(true);
     try {
       if (reportOnly) {
         await api.transition(task.id, "verifying");
@@ -1069,7 +935,7 @@ export function ReviewCard({
         await api.merge(task.id, strategy, overrideConfirmedRisks);
         toast(strategy ? "Merged locally → Verifying" : "Merged → Verifying");
       }
-      finish();
+      onDone?.();
     } catch (e) {
       const msg = (e as Error).message;
       // Keep the reason ON the card — a vanishing toast made failed merges
@@ -1085,44 +951,13 @@ export function ReviewCard({
   };
   const requestChanges = async () => {
     if (!notes.trim() || busy) return;
-    start();
+    setBusy(true);
     try {
       const r = await api.requestChanges(task.id, notes);
       toast(r.delivered ? "Changes requested — sent to agent" : "Changes requested (agent offline; recorded)");
       setNotes("");
       setMode(null);
-      finish();
-    } catch (e) {
-      toast((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  };
-  const refreshUnderstandingCheck = async () => {
-    if (busy) return;
-    start();
-    try {
-      await api.requestChanges(
-        task.id,
-        "Refresh the existing review_summary without changing the implementation. Preserve the review findings, regenerate the explanation in the current format, and add 1-5 multiple-choice understanding.checks. Each question must help the director understand this specific change or report: its behavior, user impact, risk, tradeoff, or evidence, with the answer taught in the explanation. Do not quiz agent procedures, debugging, merging, tools, or policy. Write every question and option in plain everyday words: one idea per sentence, no nested clauses. Use jargon only if the diff itself introduces the term, and then define it. Make each option plainly distinct from the others. Length follows the content, not a cap: a simple change earns a short question, a genuinely complex change can take the words it needs. Write background, essence, walkthrough, and participate the way you would explain the change to a colleague on the phone: clarity first, brevity second. Then submit the task for review again."
-      );
-      toast("Agent asked to add the understanding check");
-      finish();
-    } catch (e) {
-      toast((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  };
-  const setLandMark = async (queued: boolean) => {
-    if (busy) return;
-    setBusy(true);
-    setLandActed(true);
-    try {
-      await api.landQueue([task.id], queued);
-      toast(queued ? "Landing — the queue will merge it" : "Taken out of the land queue");
-      const t = await api.task(task.id).catch(() => null);
-      if (t) setEvents(t.events ?? []);
+      onDone?.();
     } catch (e) {
       toast((e as Error).message);
     } finally {
@@ -1131,13 +966,13 @@ export function ReviewCard({
   };
   const reject = async () => {
     if (!notes.trim() || busy) return;
-    start();
+    setBusy(true);
     try {
       await api.transition(task.id, "cancelled", notes);
       toast("Rejected — task cancelled");
       setNotes("");
       setMode(null);
-      finish();
+      onDone?.();
     } catch (e) {
       toast((e as Error).message);
     } finally {
@@ -1145,19 +980,10 @@ export function ReviewCard({
     }
   };
 
+  // No heading of its own: the task page above it already names the task.
   return (
     <section className="review-card">
       <div className="review-card-head">
-        {/* On the task page the header above already names the task. */}
-        {surface !== "task" && <div className="review-card-heading">
-          <div className="review-card-meta">
-            <TaskRef task={task} className="card-num" />
-            {project && <span>{project.name}</span>}
-          </div>
-          <h3 className="review-card-title">
-            <Link to={`/tasks/${task.id}`}>{task.title}</Link>
-          </h3>
-        </div>}
         <div className="review-status">
           {task.pr_url && <PrReference className="pr" url={task.pr_url} label={`${prLabel(task.pr_url)} ↗`} />}
           {/* Green is the default and says nothing; only a warning, a red run or
@@ -1220,7 +1046,7 @@ export function ReviewCard({
 
       <EvidenceStrip evidence={screenshots} task={task} />
 
-      <details className="review-details" open={quizRequired && quizStatus === "required"}>
+      <details className="review-details">
         <summary>
           <span>{reportOnly ? "Explain report" : review?.understanding ? "Understand this change" : "Why Hive recommends this"}</span>
           <small>
@@ -1287,84 +1113,27 @@ export function ReviewCard({
         </div>
       </details>
 
-      {quizRequired && quiz && reviewEventId && quizStatus === "required" && (
-        <UnderstandingQuiz
-          quiz={{
-            task_id: task.id,
-            question: quiz.question,
-            options: quiz.options,
-            version: "version" in quiz ? quiz.version : `${reviewEventId}:0`,
-          }}
-          intentSlug={listedQuiz?.intent_slug}
-          intentTaskId={task.id}
-          allowDefer
-          surface={surface === "focus" ? surface : undefined}
-          onPassed={() => setQuizOverride("passed")}
-          onDeferred={() => setQuizOverride("deferred")}
-        />
-      )}
-      {quizRequired && quizStatus === "passed" && <div className="understanding-quiz-status passed">Understanding confirmed. Approval unlocked.</div>}
-      {riskOverride && (
-        <div className="understanding-quiz-status deferred">
-          You chose to merge despite the confirmed risks. Take the understanding check above and Ship will go through.
-        </div>
-      )}
-      {landHeld && (
-        <div className="review-blocked review-blocked-action">
-          You marked this approved to land before you took the check. It will not merge until you say so.
-          <button className="btn btn-mini" disabled={busy} onClick={() => setLandMark(true)}>Land now</button>
-          <button className="btn btn-mini" disabled={busy} onClick={() => setLandMark(false)}>Unmark</button>
-        </div>
-      )}
-      {quizStatus === "deferred" && <div className="understanding-quiz-status deferred">Quiz saved in Needs You. You can continue now.</div>}
-      {/* A risk that lands AFTER the quiz was passed must say so, or the refusal
-          reads as "you did all that for nothing" (HIVE-570). */}
-      {!quizRequired && confirmedRisks.length > 0 && (
-        <div className="understanding-quiz-status deferred">
-          {quizStatus === "passed"
-            ? `You passed the understanding check on this change earlier. A new finding arrived on commit ${(task.head_sha ?? "").slice(0, 7)} — your answer is kept.`
-            : "No understanding check yet — the risk check confirmed something on this commit, so this change is not ready to ship. It comes back once the agent clears the finding."}
-        </div>
-      )}
-      {!quizRequired && confirmedRisks.length === 0 && (
-        <p className="muted review-mechanical">
-          Mechanical change, no understanding check.{" "}
-          <button className="link-btn" onClick={requireQuiz} disabled={busy}>Quiz me anyway</button>
-        </p>
-      )}
-
       {/* Why the button is off comes BEFORE the button, so the eye meets the
-          reason first. A confirmed risk outranks a missing quiz: asking the agent
-          to write questions about a change that cannot merge is the wrong next step. */}
-      {!riskBlocked && quizRequired && missingQuiz && !task.never_dispatched ? (
-        <div className="review-blocked review-blocked-action">
-          <button className="btn btn-mini" disabled={busy} onClick={refreshUnderstandingCheck}>
-            {busy ? "Asking…" : "Have agent add it"}
-          </button>
-        </div>
-      ) : mergeBlocked ? (
+          reason first. */}
+      {mergeBlocked && (
         <div className={confirmedRisks.length ? "review-blocked review-blocked-action" : "review-blocked"}>
           {mergeBlocked}
           {confirmedRisks.length > 0 && (
             <button
               className="btn btn-mini"
               disabled={busy}
-              title={
-                quizOwed
-                  ? "Merge it despite the risks. The understanding check comes back first, then Ship works."
-                  : "Merge anyway. The confirmed risks stay on the card as the record of what you accepted."
-              }
-              onClick={() => (quizOwed ? setRiskOverride(true) : merge(undefined, true))}
+              title="Merge anyway. The confirmed risks stay on the card as the record of what you accepted."
+              onClick={() => merge(undefined, true)}
             >
               Merge anyway
             </button>
           )}
         </div>
-      ) : null}
+      )}
 
       <div className="review-actions">
-        <button className="btn btn-primary" onClick={() => merge(undefined, riskOverride || undefined)} disabled={busy || !!mergeBlocked} title={mergeBlocked}>
-          {busy ? "Working…" : reportOnly ? "Accept report" : surface === "focus" ? "Ship" : "Approve & merge"}
+        <button className="btn btn-primary" onClick={() => merge()} disabled={busy || !!mergeBlocked} title={mergeBlocked}>
+          {busy ? "Working…" : reportOnly ? "Accept report" : "Approve & merge"}
         </button>
         {!task.never_dispatched && (
           <button className="btn" onClick={() => setMode(mode === "changes" ? null : "changes")}>
@@ -1382,7 +1151,7 @@ export function ReviewCard({
             <button
               className="btn"
               style={{ marginLeft: "var(--s2)" }}
-              disabled={busy || !!(quizBlocked || depBlocked || deliveryBlocked)}
+              disabled={busy || !!(depBlocked || deliveryBlocked)}
               title="Merge anyway. The risks above stay on the card as the record of what you accepted."
               onClick={() => merge(undefined, true)}
             >
@@ -1440,193 +1209,6 @@ export function ReviewCard({
           </button>
         </div>
       )}
-
-    </section>
-  );
-}
-
-// The verify queue's card (HIVE-611). hive stops every merge at `verifying` and
-// waits for the director (HIVE-604), so this is the surface he uses most — but
-// it used to render as nothing but a row of unlabelled thumbnails. It reads in
-// the same order the review card established (HIVE-557): what shipped, the
-// before → after, why it was needed, then what needs you.
-// A Jira mirror has no work of its own: its context is the finished work task
-// under it. The most advanced one is what the director looks at.
-const WORK_RANK: Record<string, number> = { done: 4, verifying: 3, in_review: 2, in_progress: 1 };
-export function mirrorWorkOf(mirror: Task, tasks: Task[]): Task | null {
-  return (
-    [...tasks.filter((t) => t.jira_mirror_task_id === mirror.id)].sort(
-      (a, b) => (WORK_RANK[b.state] ?? 0) - (WORK_RANK[a.state] ?? 0) || String(b.updated_at).localeCompare(String(a.updated_at))
-    )[0] ?? null
-  );
-}
-
-const NOT_STATED = "(not stated)";
-
-// The verify queue's card. hive stops every merge at `verifying` and waits for
-// the director (HIVE-604), so this is the surface he uses most. It answers, in
-// order: what was asked, what shipped and why, what to check, then the button.
-// It used to open with "Check it, then close it" and nothing else when the
-// task was a Jira mirror, which carries no review of its own.
-export function VerifyCard({ task, onDone, surface }: { task: Task; onDone?: () => void; surface?: "focus" | "task" }) {
-  const { projects, tasks = [], intents = [] } = useStore();
-  const project = projects.find((p) => p.id === task.project_id);
-  const mirror = isJiraMirror(task);
-  const work = mirror ? mirrorWorkOf(task, tasks) : null;
-  const subject = work ?? task;
-  const [evidence, setEvidence] = useState<Evidence[]>([]);
-  const [events, setEvents] = useState<Event[]>([]);
-  const [verification, setVerification] = useState<VerificationItem[]>([]);
-  const [review, setReview] = useState<ReviewSummary | null>(null);
-  const [busy, setBusy] = useState(false);
-
-  useEffect(() => {
-    let live = true;
-    setEvidence([]);
-    setEvents([]);
-    setVerification([]);
-    setReview(null);
-    api
-      .task(subject.id)
-      .then((t) => {
-        if (!live) return;
-        setEvidence(t.evidence ?? []);
-        setEvents(t.events ?? []);
-        setVerification(t.verification ?? []);
-        const ev = latestReviewSummaryEvent(t.events ?? []);
-        if (ev) setReview(ev.payload as ReviewSummary);
-      })
-      .catch(() => {});
-    return () => {
-      live = false;
-    };
-  }, [subject.id]);
-
-  // The accepted ask, when the work carries one: the outcome the director
-  // signed off on is the yardstick the check is measured against.
-  const intent = intents.find(
-    (i) => i.status === "accepted" && (i.task_id === task.id || (work != null && i.task_id === work.id) || (!!task.jira_key && i.source_ref === task.jira_key))
-  );
-  const askedText = intent ? intentSection(intent.body_md, "Proposed outcome") : "";
-  const asked = askedText && askedText !== NOT_STATED ? oneLine(askedText, 260) : "";
-  const autoReviewSummary = [...events].reverse().find((e) => e.type === "auto_review" && !e.payload.skipped)?.payload
-    ?.summary as string | undefined;
-  const shippedSource = review?.understanding?.essence || autoReviewSummary || review?.done?.[0] || subject.summary || "";
-  const shipped = oneLine(shippedSource);
-  const why = whyItWasNeeded(review?.understanding?.background, review?.done ?? []);
-  // The agent's own "what to do with this" is the check instruction; it used to
-  // be the last paragraph of the collapsed panel.
-  const check = String(review?.understanding?.participate ?? "").trim();
-  const watchOuts = watchOutsOf(review);
-  const screenshots = evidence.filter((e) => e.kind === "screenshot");
-  const attachments = evidence.filter((e) => e.kind !== "screenshot" && e.kind !== "explanation");
-  const promoted = [why.source, shippedSource].filter(Boolean);
-  const packet = review?.understanding
-    ? {
-        ...review.understanding,
-        essence: promoted.includes(review.understanding.essence ?? "") ? undefined : review.understanding.essence,
-        background: promoted.includes(review.understanding.background ?? "") || why.text ? undefined : review.understanding.background,
-        participate: undefined,
-      }
-    : undefined;
-  const auditReview = review
-    ? {
-        ...review,
-        done: withoutPromoted(review.done, promoted, (d) => d),
-        iffy: (review.iffy ?? []).filter((item) => !watchOuts.includes(item)),
-        decisions: (review.decisions ?? []).filter((item) => !watchOuts.includes(item)),
-      }
-    : null;
-  const explain = explainStateOf(evidence, events, subject.head_sha);
-  const hasDetails = !!(packet || explain || attachments.length || auditReview);
-
-  const markDone = async () => {
-    if (busy) return;
-    setBusy(true);
-    // Focus is a queue: move on at once rather than holding the card through
-    // the round trip, same as the review card.
-    if (surface === "focus") onDone?.();
-    try {
-      await api.transition(task.id, "done");
-      toast("Marked done");
-      if (surface !== "focus") onDone?.();
-    } catch (e) {
-      toast((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <section className="review-card verify-card">
-      <div className="review-card-head">
-        {surface !== "task" && <div className="review-card-heading">
-          <div className="review-card-meta">
-            <TaskRef task={task} className="card-num" />
-            {project && <span>{project.name}</span>}
-            {mirror && task.jira_key && <span>{task.jira_key}</span>}
-          </div>
-          <h3 className="review-card-title">
-            <Link to={`/tasks/${task.id}`}>{task.title}</Link>
-          </h3>
-        </div>}
-        <div className="review-status">
-          {subject.pr_url && <PrReference className="pr" url={subject.pr_url} label={`${prLabel(subject.pr_url)} ↗`} />}
-        </div>
-      </div>
-
-      {mirror && (
-        <p className="muted verify-mirror-note">
-          {work
-            ? <>This is the ticket. The work was <TaskRef task={work} className="card-num" /> ({work.state}); closing this closes the ticket's row on the board.</>
-            : "This is the ticket, and no hive work is filed under it. Check the ticket itself."}
-        </p>
-      )}
-
-      <ReviewFocus asked={asked} changed={shipped} changedLabel="What shipped" why={why.text} />
-
-      <div className="review-recommendation">
-        <span className="review-recommendation-label">Check this</span>
-        <strong>{mirror && task.jira_key ? `Confirm ${task.jira_key} is done, then close it` : "Confirm it works, then close it"}</strong>
-        <p>
-          {check ||
-            (asked
-              ? "Open the result and confirm it does what was asked. Nothing else moves this."
-              : "This merged and is waiting on you. Nothing else moves it.")}
-        </p>
-      </div>
-
-      <WatchOut items={watchOuts} />
-
-      <VerificationChecklist items={verification} evidence={evidence} />
-
-      <PreviewPanel task={subject} screenshots={screenshots} />
-
-      <EvidenceStrip evidence={screenshots} task={subject} />
-
-      {hasDetails && (
-        <details className="review-details">
-          <summary>
-            <span>Understand this change</span>
-            <small>{evidence.length} evidence</small>
-          </summary>
-          <div className="review-details-body">
-            {(packet || explain) && <ReviewUnderstanding packet={packet ?? {}} caveats={review?.iffy ?? []} explain={explain} />}
-            <EvidenceStrip evidence={attachments} task={subject} />
-            {auditReview && <ReviewAudit r={auditReview} />}
-          </div>
-        </details>
-      )}
-
-      <div className="review-actions">
-        <button className="btn btn-primary" onClick={markDone} disabled={busy}>
-          {busy ? "Working…" : "Verified — mark done"}
-        </button>
-        {/* Looked, and it is not right: the note becomes a follow-up task that
-            carries this change's context. This one still closes. */}
-        <RequestChanges taskId={subject.id} compact />
-        {surface !== "task" && <Link className="btn" to={`/tasks/${subject.id}`}>Open task</Link>}
-      </div>
     </section>
   );
 }

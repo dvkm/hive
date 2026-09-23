@@ -21,9 +21,9 @@ import {
 import { toast } from "../lib/ui";
 
 const STATUS_LABEL: Record<Intent["status"], string> = {
-  draft: "Draft — waiting on you",
+  draft: "Waiting on you",
   accepted: "Accepted",
-  superseded: "Superseded",
+  superseded: "Replaced",
 };
 
 const NOT_STATED = "(not stated)";
@@ -73,7 +73,7 @@ function OpenQuestions({
             <input
               className="intent-q-answer"
               aria-label="Your answer (optional)"
-              placeholder="Your answer, optional — tick the box or press Enter to save"
+              placeholder="Your answer, optional. Tick the box or press Enter to save."
               value={answer}
               disabled={busy}
               onChange={(e) => setAnswers((prev) => ({ ...prev, [q.text]: e.target.value }))}
@@ -109,7 +109,8 @@ function AddLine({ heading, busy, onSave }: { heading: string; busy: boolean; on
   );
 }
 
-export function IntentCard({ intent, onChange }: { intent: Intent; onChange?: (next: Intent) => void }) {
+// brief: Home shows the problem and the questions; the rest of the draft folds away.
+export function IntentCard({ intent, onChange, brief = false }: { intent: Intent; onChange?: (next: Intent) => void; brief?: boolean }) {
   const [busy, setBusy] = useState(false);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(intent.body_md);
@@ -148,9 +149,37 @@ export function IntentCard({ intent, onChange }: { intent: Intent; onChange?: (n
     }
   };
 
+  const sections = intentSections(intent.body_md);
+  const upfront = (heading: string) => !brief || heading === "Problem" || heading === "Open questions";
+  const renderSection = ({ heading, text }: { heading: string; text: string }) => {
+    if (heading === "Open questions") {
+      const shown = questionBullets(intent.body_md).some((q) => !isHiveQuestion(q.text));
+      return (
+        <div className="intent-section" key={heading}>
+          <h3>{heading}</h3>
+          {shown && isDraft ? (
+            <OpenQuestions body={intent.body_md} busy={busy} onAnswer={(index, answer) => save(answerOpenQuestion(intent.body_md, index, answer))} />
+          ) : (
+            <p className="intent-prose muted">{shown ? text : "(none)"}</p>
+          )}
+        </div>
+      );
+    }
+    const empty = !text || text === NOT_STATED;
+    if (empty && isDraft && heading !== "Problem") {
+      return <AddLine key={heading} heading={heading} busy={busy} onSave={(value) => save(setIntentSection(intent.body_md, heading, value))} />;
+    }
+    return (
+      <div className="intent-section" key={heading}>
+        <h3>{heading}</h3>
+        <p className={`intent-prose${empty ? " muted" : ""}`}>{text || "(none)"}</p>
+      </div>
+    );
+  };
+
   return (
     <section className="panel intent-card" id="intent">
-      <h2>Intent</h2>
+      <h2>The ask</h2>
       <div className="intent-meta muted">
         <span className={`chip chip-intent-${intent.status}`}>{STATUS_LABEL[intent.status]}</span>
         <span>from {intent.source}{intent.source_ref ? ` · ${intent.source_ref}` : ""}</span>
@@ -173,31 +202,13 @@ export function IntentCard({ intent, onChange }: { intent: Intent; onChange?: (n
         </>
       ) : (
         <>
-          {intentSections(intent.body_md).map(({ heading, text }) => {
-            if (heading === "Open questions") {
-              const shown = questionBullets(intent.body_md).some((q) => !isHiveQuestion(q.text));
-              return (
-                <div className="intent-section" key={heading}>
-                  <h3>{heading}</h3>
-                  {shown && isDraft ? (
-                    <OpenQuestions body={intent.body_md} busy={busy} onAnswer={(index, answer) => save(answerOpenQuestion(intent.body_md, index, answer))} />
-                  ) : (
-                    <p className="intent-prose muted">{shown ? text : "(none)"}</p>
-                  )}
-                </div>
-              );
-            }
-            const empty = !text || text === NOT_STATED;
-            if (empty && isDraft && heading !== "Problem") {
-              return <AddLine key={heading} heading={heading} busy={busy} onSave={(value) => save(setIntentSection(intent.body_md, heading, value))} />;
-            }
-            return (
-              <div className="intent-section" key={heading}>
-                <h3>{heading}</h3>
-                <p className={`intent-prose${empty ? " muted" : ""}`}>{text || "(none)"}</p>
-              </div>
-            );
-          })}
+          {sections.filter((s) => upfront(s.heading)).map(renderSection)}
+          {brief && (
+            <details className="review-details">
+              <summary>The rest of the draft</summary>
+              <div className="review-details-body">{sections.filter((s) => !upfront(s.heading)).map(renderSection)}</div>
+            </details>
+          )}
 
           {isDraft && (
             <>

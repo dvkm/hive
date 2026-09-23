@@ -2492,11 +2492,17 @@ test("link creation sends Jira's sub-task payload and stores the link", async ()
   const create = jira.calls.find((call) => call.method === "POST" && call.path === "/rest/api/3/issue");
   expect(create?.body.fields).toMatchObject({
     project: { key: "WEB" }, parent: { key: "WEB-7" }, issuetype: { id: "10002" },
-    reporter: { accountId: SELF }, summary: "P-1 · Ship outbound links",
+    reporter: { accountId: SELF }, summary: "Ship outbound links",
   });
-  expect(J.adfToText(create?.body.fields.description)).toContain(`hive-task: ${taskId}`);
+  // The ticket reads like a teammate's: the PR, no task id, no link into hive.
+  const description = J.adfToText(create?.body.fields.description);
+  expect(description).toContain("PR: https://github.com/acme/hive/pull/1");
+  expect(description).not.toContain("hive-task");
+  expect(description).not.toContain(taskId);
+  // The machine link is an issue property nobody sees on the ticket.
   expect(create?.body.properties).toEqual([{ key: "hive.task_id", value: taskId }]);
-  expect(jira.calls.filter((call) => call.method === "POST" && call.path.endsWith("/remotelink"))).toHaveLength(2);
+  const links = jira.calls.filter((call) => call.method === "POST" && call.path.endsWith("/remotelink"));
+  expect(links).toHaveLength(1);
 });
 
 test("link creation deletes the Jira sub-task when another link wins the database race", async () => {
@@ -2569,7 +2575,7 @@ test("cancelling a linked task queues one comment for normal outbound delivery",
   expect(queued).toHaveLength(1);
   expect(queued[0].source).toBe("director");
   expect(JSON.parse(queued[0].payload)).toMatchObject({
-    direction: "outbound", linked_cancelled: true, text: "Hive marked this task cancelled.",
+    direction: "outbound", linked_cancelled: true, text: "Work on this was cancelled.",
   });
 
   await run(db, projectId, jira.fetchImpl);
@@ -3186,10 +3192,12 @@ test("an operational comment read failure fails the issue", async () => {
 // ============================================================================
 // RECEIPTS: IDEMPOTENT DELIVERY WITH CONTAINED UNKNOWNS
 // ============================================================================
-const addEvidence = (db: DB, taskId: string, kind: string, caption: string) => {
+// Evidence a Jira reader can open (an external link) unless a url is given;
+// hive's own `/evidence/...` links are never printed on a ticket.
+const addEvidence = (db: DB, taskId: string, kind: string, caption: string, url = `https://ci.example.com/${taskId}/x.png`) => {
   const id = newId("ev");
   db.query("INSERT INTO evidence (id, task_id, ts, kind, path, url, caption, meta) VALUES (?,?,?,?,?,?,?,'{}')")
-    .run(id, taskId, now(), kind, "/tmp/x", `/evidence/${taskId}/x.png`, caption);
+    .run(id, taskId, now(), kind, "/tmp/x", url, caption);
   return id;
 };
 
@@ -3212,25 +3220,22 @@ test("an acknowledged report/evidence row is not redelivered", async () => {
   expect(posted[0].text).toContain("shadow cycle output");
   const request = jira.calls.find((call) => call.method === "POST" && call.path.includes("/comment"));
   expect(adfLinks(request?.body?.body)).toEqual([
-    { text: `${J.hiveBaseUrl()}/tasks/${t.id}`, href: `${J.hiveBaseUrl()}/tasks/${t.id}` },
-    { text: `${J.hiveBaseUrl()}/evidence/${t.id}/x.png`, href: `${J.hiveBaseUrl()}/evidence/${t.id}/x.png` },
+    { text: `https://ci.example.com/${t.id}/x.png`, href: `https://ci.example.com/${t.id}/x.png` },
   ]);
 
   for (let i = 0; i < 3; i++) await run(db, projectId, jira.fetchImpl);
   expect(jira.byKey.get("WEB-1")!.comments).toHaveLength(1); // never re-delivered
 });
 
-test("receipt links resolve URLs into marked ADF link nodes", () => {
+test("a receipt links only what a Jira reader can open, and never hive itself", () => {
   const task = { id: "task-1", number: 1, title: "report", state: "done" };
   const row = { kind: "report", caption: "result", ts: "2026-01-01T00:00:00.000Z" };
-  for (const [url, direct] of [
-    ["/evidence/task-1/report.md", `${J.hiveBaseUrl()}/evidence/task-1/report.md`],
-    ["https://example.com/report", "https://example.com/report"],
-  ]) {
-    const links = adfLinks(J.textToAdf(J.receiptText(task, { ...row, url })));
-    expect(links).toContainEqual({ text: `${J.hiveBaseUrl()}/tasks/task-1`, href: `${J.hiveBaseUrl()}/tasks/task-1` });
-    expect(links).toContainEqual({ text: direct, href: direct });
-  }
+  // hive's own evidence links are dead for everyone else: no receipt at all.
+  expect(J.receiptText(task, { ...row, url: "/evidence/task-1/report.md" })).toBeNull();
+  expect(J.receiptText(task, { ...row, url: `${J.hiveBaseUrl()}/evidence/task-1/report.md` })).toBeNull();
+  const text = J.receiptText(task, { ...row, url: "https://example.com/report" })!;
+  expect(adfLinks(J.textToAdf(text))).toEqual([{ text: "https://example.com/report", href: "https://example.com/report" }]);
+  expect(text).not.toMatch(/hive/i);
 });
 
 test("a malformed legacy evidence URL does not block its receipt", async () => {
@@ -3243,15 +3248,13 @@ test("a malformed legacy evidence URL does not block its receipt", async () => {
 
   const stats = await run(db, projectId, jira.fetchImpl);
 
+  // Nothing a reader could open, so nothing is posted, and nothing breaks.
   expect(stats.errors).toBe(0);
-  expect(stats.receipts).toBe(1);
-  const request = jira.calls.find((call) => call.method === "POST" && call.path.includes("/comment"));
-  expect(adfLinks(request?.body?.body)).toEqual([
-    { text: `${J.hiveBaseUrl()}/tasks/${task.id}`, href: `${J.hiveBaseUrl()}/tasks/${task.id}` },
-  ]);
+  expect(stats.receipts).toBe(0);
+  expect(jira.calls.find((call) => call.method === "POST" && call.path.includes("/comment"))).toBeUndefined();
 });
 
-test("an oversized legacy receipt stays bounded and preserves its Hive link", async () => {
+test("an oversized receipt stays bounded, and a link too long to use posts nothing", async () => {
   const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "To Do" }] });
   const { db, projectId } = freshDb();
   await run(db, projectId, jira.fetchImpl);
@@ -3268,16 +3271,17 @@ test("an oversized legacy receipt stays bounded and preserves its Hive link", as
     );
 
   const stats = await run(db, projectId, jira.fetchImpl);
-
   expect(stats.errors).toBe(0);
-  expect(stats.receipts).toBe(1);
+  expect(stats.receipts).toBe(0);
+
+  addEvidence(db, task.id, "report", "c".repeat(J.JIRA_COMMENT_MAX_LENGTH), "https://example.com/report");
+  const next = await run(db, projectId, jira.fetchImpl);
+  expect(next.errors).toBe(0);
+  expect(next.receipts).toBe(1);
   const request = jira.calls.find((call) => call.method === "POST" && call.path.includes("/comment"));
   const rendered = J.adfToText(request?.body?.body).trim();
   expect(rendered.length).toBeLessThanOrEqual(J.JIRA_COMMENT_MAX_LENGTH);
-  expect(rendered).toContain("Caption and direct link omitted");
-  expect(adfLinks(request?.body?.body)).toEqual([
-    { text: `${J.hiveBaseUrl()}/tasks/${task.id}`, href: `${J.hiveBaseUrl()}/tasks/${task.id}` },
-  ]);
+  expect(adfLinks(request?.body?.body)).toEqual([{ text: "https://example.com/report", href: "https://example.com/report" }]);
 });
 
 test("a receipt whose acknowledgement was lost is not delivered twice", async () => {
@@ -3470,20 +3474,23 @@ test("a mirror reaching In Review gets exactly ONE context comment, and re-syncs
   reachReview(db, task.id, "PR #815 (CI green): unified member list, counts conserved");
 
   const s1 = await run(db, projectId, jira.fetchImpl);
-  const context = jira.byKey.get("WEB-1")!.comments.filter((c: any) => String(c.text).includes("Hive moved this to In Review"));
+  const context = jira.byKey.get("WEB-1")!.comments.filter((c: any) => String(c.text).startsWith("In review:"));
   expect(context).toHaveLength(1);
   // The headline is the review's own summary; the transition reason is bookkeeping.
-  expect(context[0].text).toContain("Hive moved this to In Review: unified member list");
+  expect(context[0].text).toContain("In review: unified member list");
   expect(context[0].text).not.toContain("counts conserved");
   expect(context[0].text).toContain("https://github.com/acme/x/pull/815");
   expect(context[0].text).toContain("deletion is soft-flagged: send suppression lands separately");
-  expect(context[0].text).toContain(`${J.hiveBaseUrl()}/evidence/${task.id}/x.png`);
+  expect(context[0].text).toContain(`https://ci.example.com/${task.id}/x.png`);
+  // Written the way a teammate would write it: no hive, no link into hive.
+  expect(context[0].text).not.toMatch(/\bhive\b/i);
+  expect(context[0].text).not.toContain(J.hiveBaseUrl());
   expect(s1.comments_pushed).toBe(1);
 
   // Second cycle (and a few more): the status already agrees and the ledger
   // already holds the delivery, so nothing new is composed or posted.
   for (let i = 0; i < 3; i++) await run(db, projectId, jira.fetchImpl);
-  expect(jira.byKey.get("WEB-1")!.comments.filter((c: any) => String(c.text).includes("Hive moved this to In Review"))).toHaveLength(1);
+  expect(jira.byKey.get("WEB-1")!.comments.filter((c: any) => String(c.text).startsWith("In review:"))).toHaveLength(1);
 });
 
 test("verifying shares In Review's comment, and Done gets its own", async () => {
@@ -3509,21 +3516,21 @@ test("verifying shares In Review's comment, and Done gets its own", async () => 
   await run(db, projectId, jira.fetchImpl);
   jiraClockBehind();
   const texts = () => jira.byKey.get("WEB-1")!.comments.map((c: any) => String(c.text));
-  expect(texts().filter((t) => t.includes("Hive moved this to In Review"))).toHaveLength(1);
+  expect(texts().filter((t) => t.startsWith("In review:"))).toHaveLength(1);
 
   transition(db, task.id, "done", { source: "director", reason: "smoke checks pass" });
   await run(db, projectId, jira.fetchImpl);
   jiraClockBehind();
-  const doneNotes = texts().filter((t) =>
-    t.includes("Hive finished this and the director verified it; please check the live result and move the ticket to Done")
-  );
+  const doneNotes = texts().filter((t) => t.startsWith("Done:"));
   expect(doneNotes).toHaveLength(1);
+  expect(doneNotes[0]).toContain("Could you check it and move this ticket to Done if it looks right?");
   expect(doneNotes[0]).not.toContain("smoke checks pass"); // the transition reason stays internal
+  expect(doneNotes[0]).not.toMatch(/\bhive\b|director/i);
   expect(doneNotes[0]).toContain("PR: https://github.com/acme/x/pull/815");
   // and the ticket itself is still In Review: hive never writes Done (HIVE-630)
   expect(jira.byKey.get("WEB-1")!.status).toBe("In Review");
   for (let i = 0; i < 2; i++) await run(db, projectId, jira.fetchImpl);
-  expect(texts().filter((t) => t.startsWith("Hive"))).toHaveLength(2); // one per context key, ever
+  expect(texts().filter((t) => t.startsWith("In review:") || t.startsWith("Done:"))).toHaveLength(2); // one per context key, ever
 });
 
 test("a human's own move to In Review gets no comment when hive has nothing to add", async () => {
@@ -3568,8 +3575,8 @@ test("the context comment stays short: evidence is capped and long reasons are c
   for (let i = 0; i < 9; i++) addEvidence(db, id, "screenshot", `shot ${i}`);
 
   const text = J.reviewContextText(db, { id, pr_url: null }, "In Review")!;
-  expect(text.split("\n").filter((line) => line.startsWith("- ")).filter((l) => !l.includes("more in Hive"))).toHaveLength(5);
-  expect(text).toContain("- +4 more in Hive");
+  expect(text.split("\n").filter((line) => line.startsWith("- "))).toHaveLength(5);
+  expect(text).not.toMatch(/\bhive\b/i);
   expect(text.split("\n")[0].length).toBeLessThan(450);
 });
 

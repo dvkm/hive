@@ -60,26 +60,7 @@ test("kinds map to push classes; unknown kinds are info", () => {
   expect(classOfKind("review")).toBe("decision");
   expect(classOfKind("circuit_breaker")).toBe("fleet_down");
   expect(classOfKind("auth_lost")).toBe("fleet_down");
-  expect(classOfKind("quiz_digest")).toBe("quiz-digest");
   expect(classOfKind("done")).toBe("info");
-});
-
-// The catch-up digest is its own class so it can be let through on its own,
-// without also letting every other low-urgency push through.
-test("a quiz digest is held by default but passes when allowed through", () => {
-  const db = freshDb();
-  setAway(db, { on: true, always_through: ["security", "spend", "fleet_down", "second_failure"] });
-  const held = recordingPush();
-  enqueue(db, { kind: "quiz_digest", urgency: "urgent", title: "Catch up on 3 shipped changes" }, { push: held.push });
-  expect(held.sent.length).toBe(0);
-  expect(heldPushes(db)[0].class).toBe("quiz-digest");
-
-  const db2 = freshDb();
-  setAway(db2, { on: true, always_through: ["quiz-digest"] });
-  const through = recordingPush();
-  enqueue(db2, { kind: "quiz_digest", urgency: "urgent", title: "Catch up on 3 shipped changes" }, { push: through.push });
-  expect(through.sent.length).toBe(1);
-  expect(heldPushes(db2).length).toBe(0);
 });
 
 test("while away, a decision push is held and a fleet_down push still goes out", () => {
@@ -135,7 +116,7 @@ test("the schedule flips away mode on and off across a reconciler tick", () => {
   expect(syncAway(db, DAY, { push })).toEqual({ active: false, flushed: 2 });
   expect(sent.length).toBe(1);
   expect(sent[0].title).toBe("While you were away: 2 items");
-  expect(sent[0].url).toBe("/inbox");
+  expect(sent[0].url).toBe("/");
   expect(heldPushes(db).length).toBe(0);
 
   // waking again with nothing held sends nothing

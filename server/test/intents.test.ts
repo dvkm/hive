@@ -12,7 +12,7 @@ import type { DB } from "../src/db.ts";
 const { makeHandler } = await import("../src/api.ts");
 const { dispatchOnce } = await import("../src/dispatcher.ts");
 const { getTask } = await import("../src/state.ts");
-const { intentFileFor, intentSlug, openQuestions, intentSection, intentBodyError, addOpenQuestion } = await import("../src/intents.ts");
+const { acceptedIntentBody, openQuestions, intentSection, intentBodyError, addOpenQuestion } = await import("../src/intents.ts");
 const { briefFromIntent, extractSections, fallbackBody, renderIntentBody } = await import("../src/intentDraft.ts");
 const { composeBrief } = await import("../src/briefs.ts");
 const { Herdr } = await import("../src/runtime/herdr.ts");
@@ -84,11 +84,6 @@ test("open questions: a plain bullet is unanswered, a ticked one is not", () => 
   expect(openQuestions(BODY)).toEqual([]);
   expect(intentSection(BODY, "Problem")).toBe("Post-Done Jira comments land on nothing.");
   expect(openQuestions(addOpenQuestion(BODY, "which environment?"))).toEqual(["which environment?"]);
-});
-
-test("intent file slug prefers the Jira key", () => {
-  expect(intentSlug({ jira_key: "WEB-101", number: 7 })).toBe("WEB-101");
-  expect(intentSlug({ jira_key: null, number: 7 })).toBe("hive-7");
 });
 
 test("a task on a draft intent stays queued; accepting it lets the dispatcher through", async () => {
@@ -166,22 +161,16 @@ test("tasks with no intent are unaffected", async () => {
   expect(getTask(db, task.json.id).state).toBe("in_progress");
 });
 
-test("only an accepted intent is written into the worktree", async () => {
+test("only an accepted intent reaches the agent", async () => {
   const { db, handler, projectId } = fresh();
   const draft = await call(handler, "POST", "/api/intents", { project_id: projectId, source: "director", body_md: BODY });
   const task = await call(handler, "POST", "/api/tasks", { project_id: projectId, title: "do the thing", intent_id: draft.json.id });
   const row = () => getTask(db, task.json.id);
-  expect(intentFileFor(db, row())).toBeNull(); // still a draft
-  expect(intentFileFor(db, { intent_id: null, number: 1 })).toBeNull(); // no intent at all
+  expect(acceptedIntentBody(db, row())).toBeNull(); // still a draft
+  expect(acceptedIntentBody(db, { intent_id: null })).toBeNull(); // no intent at all
 
   await call(handler, "POST", `/api/intents/${draft.json.id}/accept`, {});
-  const file = intentFileFor(db, row())!;
-  expect(file.path).toBe(`intent/hive-${row().number}.md`);
-  expect(file.body).toBe(BODY);
-
-  // A Jira-keyed task files under the key everyone else uses.
-  db.query("UPDATE tasks SET jira_key = 'WEB-101' WHERE id = ?").run(task.json.id);
-  expect(intentFileFor(db, getTask(db, task.json.id))!.path).toBe("intent/WEB-101.md");
+  expect(acceptedIntentBody(db, row())).toBe(BODY.trim());
 });
 
 // ============================================================================
@@ -277,8 +266,11 @@ test("the agent is told to read the accepted record first, and only once it exis
 
   await call(handler, "POST", `/api/intents/${draft.json.id}/accept`, {});
   const prompt = composeBrief(db, task.json.id);
-  expect(prompt).toContain(`intent/hive-${getTask(db, task.json.id).number}.md`);
+  expect(prompt).toContain(BODY.trim());
   expect(prompt).toContain("`## Constraints` are HARD LIMITS");
+  // The record rides in the brief; nothing tells the agent to commit it.
+  expect(prompt).not.toContain("intent/");
+  expect(prompt).not.toContain("commit it with your change");
 });
 
 test("a model that answers with nothing still yields a usable record", async () => {

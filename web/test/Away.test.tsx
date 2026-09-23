@@ -30,7 +30,7 @@ const text = (renderer: ReturnType<typeof create>) => flatten(renderer.toJSON())
 // Restores whatever this file overwrote on the shared `api` singleton — other
 // test files in the same run see the same object.
 function stubStoreApi(): () => void {
-  const keys = ["cachedTasks", "tasks", "decisions", "projects", "checkpoints", "understandingQuizzes", "notifications", "offline", "away", "setAway"] as const;
+  const keys = ["cachedTasks", "tasks", "decisions", "projects", "intents", "notifications", "offline", "away", "setAway"] as const;
   const originals = Object.fromEntries(keys.map((k) => [k, (api as any)[k]]));
   const empty = async () => [];
   Object.assign(api, {
@@ -38,8 +38,7 @@ function stubStoreApi(): () => void {
     tasks: empty,
     decisions: empty,
     projects: empty,
-    checkpoints: async () => ({ checkpoints: [] }),
-    understandingQuizzes: async () => ({ quizzes: [] }),
+    intents: empty,
     notifications: async () => ({ notifications: [] }),
     offline: async () => ({ on: false }),
   });

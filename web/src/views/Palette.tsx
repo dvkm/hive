@@ -23,18 +23,19 @@ type Item = {
 };
 
 const NAV: { label: string; path: string }[] = [
-  { label: "Chief of Staff", path: "/" },
+  { label: "Home", path: "/" },
   { label: "Work", path: "/work" },
-  { label: "Needs you", path: "/inbox" },
   { label: "Activity", path: "/feed" },
   { label: "Evidence", path: "/evidence" },
-  { label: "Agent sessions", path: "/supervisors" },
+  { label: "Chief of staff", path: "/supervisors" },
   { label: "Terminals", path: "/terminals" },
   { label: "Learnings", path: "/learnings" },
   { label: "Analytics", path: "/analytics" },
+  { label: "Monitors", path: "/monitors" },
+  { label: "Deployments", path: "/deployments" },
   { label: "Projects", path: "/projects" },
   { label: "Policies", path: "/policies" },
-  { label: "Monitors", path: "/monitors" },
+  { label: "Settings", path: "/settings" },
 ];
 
 const TYPE_ICON: Record<SearchHit["type"], string> = {
@@ -304,7 +305,7 @@ export default function Palette() {
         run: () => {
           close();
           if (h.type === "task") openTask(h.id);
-          else if (h.type === "decision") navigate(h.task_id ? `/tasks/${h.task_id}#dcard-${h.id}` : "/inbox");
+          else if (h.type === "decision") navigate(h.task_id ? `/tasks/${h.task_id}#dcard-${h.id}` : "/");
           else if (h.type === "learning") navigate("/learnings");
           else if (h.type === "policy") navigate("/policies");
           else if (h.type === "project") navigate("/projects");

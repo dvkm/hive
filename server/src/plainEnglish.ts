@@ -1,10 +1,10 @@
 // The plain-language bar for every string a human director reads: task titles
 // and briefs the planner writes, agent status notes and checkpoints, decision
-// cards, report bullets, review summaries, and understanding-quiz questions.
+// cards, report bullets, and review summaries.
 //
 // Injected verbatim into every prompt that produces such text (briefs.ts,
 // planner.ts, reviewer.ts, drift.ts) so the bar cannot drift apart between
-// them. Director feedback 2026-08-19: quizzes and briefs read like compressed
+// them. Director feedback 2026-08-19: review text and briefs read like compressed
 // engineer shorthand, e.g. "root formula restated as the two-step curve, widths
 // extended to check 1439 and 1440 either side of the step" — that example is
 // the `Bad:` line below, on purpose.

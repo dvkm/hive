@@ -9,6 +9,27 @@ test("API token entry avoids Electron's unsupported window.prompt", () => {
   expect(source).toContain('document.createElement("dialog")');
 });
 
+test("the digest call marks the look only when asked, and can pin a window", async () => {
+  const original = globalThis.fetch;
+  const urls: string[] = [];
+  globalThis.fetch = (async (url: string) => {
+    urls.push(url);
+    return new Response(JSON.stringify({ since: "s", until: "u", projects: [] }));
+  }) as unknown as typeof fetch;
+  try {
+    await api.digest(true);
+    await api.digest(false, "2026-09-22T10:00:00.000Z");
+    await api.digest();
+  } finally {
+    globalThis.fetch = original;
+  }
+  expect(urls).toEqual([
+    "/api/digest?mark=1",
+    "/api/digest?since=2026-09-22T10%3A00%3A00.000Z",
+    "/api/digest",
+  ]);
+});
+
 // Stands in the browser Cache API up with one entry stamped `cachedAt`.
 function withCachedTasks(tasks: unknown, cachedAt: number | null, run: () => Promise<void>) {
   const original = globalThis.caches;

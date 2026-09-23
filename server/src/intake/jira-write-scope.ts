@@ -1,4 +1,4 @@
-export const NEEDS_DECISION_LABEL = "hive:needs-decision";
+export const NEEDS_DECISION_LABEL = "needs-decision";
 
 export const JIRA_OWNERSHIP = {
   jiraOwnedFields: ["summary", "description", "issue type", "priority"],

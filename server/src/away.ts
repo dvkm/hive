@@ -23,7 +23,7 @@ import { pushToAll } from "./push.ts";
 import type { PushPayload } from "./push.ts";
 
 // How an outgoing push is classified. `always_through` is a list of these.
-export type PushClass = "decision" | "quiz-digest" | "security" | "spend" | "fleet_down" | "second_failure" | "info";
+export type PushClass = "decision" | "security" | "spend" | "fleet_down" | "second_failure" | "info";
 
 export interface AwaySchedule {
   start: string; // "23:00" local wall clock in `tz`
@@ -57,7 +57,6 @@ const KIND_CLASS: Record<string, PushClass> = {
   decision: "decision",
   decision_nag: "decision",
   review: "decision",
-  quiz_digest: "quiz-digest",
   circuit_breaker: "fleet_down",
   agent_unreachable: "fleet_down",
   auth_lost: "fleet_down",
@@ -198,7 +197,7 @@ export function flushHeld(db: DB, deps: FlushDeps = {}): { count: number; summar
   if (!held.length) return { count: 0, summary: "" };
   const summary = `While you were away: ${held.length} item${held.length === 1 ? "" : "s"}`;
   setSetting(db, "away_last_flush", JSON.stringify({ at: now(), items: held }));
-  void (deps.push ?? pushToAll)(db, { title: summary, body: held[held.length - 1].title, url: "/inbox" }).catch(() => {});
+  void (deps.push ?? pushToAll)(db, { title: summary, body: held[held.length - 1].title, url: "/" }).catch(() => {});
   return { count: held.length, summary };
 }
 

@@ -1,4 +1,4 @@
-import type { Checkpoint, Decision, Intent, Task, UnderstandingQuiz } from "./domain";
+import type { Decision, Intent, Task } from "./domain";
 
 // Does an item belong to the active project filter? An empty filter ("" = All)
 // matches everything. Lives here, next to the needs-you rules, so this module
@@ -18,16 +18,13 @@ export interface BlockingTaskRef {
   pr_url: string | null;
 }
 
+// The only things that ask the director for something: a decision hive left
+// for them, an ask with a question only a person can answer, and a review that
+// needs their own Ship. Everything else hive handles and reports in the digest.
 export type NeedsYouItem =
   | { kind: "decision"; id: string; decision: Decision }
   | { kind: "intent"; id: string; intent: Intent }
-  | { kind: "checkpoint"; id: string; checkpoint: Checkpoint }
-  | { kind: "quiz_digest"; id: string; quizzes: UnderstandingQuiz[] }
-  | { kind: "review"; id: string; task: Task }
-  | { kind: "verify"; id: string; task: Task }
-  | { kind: "review_pending"; id: string; task: Task }
-  | { kind: "attention"; id: string; task: Task }
-  | { kind: "waiting"; id: string; task: Task; blockedBy: BlockingTaskRef[] };
+  | { kind: "review"; id: string; task: Task };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const PRIORITY_HEAD_START: Record<NonNullable<Task["priority"]>, number> = {
@@ -40,18 +37,9 @@ const PRIORITY_HEAD_START: Record<NonNullable<Task["priority"]>, number> = {
 function focusItemKey(item: NeedsYouItem, tasks: Map<string, Task>): [number, number] {
   const candidates = item.kind === "intent"
     ? [{ ts: item.intent.updated_at, task: item.intent.task_id ? tasks.get(item.intent.task_id) : undefined }]
-    : item.kind === "quiz_digest"
-    ? item.quizzes.map((quiz) => ({ ts: quiz.ts, task: tasks.get(quiz.task_id) }))
     : item.kind === "decision"
       ? [{ ts: item.decision.ts, task: tasks.get(item.decision.task_id) }]
-      : item.kind === "checkpoint"
-        ? [{ ts: item.checkpoint.ts, task: tasks.get(item.checkpoint.task_id) }]
-        : [{
-            ts: item.kind === "attention"
-              ? item.task.health?.since ?? item.task.needs_you_since ?? item.task.updated_at
-              : item.task.needs_you_since ?? item.task.updated_at,
-            task: item.task,
-          }];
+      : [{ ts: item.task.needs_you_since ?? item.task.updated_at, task: item.task }];
 
   return candidates.reduce<[number, number]>((best, { ts, task }) => {
     const time = Date.parse(ts);
@@ -88,18 +76,6 @@ export function orderFocusItems(items: NeedsYouItem[], tasks: Task[]): NeedsYouI
       intentProject(a.item).localeCompare(intentProject(b.item)) ||
       a.key[0] - b.key[0] || a.key[1] - b.key[1] || a.index - b.index)
     .map(({ item }) => item);
-}
-
-// Mirrors server/src/health.ts's needsAttention — keep both excluding the
-// same unsupervised tasks (see server/src/supervision.ts's isSupervisedTask).
-// A never-spawned external task (tracking-only, no agent_target) is excluded;
-// a manually-spawned one is real hive-driven work and stays visible.
-export function taskNeedsAttention(task: Task): boolean {
-  if (task.source === "chat_supervisor") return false;
-  if (task.source === "external" && !task.agent_target) return false;
-  if (task.state === "in_review" || task.state === "needs_decision") return false;
-  if (task.state === "failed") return !task.requeued_to;
-  return !!task.health && (task.health.status === "dead" || task.health.status === "stuck");
 }
 
 // Auto-review exclusion is owned by #974/PR #87; keep this browser-side guard here so the changes merge independently.
@@ -184,107 +160,43 @@ function reviewIsActionable(task: Task): boolean {
   return task.review_actionable === true;
 }
 
-// Browser-safe mirror of server/src/state.ts's dependency gate. Exported so
-// BlockedBy and the needs-you queue use the same threshold.
+// Browser-safe mirror of server/src/state.ts's dependency gate, so BlockedBy
+// uses the same threshold.
 export const DEP_MET_STATES = new Set(["verifying", "done"]);
-const DEAD_DEP_STATES = new Set(["failed", "cancelled"]);
-export function unmetDeps(task: Task, tasks: Task[]): BlockingTaskRef[] {
-  return (task.depends_on ?? []).flatMap((id) => {
-    const dep = tasks.find((t) => t.id === id);
-    if (dep && DEP_MET_STATES.has(dep.state)) return [];
-    return [dep
-      ? { id: dep.id, number: dep.number, display_id: dep.display_id, title: dep.title, state: dep.state, pr_url: dep.pr_url }
-      : { id, number: 0, title: "(unknown task)", state: "missing", pr_url: null }];
-  });
-}
 
-// A task needing attention is either genuinely stuck/dead (needs routing) or
-// purely blocked on another task's pull request landing (needs nothing from the
-// director but time). Failed tasks always need routing regardless of
-// declared deps — the human chooses requeue/edit/cancel.
-export function isWaiting(task: Task, tasks: Task[]): boolean {
-  const blocking = unmetDeps(task, tasks);
-  return task.state !== "failed" && blocking.length > 0 && !blocking.every((dep) => DEAD_DEP_STATES.has(dep.state));
-}
-
-// A quiz on a shipped task is a catch-up, not a gate. Five of them are still
-// one thing to sit down and do, so they collapse into ONE digest the director
-// works through in order. Grouped by project so the project filter (and the
-// digest's own heading) still names exactly one project. Quizzes on tasks still
-// in review are NOT here — those block the review card itself.
-export function quizDigests(tasks: Task[], quizzes: UnderstandingQuiz[]): NeedsYouItem[] {
-  const byProject = new Map<string, UnderstandingQuiz[]>();
-  for (const quiz of quizzes) {
-    const state = tasks.find((task) => task.id === quiz.task_id)?.state ?? quiz.task_state;
-    if (!["verifying", "done", "failed"].includes(state)) continue;
-    const group = byProject.get(quiz.project_id);
-    if (group) group.push(quiz);
-    else byProject.set(quiz.project_id, [quiz]);
-  }
-  return [...byProject].map(([projectId, group]) => ({
-    kind: "quiz_digest" as const,
-    id: `quiz-digest:${projectId}`,
-    quizzes: group,
-  }));
-}
-
-export function getNeedsYouItems(decisions: Decision[], tasks: Task[], checkpoints: Checkpoint[], quizzes: UnderstandingQuiz[], intents: Intent[] = []): NeedsYouItem[] {
+// THE definition of "needs you" (HIVE-556: one set, so no two screens can show
+// different numbers). The server decides each part, because each reads state
+// the browser never sees:
+//   - a decision the advisor has not judged yet is hive's, not the director's
+//     (`for_director`), and one it settled is already answered;
+//   - a draft ask is the director's only while nothing else is moving it: hive
+//     is still reading the code (`hive_working`) or asked the ticket's reporter
+//     (`waiting_on`) first;
+//   - a review is the director's only when directorHold keeps it (`review_gate`).
+// Merged work, catch-up reading, checkpoints and stuck agents are not here:
+// hive handles them and the digest reports them.
+export function getNeedsYouItems(decisions: Decision[], tasks: Task[], intents: Intent[] = []): NeedsYouItem[] {
   return [
-    ...decisions.map((decision) => ({ kind: "decision" as const, id: decision.id, decision })),
-    // A draft intent is an ask nobody has accepted yet. One row each, above the
-    // reviews: accepting is what lets the work start at all, so it comes before
-    // judging work that already ran.
+    ...decisions
+      .filter((decision) => decision.for_director !== false)
+      .map((decision) => ({ kind: "decision" as const, id: decision.id, decision })),
     ...intents
-      .filter((intent) => intent.status === "draft")
+      .filter((intent) => intent.status === "draft" && !intent.hive_working && !intent.waiting_on)
       .map((intent) => ({ kind: "intent" as const, id: intent.id, intent })),
-    ...checkpoints.map((checkpoint) => ({ kind: "checkpoint" as const, id: checkpoint.id, checkpoint })),
-    ...quizDigests(tasks, quizzes),
-    // hive never closes a task (HIVE-604): every merge stops in `verifying` and
-    // waits for the director to verify it. That makes `verifying` the director's
-    // queue, so it belongs in the SAME needs-you set as reviews rather than in a
-    // second notion of pending. Tracking-only rows are included: a mirrored
-    // ticket has no PR to smoke, but the issue behind it still needs a person.
     ...tasks
-      .filter((task) => task.state === "verifying" && !mirrorStillWorking(task, tasks))
-      .map((task): NeedsYouItem => ({ kind: "verify", id: task.id, task })),
-    ...tasks
-      .filter((task) => task.state === "in_review" && !isTrackingOnly(task))
-      .map((task): NeedsYouItem =>
-        reviewIsActionable(task)
-          ? { kind: "review", id: task.id, task }
-          : { kind: "review_pending", id: task.id, task }),
-    ...tasks.filter(taskNeedsAttention).map((task): NeedsYouItem => {
-      const blockedBy = task.state === "failed" ? [] : unmetDeps(task, tasks);
-      return blockedBy.length && !blockedBy.every((dep) => DEAD_DEP_STATES.has(dep.state))
-        ? { kind: "waiting", id: task.id, task, blockedBy }
-        : { kind: "attention", id: task.id, task };
-    }),
+      .filter((task) => task.state === "in_review" && !isTrackingOnly(task) && reviewIsActionable(task))
+      .map((task) => ({ kind: "review" as const, id: task.id, task })),
   ];
 }
 
-// Which project does a needs-you item belong to? Checkpoints and quizzes carry
-// their project; a decision only knows its task, so look that up. Used by the
-// focus/backlogs views to honour the shared project filter.
+// Which project does a needs-you item belong to? A decision only knows its
+// task, so look that up. Used to honour the shared project filter.
 export function itemProject(item: NeedsYouItem, tasks: Task[]): string | undefined {
   if (item.kind === "decision") return tasks.find((task) => task.id === item.decision.task_id)?.project_id;
   if (item.kind === "intent") return item.intent.project_id;
-  if (item.kind === "checkpoint") return item.checkpoint.project_id;
-  if (item.kind === "quiz_digest") return item.quizzes[0]?.project_id;
   return item.task.project_id;
 }
 
-// THE definition of "needs you". Every place that shows a needs-you number —
-// the nav badge, the landing headline, the board's one strip — calls this, so
-// they cannot disagree again (HIVE-556). Before this, three surfaces counted
-// three different sets and the director saw 5, 8 and 3 on one screen.
-//
-// A "waiting" or "review_pending" item is visible somewhere but is not yours to
-// act on yet, so it is never part of the number. Anything that shows a
-// DIFFERENT set must be labelled with a different word than "needs you".
-export function isActionable(item: NeedsYouItem): boolean {
-  return item.kind !== "waiting" && item.kind !== "review_pending";
-}
-
 export function actionableItems(items: NeedsYouItem[], tasks: Task[], projectFilter = ""): NeedsYouItem[] {
-  return items.filter((item) => isActionable(item) && inProjectFilter(itemProject(item, tasks), projectFilter));
+  return items.filter((item) => inProjectFilter(itemProject(item, tasks), projectFilter));
 }

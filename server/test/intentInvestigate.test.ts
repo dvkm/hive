@@ -45,7 +45,7 @@ function fixture(opts: { graft?: boolean } = {}) {
     calls.push({ argv, cwd: o.cwd });
     return { ...reply(), stderr: "" };
   };
-  const accept = (id: string) => acceptIntent(db, id, { accepted_by: "hive" }, { intentExec: async () => ({ code: 0, stdout: "{}", stderr: "" }) });
+  const accept = (id: string) => acceptIntent(db, id, { accepted_by: "hive" });
   const events = () =>
     (db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'intent_investigated'").all(taskId) as { payload: string }[]).map((r) => JSON.parse(r.payload));
   return { db, repo, taskId, intent, calls, stub, accept, events };
@@ -124,13 +124,12 @@ test("a draft the director edited while hive was looking is left alone", async (
 });
 
 test("every prompt that writes for the director writes in English, whatever language the ticket is in", async () => {
-  const { buildDraftPrompt, buildChecksPrompt } = await import("../src/intentDraft.ts");
+  const { buildDraftPrompt } = await import("../src/intentDraft.ts");
   const { PLAIN_ENGLISH } = await import("../src/plainEnglish.ts");
   const f = fixture();
   const prompts = [
     await buildInvestigatePromptOf(f.intent),
     buildDraftPrompt({ title: "자산 상세화면 칩", description: "진행단계 칩이 비활성으로 남는다", comments: [] }),
-    buildChecksPrompt(f.intent),
   ];
   expect(PLAIN_ENGLISH).toContain("Write in English");
   for (const prompt of prompts) {

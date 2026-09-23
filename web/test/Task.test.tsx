@@ -1,16 +1,13 @@
-import { beforeEach, expect, test } from "bun:test";
+import { expect, test } from "bun:test";
 import { act, create } from "react-test-renderer";
 import { MemoryRouter } from "react-router-dom";
-import { Ctx, resetQuizStatesForTests, type Store } from "../src/lib/store";
+import { Ctx, type Store } from "../src/lib/store";
 import { LightboxProvider } from "../src/lib/lightbox";
 import { api } from "../src/lib/api";
-import type { Task, TaskDetail, UnderstandingQuiz } from "../src/lib/api";
+import type { Task, TaskDetail } from "../src/lib/api";
 import { TaskBody } from "../src/views/Task";
 
-// Quiz state lives in a module-level map shared across every bun test file.
-beforeEach(resetQuizStatesForTests);
-
-const fakeStore = { tasks: [], projects: [], rev: {}, quizzes: [], reloadQuizzes: () => {}, intents: [], reloadIntents: () => {} } as unknown as Store;
+const fakeStore = { tasks: [], projects: [], rev: {}, intents: [], reloadIntents: () => {} } as unknown as Store;
 
 const task = (id: string, extra: Partial<Task> = {}): Task => ({
   id,
@@ -66,23 +63,6 @@ function tree(t: Task, store: Store = fakeStore, taskDetail: TaskDetail = detail
     </MemoryRouter>
   );
 }
-
-const quiz = (taskId: string, extra: Partial<UnderstandingQuiz> = {}): UnderstandingQuiz => ({
-  id: `quiz-${taskId}`,
-  task_id: taskId,
-  ts: "2026-01-01T00:00:00.000Z",
-  task_number: 1,
-  task_title: "task",
-  task_state: "done",
-  task_kind: "ship",
-  project_id: "project",
-  report: {},
-  question: "Why does this matter?",
-  options: [{ key: "a", label: "A" }, { key: "b", label: "B" }],
-  version: `quiz-${taskId}:0`,
-  status: "required",
-  ...extra,
-});
 
 const btn = (renderer: ReturnType<typeof create>, label: string) =>
   renderer.root.findAll((n) => n.type === "button" && n.children.includes(label));
@@ -178,26 +158,38 @@ test("the task timeline renders director actors on actions and resolved decision
   expect(text).toContain("director-tab-b");
 });
 
-// The server accepts understanding-quiz answers in in_review/verifying/done/failed
-// (server/src/api.ts's UNDERSTANDING_QUIZ_ANSWERABLE_STATES), but the task page
-// used to only render the quiz when state === "in_review" — a task moved to
-// done/failed with a pending quiz showed no way to clear it (hive-1028).
-for (const state of ["done", "failed", "verifying"] as const) {
-  test(`a pending understanding quiz renders on the task page for a ${state} task`, async () => {
-    const t = task(`${state}-task`, { state });
-    const q = quiz(t.id, { task_state: state });
+// Merged work closes without the director. A verifying task offers him one
+// small optional action, and no copy telling him it waits on him.
+test("a verifying task offers Mark verified and no verify chore", async () => {
+  const t = task("merged", { state: "verifying", pr_url: "https://github.com/org/repo/pull/7" });
+  const moves: unknown[][] = [];
+  const original = api.transition;
+  api.transition = (async (...args: unknown[]) => {
+    moves.push(args);
+    return t;
+  }) as typeof api.transition;
+  // toast() reaches for a DOM this renderer has none of.
+  const doc = (globalThis as any).document;
+  (globalThis as any).document = { createElement: () => ({ classList: { add() {}, remove() {} }, remove() {} }), body: { appendChild() {} } };
+  try {
     let renderer!: ReturnType<typeof create>;
     await act(async () => {
-      renderer = create(tree(t, { ...fakeStore, quizzes: [q] } as unknown as Store));
+      renderer = create(tree(t));
     });
+    const text = JSON.stringify(renderer.toJSON());
+    expect(text).not.toContain("Nothing else moves");
+    expect(text).not.toContain("Confirm it works");
+    expect(btn(renderer, "Done")).toHaveLength(0);
 
-    const questions = renderer.root.findAll((n) => n.type === "h4" && n.children.includes(q.question));
-    expect(questions.length).toBe(1);
-
-    const labels = renderer.root.findAll((n) => n.props.className === "understanding-quiz-label");
-    expect(labels[0].children.join("")).toContain("Confirm you understood the change");
-  });
-}
+    await act(async () => {
+      await btn(renderer, "Mark verified")[0].props.onClick();
+    });
+    expect(moves).toEqual([["merged", "done", "verified by the director"]]);
+  } finally {
+    api.transition = original;
+    (globalThis as any).document = doc;
+  }
+});
 
 // HIVE-570: the risk verdicts belong to the change, not to the land queue. The
 // review card carries them while the task is in review; after it ships (or gets

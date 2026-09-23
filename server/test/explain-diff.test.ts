@@ -30,7 +30,6 @@ const HEAD_OID = "1589022070f7ba47c936b1f9159e688191b8d7bb";
 // socket still wired to an earlier, dead server.
 function makeApi(opts: { rollup?: any[]; html?: string; plannerCode?: number } = {}) {
   const db = openDb(":memory:");
-  const prompts: string[] = [];
   const exec: Exec = async (argv) => {
     if (has(argv, "gh", "pr", "diff")) return OK("diff --git a/x.ts b/x.ts\n+one line\n");
     if (has(argv, "gh", "pr", "view"))
@@ -45,13 +44,12 @@ function makeApi(opts: { rollup?: any[]; html?: string; plannerCode?: number } =
   const argvs: string[][] = [];
   const plannerExec: PlannerExec = async (argv) => {
     argvs.push(argv);
-    prompts.push(argv.find((a) => a.includes("Quiz")) ?? "");
     if (opts.plannerCode) return { code: opts.plannerCode, stdout: "", stderr: "model unavailable" };
     return { code: 0, stdout: JSON.stringify({ result: opts.html ?? PAGE }), stderr: "" };
   };
   const herdr = new Herdr(exec, "herdr");
   const handler = makeHandler(db, { herdr, exec, plannerExec });
-  return { db, handler, prompts, argvs, exec, plannerExec };
+  return { db, handler, argvs, exec, plannerExec };
 }
 
 type Handler = ReturnType<typeof makeHandler>;
@@ -65,13 +63,6 @@ async function get(handler: Handler, path: string) {
   return { status: res.status, json: (await res.json()) as any };
 }
 
-const CHECK = {
-  question: "What does this change do to the review queue?",
-  options: [{ key: "gate", label: "It holds a task until the page exists." }, { key: "none", label: "Nothing." }],
-  answer_key: "gate",
-  explanation: "The gate holds the handoff until the explanation is stored.",
-};
-
 async function readyTask(handler: Handler, prUrl: string) {
   const p = await post(handler, "/api/projects", { name: "p", repo_path: "/repo" });
   const t = await post(handler, "/api/tasks", { project_id: p.json.id, title: "explain me", brief: "b" });
@@ -81,7 +72,7 @@ async function readyTask(handler: Handler, prUrl: string) {
   await post(handler, `/api/tasks/${id}/events`, {
     type: "review_summary",
     done: ["did the thing"],
-    understanding: { background: "b", essence: "e", check: CHECK },
+    understanding: { background: "b", essence: "e" },
   });
   const ready = await post(handler, `/api/tasks/${id}/events`, { type: "ready", pr_url: prUrl });
   return { id, ready };
@@ -127,9 +118,6 @@ test("green CI: the handoff is held until the explanation page exists, then it l
   const entered = events.json.findIndex((e: any) => e.type === "state_change" && e.payload?.to === "in_review");
   expect(stored).toBeGreaterThanOrEqual(0);
   expect(stored).toBeLessThan(entered);
-
-  // The quiz comes from the review summary, not from a second set of questions.
-  expect(s.prompts.join("\n")).toContain(CHECK.question);
 });
 
 test("the explanation run cannot write files, so the page has to come back on stdout", async () => {

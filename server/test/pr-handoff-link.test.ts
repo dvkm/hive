@@ -40,17 +40,7 @@ async function post(base: string, path: string, body: unknown) {
 const REVIEW = {
   type: "review_summary",
   done: ["the work"],
-  understanding: {
-    essence: "a change",
-    checks: [
-      {
-        question: "What does this change do?",
-        options: [{ key: "a", label: "the work" }, { key: "b", label: "nothing" }],
-        answer_key: "a",
-        explanation: "It does the work.",
-      },
-    ],
-  },
+  understanding: { essence: "a change" },
 };
 
 // A task in_progress on branch `hive/mine`, already linked to its real PR.

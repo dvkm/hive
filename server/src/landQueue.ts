@@ -177,8 +177,8 @@ async function defaultMerge(db: DB, taskId: string, exec: Exec): Promise<{ ok: b
 //                  already moved past (HIVE-588); the check re-runs on the new
 //                  head, so there is nothing here for a human to answer.
 //
-// Everything else (a real conflict, red CI, a missing understanding check) needs
-// a human or the agent, so it opens the pause card instead.
+// Everything else (a real conflict, red CI) needs a human or the agent, so it
+// opens the pause card instead.
 const TRANSIENT_RE =
   /risk check did not finish|risk finding is stale|base branch was modified|base.{0,20}(changed|moved|out of date|behind)|not up to date|merge queue|enqueued|try again|rate limit|secondary rate|timed? ?out|temporarily unavailable|\b50[234]\b|checks? (are )?(still )?(pending|running|in progress)|required status checks? .{0,30}(pending|expected)/i;
 
@@ -199,42 +199,6 @@ const CAPACITY_RE =
 
 export function isCapacityLandFailure(reason: string): boolean {
   return CAPACITY_RE.test(reason);
-}
-
-// A refusal that is waiting on the DIRECTOR, not on the queue and not on the
-// agent: an understanding check that has been submitted but not yet answered.
-// The review card already asks that question, so a land-queue card here would be
-// the same question twice. The mark stays and the queue simply re-checks the
-// gate each sweep, which is what makes a quiz reset by a NEW review_summary land
-// on its own once the director passes it — no re-marking, no second card.
-// (A task with NO check submitted at all is a different thing: that needs the
-// agent, so it falls through to the pause card.)
-const QUIZ_HOLD_RE = /pass the understanding check/i;
-
-export function isQuizHold(reason: string): boolean {
-  return QUIZ_HOLD_RE.test(reason);
-}
-
-// The mark predates the insight. A director who marks a PR approved-to-land and
-// only THEN passes its understanding check has just learned what the change
-// actually does — and may no longer want it. So a pass recorded after the mark
-// freezes the queue for that task until the director taps "Land now" on the
-// review card, which re-marks it and postdates the pass (director ruling,
-// HIVE-421). Unmarking clears it the other way.
-// ponytail: derived from event order, no new column — "Land now" is the
-// existing land-queue mark call, not a new endpoint.
-export function landHeldForQuiz(db: DB, taskId: string): boolean {
-  const row = db
-    .query(
-      `SELECT (SELECT MAX(rowid) FROM events WHERE task_id = ? AND type = 'land_queued') AS marked,
-              (SELECT MAX(rowid) FROM events
-                 WHERE task_id = ? AND type = 'understanding_quiz_passed'
-                   AND json_extract(payload, '$.review_event_id') = (
-                     SELECT id FROM events WHERE task_id = ? AND type = 'review_summary'
-                      ORDER BY ts DESC, rowid DESC LIMIT 1)) AS passed`
-    )
-    .get(taskId, taskId, taskId) as { marked: number | null; passed: number | null };
-  return !!(row?.marked && row?.passed && row.passed > row.marked);
 }
 
 // Retry spacing after consecutive transient failures. The reconciler sweeps
@@ -283,9 +247,9 @@ function failedAttemptRun(db: DB, taskId: string): number {
 }
 
 // A non-transient failure is permanent until something actually changes: the
-// scope check, the missing understanding check, the confirmed risk and the
-// "task is not in_review" refusal all give the SAME answer on the same commit,
-// every sweep, forever. So a task gets ONE retry after the first non-transient
+// scope check, the confirmed risk and the "task is not in_review" refusal all
+// give the SAME answer on the same commit, every sweep, forever. So a task
+// gets ONE retry after the first non-transient
 // failure (the director answering "retry" on the pause card), and after that it
 // is held — still queued, not merged — until a human unqueues it or the agent
 // pushes a new head_sha. Measured on one machine: 116 land failures were only 30
@@ -830,10 +794,9 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
         // Red or still-running CI holds only this node. Independent nodes can
         // still enter the same batch (they land one after another, not at once).
         if (n.ci_status === "failing" || n.ci_status === "pending") continue;
-        // The reviewer has not spoken for this head yet (HIVE-581). The merge
-        // asks understandingChecksRequired, and that reads "no verdict" as
-        // "needs a check" — so attempting now refuses a task that would land
-        // free a couple of minutes later. Nothing here needs a human, so hold
+        // The reviewer has not spoken for this head yet (HIVE-581). Merging
+        // now would land a head the risk check never read, and the review is
+        // a couple of minutes away. Nothing here needs a human, so hold
         // quietly: no attempt, no failed land_attempted, no pause card.
         // reviewPipelineSettled (not a bare !verdict) is what keeps a project
         // with auto review off, or a task with no head, from stalling forever.
@@ -888,8 +851,6 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
           pending.delete(n.id);
           continue;
         }
-        // Quiz passed after the mark: wait for the director's "Land now" tap.
-        if (landHeldForQuiz(db, n.id)) continue;
         // A corrective steer is queued for the agent (it's between turns) but
         // not delivered yet: the branch is known to need a fix, so retrying the
         // merge against it now just burns attempts (HIVE-444). Hold quietly
@@ -941,10 +902,6 @@ export async function landOnce(db: DB, deps: LandDeps = {}): Promise<void> {
         pending.delete(node.id);
         const reason = result.reason ?? "merge failed";
         const code = result.ok ? undefined : codeOfFailure(db, node, reason, result.code);
-        // Waiting on the director's quiz answer: hold quietly, log nothing. A
-        // sweep runs every 30s and this refusal is a local check, so an event
-        // per sweep would be pure timeline noise.
-        if (!result.ok && isQuizHold(reason)) continue;
         // A transient cause that has already burned its retries is no longer
         // transient: it is a stall the director needs to see.
         const priorRetries = retryState(db, node.id);

@@ -379,9 +379,9 @@ async function reviewOne(db: DB, t: any, deps: ReviewerDeps): Promise<void> {
     return;
   }
   setSetting(db, "reviewer_parse_failure_streak", "0");
-  // `files` is what the reviewed diff touched. Read back by
-  // understandingChecksRequired (hive-1559) to spot sensitive paths without
-  // re-shelling out to git for every task on a director surface.
+  // `files` is what the reviewed diff touched. Read back by directorHold to
+  // spot sensitive paths without re-shelling out to git for every task on a
+  // director surface.
   const files = parseUnifiedDiff(diff.text).files.map((f) => f.path);
   writeEvent(db, { task_id: t.id, source: "system", type: "auto_review", payload: { ...review, files, ...reviewIdentity } as any });
   broadcast({ type: "task", task: getTask(db, t.id) });
@@ -412,8 +412,8 @@ async function reviewOne(db: DB, t: any, deps: ReviewerDeps): Promise<void> {
 //
 // Failed attempts (`auto_review_error`) are NOT read here. A later failure does
 // not un-review an earlier success: the review happened, and its risk verdicts
-// are still keyed to that head. Counting it made autoMergeReady (which reads
-// successes only) and understandingChecksRequired (which read both) disagree
+// are still keyed to that head. Counting it once made the auto-merge sweep
+// (which read successes only) and the merge gate (which read both) disagree
 // about the same task, so the reconciler asked for a merge every cycle and the
 // merge refused every cycle, forever (HIVE-499). Callers that care about
 // freshness compare `reviewed_head_sha` to the head they are about to act on.
@@ -1160,8 +1160,8 @@ export function riskVerdictsFor(
 // from the other side, this is the same test verifyPendingOnce uses to decide a
 // task needs no further verification: the newest review was written for this
 // exact head, and every risk and question it raised already has a verdict keyed
-// to that head. Until then the missing quiz answer is a pass that has not run,
-// not a question for the director — so the director surfaces must not count it.
+// to that head. Until then the review is a pass that has not finished, not a
+// question for the director — so the director surfaces must not count it.
 export function reviewCompleteForHead(db: DB, taskId: string, head: string | null | undefined): boolean {
   if (!head) return false;
   const review = latestAutoReviewVerdict(db, taskId);
@@ -1225,6 +1225,7 @@ function hasConfirmedRisk(raw: string): boolean {
 export interface ReviewActionableTask {
   id: string;
   state: string;
+  kind?: string | null;
   pr_url?: string | null;
   ci_status?: string | null;
   head_sha?: string | null;
@@ -1333,12 +1334,76 @@ function headOf(raw: string): unknown {
   }
 }
 
+// Paths whose changes always wait for the director's own Ship, whatever the
+// reviewer said. Per-project override: config.understanding_checks.sensitive_paths.
+export const DEFAULT_SENSITIVE_PATHS = ["auth", "token", "security", "payment", "billing", "migration", "secret", "credential", "password"];
+
+// The first sensitive token any changed path contains, matched anywhere inside a
+// path segment so "auth" hits `server/src/auth.ts` and `web/authGuard.ts`.
+// Deliberately biased to false positives: a needless hold costs one click, a
+// missed one ships money or auth code nobody looked at.
+export function sensitivePathHit(files: string[], tokens: string[]): string | null {
+  const needles = tokens.map((token) => token.toLowerCase()).filter(Boolean);
+  for (const file of files) {
+    const segments = file.toLowerCase().split("/");
+    const hit = needles.find((needle) => segments.some((segment) => segment.includes(needle)));
+    if (hit) return hit;
+  }
+  return null;
+}
+
+// Why a settled review needs the director's own Ship, in one plain sentence, or
+// null when hive lands it on its own. Product judgment and authority stay with a
+// person: a kind the project never ships alone, a finding only a person can
+// weigh, code that touches money, auth or data migrations, and a change the
+// director already pushed back on. Everything else is hive's to merge.
+export function directorHold(db: DB, task: { id: string; kind?: string | null; project_id: string }): string | null {
+  if (db.query("SELECT 1 FROM events WHERE task_id = ? AND type = 'understanding_required' LIMIT 1").get(task.id))
+    return "You asked to see this one before it ships.";
+  if (task.kind === "scout") return null;
+  const project = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id) as { config: string | null } | undefined;
+  let config: any = {};
+  try {
+    config = JSON.parse(project?.config ?? "{}") ?? {};
+  } catch {
+    config = {};
+  }
+  const kinds: string[] = Array.isArray(config.auto_merge?.kinds) ? config.auto_merge.kinds : [];
+  if (!kinds.includes(String(task.kind))) return `This project does not ship ${task.kind ?? "these"} changes on its own.`;
+  const review = latestAutoReviewVerdict(db, task.id);
+  if (review && review.verdict !== "looks_good" && review.verdict !== "caution")
+    return "The automatic review could not read this change.";
+  // Risks and questions are suspicions until the per-risk check refutes every
+  // one of them for this head (HIVE-406/407); a caution with nothing listed was
+  // never checked at all.
+  const unresolved = review
+    ? review.verdict === "caution"
+      ? !cautionCleared(db, task.id, review.reviewed_head_sha, review)
+      : !ambiguityCleared(db, task.id, review.reviewed_head_sha, review)
+    : false;
+  if (review && unresolved) {
+    const first = [...review.questions, ...review.risks].map((s) => s.trim()).find(Boolean);
+    return first ? `The reviewer raised a call only you can make: ${first}` : "The reviewer flagged something only you can weigh.";
+  }
+  const tokens = Array.isArray(config.understanding_checks?.sensitive_paths)
+    ? config.understanding_checks.sensitive_paths.map(String)
+    : DEFAULT_SENSITIVE_PATHS;
+  const hit = review ? sensitivePathHit(review.files, tokens) : null;
+  if (hit) return `It changes ${hit} code.`;
+  const pushedBack = db
+    .query("SELECT 1 FROM events WHERE task_id = ? AND type = 'changes_requested' AND source IN ('director', 'web', 'cli') LIMIT 1")
+    .get(task.id);
+  if (pushedBack) return "You asked for changes on it before.";
+  return null;
+}
+
 // Something the director can actually read: the agent's own review summary, or
 // a report attached as evidence (how scouts hand work over).
 // Why an in_review task is, or is not yet, the director's: the board's column
 // used to be labelled "Ready to Merge" for every card in it, risk-blocked ones
-// included. `needs_you` is exactly reviewActionable; the rest name the gate.
-export type ReviewGate = "needs_you" | "risk_confirmed" | "review_running" | "ci_failing" | "ci_pending" | "no_pr";
+// included. `needs_you` is a settled review that directorHold keeps for a
+// person; `hive_merging` is a settled one hive lands itself; the rest name the gate.
+export type ReviewGate = "needs_you" | "hive_merging" | "risk_confirmed" | "review_running" | "ci_failing" | "ci_pending" | "no_pr";
 
 function gateHolding(db: DB, t: ReviewActionableTask): ReviewGate {
   if (!t.pr_url) return "no_pr";
@@ -1349,7 +1414,8 @@ function gateHolding(db: DB, t: ReviewActionableTask): ReviewGate {
 
 export function reviewGate(db: DB, task: ReviewActionableTask): ReviewGate | null {
   if (task.state !== "in_review") return null;
-  return reviewActionable(db, task) ? "needs_you" : gateHolding(db, task);
+  if (!reviewActionable(db, task)) return gateHolding(db, task);
+  return directorHold(db, task) ? "needs_you" : "hive_merging";
 }
 
 export function reviewGateBatch(db: DB, tasks: ReviewActionableTask[]): Map<string, ReviewGate> {
@@ -1357,7 +1423,8 @@ export function reviewGateBatch(db: DB, tasks: ReviewActionableTask[]): Map<stri
   const gates = new Map<string, ReviewGate>();
   for (const t of tasks) {
     if (t.state !== "in_review") continue;
-    gates.set(t.id, actionable.has(t.id) ? "needs_you" : gateHolding(db, t));
+    if (!actionable.has(t.id)) gates.set(t.id, gateHolding(db, t));
+    else gates.set(t.id, directorHold(db, t) ? "needs_you" : "hive_merging");
   }
   return gates;
 }

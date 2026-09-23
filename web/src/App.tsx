@@ -9,7 +9,6 @@ import {
   faComments,
   faSatelliteDish,
   faImage,
-  faEye,
   faBookOpen,
   faChartColumn,
   faFolder,
@@ -25,13 +24,12 @@ import { useProjectFilter } from "./lib/projectFilter";
 import { relTime } from "./lib/time";
 import { toast } from "./lib/ui";
 import { pushState, enablePush } from "./lib/push";
+import Home from "./views/Home";
 import Board from "./views/Board";
-import Brief from "./views/Brief";
 import Feed from "./views/Feed";
 import Evidence from "./views/Evidence";
 import TaskPage from "./views/Task";
 import TaskModal from "./views/TaskModal";
-import Catchup from "./views/Catchup";
 import Policies from "./views/Policies";
 import Settings from "./views/Settings";
 import Monitors from "./views/Monitors";
@@ -67,44 +65,25 @@ function PushButton() {
   );
 }
 
-const SECONDARY_NAV: { label: string; items: [string, string, IconDefinition][] }[] = [
-  {
-    label: "Observe",
-    items: [
-      ["/catchup", "Catch up", faEye],
-      ["/feed", "Activity", faSatelliteDish],
-      ["/evidence", "Evidence", faImage],
-      ["/supervisors", "Agent sessions", faComments],
-      ["/terminals", "Terminals", faClipboard],
-    ],
-  },
-  {
-    label: "Improve",
-    items: [
-      ["/learnings", "Learnings", faBookOpen],
-      ["/analytics", "Analytics", faChartColumn],
-      ["/monitors", "Monitors", faHeart],
-      ["/deployments", "Deployments", faRocket],
-    ],
-  },
-  {
-    label: "Configure",
-    items: [
-      ["/projects", "Projects", faFolder],
-      ["/policies", "Policies", faScaleBalanced],
-      ["/settings", "Settings", faGear],
-    ],
-  },
+// Everything that is not Home or Work. None of it asks anything of the director.
+const DETAILS: [string, string, IconDefinition][] = [
+  ["/feed", "Activity", faSatelliteDish],
+  ["/evidence", "Evidence", faImage],
+  ["/supervisors", "Chief of staff", faComments],
+  ["/terminals", "Terminals", faClipboard],
+  ["/learnings", "Learnings", faBookOpen],
+  ["/analytics", "Analytics", faChartColumn],
+  ["/monitors", "Monitors", faHeart],
+  ["/deployments", "Deployments", faRocket],
+  ["/projects", "Projects", faFolder],
+  ["/policies", "Policies", faScaleBalanced],
+  ["/settings", "Settings", faGear],
 ];
-
 
 // Stroke icons for the rail, on a 24px grid so they scale and recolor with the theme.
 const ICONS: Record<string, string> = {
   home: "M3 11l9-8 9 8M5 9.5V21h14V9.5",
   board: "M3 5a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1zM10 5a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1h-3a1 1 0 0 1-1-1zM17 5a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1h-2a1 1 0 0 1-1-1z",
-  inbox: "M3 13l2.5-8h13L21 13M3 13v6h18v-6h-5l-1.5 2h-5L8 13z",
-  activity: "M3 12h4l3-8 4 16 3-8h4",
-  evidence: "M3 6a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2zM3 16l5-5 4 4 3-3 6 6M16 9h.01",
   search: "M18 11a7 7 0 1 1-14 0 7 7 0 0 1 14 0zM20 20l-4-4",
   more: "M5 12h.01M12 12h.01M19 12h.01",
 };
@@ -117,16 +96,73 @@ function Icon({ name }: { name: keyof typeof ICONS }) {
   );
 }
 
-// The navigation sidebar: the five places the director goes, then the
-// secondary pages by group, then search and the live dot. Labels show at
-// desktop widths; under 1100px it collapses to the icon rail (CSS).
+// The Details menu: one button that opens the list of secondary pages. It
+// closes on a pick, a click elsewhere, Escape, or another popover opening.
+function DetailsMenu() {
+  const [open, setOpen] = useState(false);
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const { pathname } = useLocation();
+  const inDetails = DETAILS.some(([to]) => pathname.startsWith(to));
+
+  useEffect(() => setOpen(false), [pathname]);
+  useEffect(() => {
+    if (!open) return;
+    const close = () => setOpen(false);
+    const onPointerDown = (event: PointerEvent) => {
+      if (!wrapRef.current?.contains(event.target as Node)) close();
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
+    window.addEventListener("hive:palette", close);
+    window.addEventListener("hive:notifications", close);
+    window.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("hive:palette", close);
+      window.removeEventListener("hive:notifications", close);
+      window.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [open]);
+
+  return (
+    <div className="rail-details" ref={wrapRef}>
+      <button
+        className={`rail-item${inDetails ? " active" : ""}`}
+        aria-expanded={open}
+        aria-haspopup="menu"
+        title="Details"
+        aria-label="Details"
+        onClick={() => {
+          if (!open) window.dispatchEvent(new Event("hive:browse"));
+          setOpen(!open);
+        }}
+      >
+        <Icon name="more" />
+        <span className="rail-label">Details</span>
+      </button>
+      {open && (
+        <div className="rail-menu" role="menu">
+          {DETAILS.map(([to, label, icon]) => (
+            <NavLink key={to} to={to} className="rail-menu-item" role="menuitem">
+              <FontAwesomeIcon icon={icon} />
+              {label}
+            </NavLink>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// The navigation sidebar: Home and Work, the Details menu, then search and the
+// live dot. Labels show at desktop widths; under 1100px it collapses to the
+// icon rail (CSS).
 function Rail({ inboxCount, offline, setOffline }: { inboxCount: number; offline: boolean; setOffline: (v: boolean) => void }) {
   const items: [string, string, keyof typeof ICONS][] = [
     ["/", "Home", "home"],
     ["/work", "Work", "board"],
-    ["/inbox", "Needs you", "inbox"],
-    ["/feed", "Activity", "activity"],
-    ["/evidence", "Evidence", "evidence"],
   ];
   return (
     <nav className="rail" aria-label="Primary">
@@ -142,22 +178,10 @@ function Rail({ inboxCount, offline, setOffline }: { inboxCount: number; offline
         <NavLink key={to} to={to} end={to === "/"} className="rail-item" title={label} aria-label={label}>
           <Icon name={icon} />
           <span className="rail-label">{label}</span>
-          {to === "/inbox" && inboxCount > 0 && <span className="badge rail-badge">{inboxCount}</span>}
+          {to === "/" && inboxCount > 0 && <span className="badge rail-badge">{inboxCount}</span>}
         </NavLink>
       ))}
-      <div className="rail-groups">
-        {SECONDARY_NAV.map((group) => (
-          <div className="rail-group" key={group.label}>
-            <div className="rail-group-label rail-label">{group.label}</div>
-            {group.items.map(([to, label, icon]) => (
-              <NavLink key={to} to={to} className="rail-item rail-sub" title={label} aria-label={label}>
-                <FontAwesomeIcon icon={icon} />
-                <span className="rail-label">{label}</span>
-              </NavLink>
-            ))}
-          </div>
-        ))}
-      </div>
+      <DetailsMenu />
       <div className="rail-gap" />
       <div className="rail-system">
         <PushButton />
@@ -180,8 +204,7 @@ function Rail({ inboxCount, offline, setOffline }: { inboxCount: number; offline
   );
 }
 
-// Mobile navigation keeps the home exchange, Needs you queue, work board, and
-// secondary operational views within one tap.
+// Mobile navigation: Home, Work, and More, which holds the Details pages.
 function MobileNav({
   inboxCount,
   offline,
@@ -193,21 +216,20 @@ function MobileNav({
 }) {
   const [moreOpen, setMoreOpen] = useState(false);
   const close = () => setMoreOpen(false);
-  const tab = (to: string, label: string, icon: string, badge = 0, end = false) => (
+  const tab = (to: string, label: string, icon: keyof typeof ICONS, badge = 0, end = false) => (
     <NavLink to={to} end={end} className="mobtab" onClick={close}>
-      <span className="mobtab-icon">{icon}</span>
+      <span className="mobtab-icon"><Icon name={icon} /></span>
       {label}
       {badge > 0 && <span className="badge mobtab-badge">{badge}</span>}
     </NavLink>
   );
-  const more = SECONDARY_NAV.flatMap(({ items }) => items);
   return (
     <>
       {moreOpen && (
         <div className="mobsheet-scrim" onClick={close}>
           <div className="mobsheet" onClick={(e) => e.stopPropagation()}>
             <div className="mobsheet-grid">
-              {more.map(([to, label, icon]) => (
+              {DETAILS.map(([to, label, icon]) => (
                 <NavLink key={to} to={to} className="mobsheet-item" onClick={close}>
                   <span className="mobsheet-icon"><FontAwesomeIcon icon={icon} /></span>
                   {label}
@@ -223,18 +245,17 @@ function MobileNav({
                   close();
                 }}
               >
-                {offline ? "⏸ Offline mode is ON — tap to resume" : "Go offline (drain the fleet)"}
+                {offline ? "Resume Hive" : "Go offline"}
               </button>
             </div>
           </div>
         </div>
       )}
       <nav className="mobnav">
-        {tab("/", "Home", "◆", 0, true)}
-        {tab("/inbox", "Needs you", "◎", inboxCount)}
-        {tab("/work", "Work", "▦")}
+        {tab("/", "Home", "home", inboxCount, true)}
+        {tab("/work", "Work", "board")}
         <button className={`mobtab ${moreOpen ? "active" : ""}`} onClick={() => setMoreOpen((v) => !v)}>
-          <span className="mobtab-icon">☰</span>
+          <span className="mobtab-icon"><Icon name="more" /></span>
           More
         </button>
       </nav>
@@ -388,8 +409,8 @@ export function Bell() {
 export default function App() {
   const { needsYou, tasks, offline, setOffline, away, setAway } = useStore();
   const projectFilter = useProjectFilter();
-  // One shared definition (lib/needsYou.ts) so this badge, the landing
-  // headline and the board strip always show the same number.
+  // One shared definition (lib/needsYou.ts) so this badge and the Home
+  // headline always show the same number.
   const inboxCount = actionableItems(needsYou, tasks, projectFilter).length;
   // The same number in the tab title and on the installed app's icon, so a
   // backgrounded hive still says how many things are waiting. Zero clears both
@@ -408,7 +429,6 @@ export default function App() {
   // notifications, refresh) carry no such state, so /tasks/:id just renders
   // the standalone page as usual.
   const background = (location.state as { backgroundLocation?: Location } | null)?.backgroundLocation;
-  const managerIsRendered = (background || location).pathname === "/";
   return (
     <div className="app">
       <a className="skip-link" href="#main-content">Skip to content</a>
@@ -433,20 +453,17 @@ export default function App() {
       <MobileNav inboxCount={inboxCount} offline={offline} setOffline={setOffline} />
       <main className="content" id="main-content">
         <Routes location={background || location}>
-          <Route path="/" element={<Chat embedded />} />
+          <Route path="/" element={<Home />} />
           <Route path="/work" element={<Board />} />
           <Route path="/board" element={<Navigate replace to="/work" />} />
-          <Route path="/inbox" element={<Brief />} />
-          <Route path="/brief" element={<Navigate replace to="/inbox" />} />
+          {/* The old queues and inboxes. What they held that still needs the
+              director is on Home now; old links and pushes land there. */}
+          {["/inbox", "/brief", "/decisions", "/review", "/catchup"].map((path) => (
+            <Route key={path} path={path} element={<Navigate replace to="/" />} />
+          ))}
           <Route path="/feed" element={<Feed />} />
           <Route path="/evidence" element={<Evidence />} />
           <Route path="/tasks/:id" element={<TaskPage />} />
-          {/* Decisions and Review were the Needs-you inbox filtered by kind;
-              one queue is one place to look. A single decision opens on its
-              task page (#dcard-<id>), where the card is answerable. */}
-          <Route path="/decisions" element={<Navigate replace to="/inbox" />} />
-          <Route path="/review" element={<Navigate replace to="/inbox" />} />
-          <Route path="/catchup" element={<Catchup />} />
           <Route path="/supervisors" element={<Supervisors />} />
           <Route path="/terminals" element={<Terminals />} />
           <Route path="/learnings" element={<Learnings />} />
@@ -465,7 +482,7 @@ export default function App() {
         </Routes>
       )}
       <Palette />
-      {!managerIsRendered && <Chat />}
+      <Chat />
     </div>
   );
 }

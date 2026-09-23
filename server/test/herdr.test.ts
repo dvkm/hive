@@ -506,7 +506,7 @@ test("spawn preserves a DIRTY leftover worktree to a ghost branch before removin
 
   expect(r.worktree_path).toBe(WT);
   expect(calls.some((c) => has(c, "checkout", "-b", "ghost-t1"))).toBe(true);
-  expect(calls.some((c) => has(c, "commit", "--no-verify", "hive: WIP rescued from t1"))).toBe(true);
+  expect(calls.some((c) => has(c, "commit", "--no-verify", "WIP"))).toBe(true);
   // the rescue lands BEFORE the removal, never after
   expect(idx(calls, "commit", "--no-verify")).toBeLessThan(idx(calls, "worktree", "remove"));
 });
