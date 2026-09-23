@@ -23,6 +23,7 @@ const OK = (stdout = ""): ExecResult => ({ code: 0, stdout, stderr: "" });
 const has = (argv: string[], ...xs: string[]) => xs.every((x) => argv.includes(x));
 
 const PAGE = "<!doctype html><html><body><h1>Explanation</h1><pre>diff</pre></body></html>";
+const HEAD_OID = "1589022070f7ba47c936b1f9159e688191b8d7bb";
 
 // Call the handler directly instead of standing up a real HTTP server. See
 // thinBriefVsMirror.test.ts: bun's fetch pool can hand a later Bun.serve a
@@ -32,7 +33,7 @@ function makeApi(opts: { rollup?: any[]; html?: string; plannerCode?: number } =
   const exec: Exec = async (argv) => {
     if (has(argv, "gh", "pr", "diff")) return OK("diff --git a/x.ts b/x.ts\n+one line\n");
     if (has(argv, "gh", "pr", "view"))
-      return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: opts.rollup ?? [] }));
+      return OK(JSON.stringify({ state: "OPEN", statusCheckRollup: opts.rollup ?? [], headRefOid: HEAD_OID }));
     if (has(argv, "worktree", "create"))
       return OK(JSON.stringify({ result: { worktree: { path: WT, branch: "hive/x", open_workspace_id: "w1" } } }));
     if (has(argv, "agent", "get")) return OK('{"result":{"agent":{"pane_id":"p1","agent_status":"working"}}}');
@@ -48,7 +49,7 @@ function makeApi(opts: { rollup?: any[]; html?: string; plannerCode?: number } =
   };
   const herdr = new Herdr(exec, "herdr");
   const handler = makeHandler(db, { herdr, exec, plannerExec });
-  return { db, handler, argvs };
+  return { db, handler, argvs, exec, plannerExec };
 }
 
 type Handler = ReturnType<typeof makeHandler>;
@@ -126,6 +127,29 @@ test("the explanation run cannot write files, so the page has to come back on st
   const argv = s.argvs.find((a) => a.some((x) => x.includes("Write a rich, interactive explanation")));
   expect(argv).toBeDefined();
   expect(argv).toContain("--disallowed-tools=Write,Edit,NotebookEdit");
+});
+
+// The first gate check runs before hive has stamped tasks.head_sha, so the page
+// used to be stored with commit_sha null. The next check, which HAS the sha,
+// could never match it and paid for a second opus run on the identical diff —
+// twice per task, every task.
+test("the page is stamped with the PR head, so the next gate check does not pay for a second run", async () => {
+  const { explanationGate } = await import("../src/explainDiff.ts");
+  const s = makeApi({ rollup: [{ conclusion: "SUCCESS" }] });
+  const { id } = await readyTask(s.handler, "https://gh/pr/5");
+  await waitForState(s.handler, id, "in_review");
+
+  const runs = () => s.argvs.filter((a) => a.some((x) => x.includes("Write a rich, interactive explanation"))).length;
+  expect(runs()).toBe(1);
+  const page = s.db.query("SELECT meta FROM evidence WHERE task_id = ? AND kind = 'explanation'").get(id) as any;
+  expect(JSON.parse(page.meta).commit_sha).toBe(HEAD_OID);
+
+  // The reconciler stamps the head a cycle later; the gate must now be satisfied.
+  s.db.query("UPDATE tasks SET head_sha = ? WHERE id = ?").run(HEAD_OID, id);
+  const task = s.db.query("SELECT * FROM tasks WHERE id = ?").get(id) as any;
+  expect(explanationGate(s.db, task, { exec: s.exec, plannerExec: s.plannerExec })).toBe("ready");
+  await new Promise((r) => setTimeout(r, 50));
+  expect(runs()).toBe(1);
 });
 
 test("a model failure records why and hands off anyway, rather than stranding the task", async () => {
