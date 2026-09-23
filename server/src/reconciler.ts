@@ -1934,7 +1934,7 @@ async function recoverStale(db: DB, deps: ReconcilerDeps): Promise<void> {
         if (cur) openBreakerDecision(db, cur, dead, Math.round(DEAD_BURST_MS / 60_000));
         continue; // breaker now open: every later task this lap is held by teardownBlocked
       }
-      await recoverDead(db, h, t.id, t.agent_target, lost ? "hive could not reach the agent and it made no progress for hours; restarted" : undefined);
+      await recoverDead(db, h, t.id, t.agent_target, lost ? "hive could not reach the agent and it made no progress for hours" : undefined);
     } else if (staleFlagged) {
       // Quiet but WORKING is not stuck — long tool runs and big builds are
       // silent by nature. Only idle/blocked/unknown agents enter recovery, and
@@ -1943,7 +1943,7 @@ async function recoverStale(db: DB, deps: ReconcilerDeps): Promise<void> {
       // than handed to the director to nudge (task 655 sat 124h that way).
       if (status === "working") {
         if (quietMs(db, t.id, nowMs) > (deps.staleMs ?? DEFAULT_STALE_MS) * HUNG_RESTART_MULTIPLIER)
-          await recoverDead(db, h, t.id, t.agent_target, "no progress while the agent still looked busy; restarted");
+          await recoverDead(db, h, t.id, t.agent_target, "no progress for hours while the agent still looked busy");
         continue;
       }
       await recoverSilent(db, h, t.id, t.agent_target, deps);
