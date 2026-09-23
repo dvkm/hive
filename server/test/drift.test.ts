@@ -392,14 +392,14 @@ test("real scope creep — a file nobody mentioned — still raises the card (HI
 
 test("directionSinceBrief reads director steers and answered decisions, not hive's own steers", () => {
   const { db, id } = setup();
-  steerTask(db, id, "unlink 비고 from the homepage too");
+  steerTask(db, id, "unlink remarks from the homepage too");
   answerCard(db, id, "one table or two?", "merge onto one table");
   db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)").run(
     newId("ev"), id, now(), "system", "steer", JSON.stringify({ message: "do not retry the land", delivery: "queued" })
   );
   const direction = directionSinceBrief(db, id);
   expect(direction.map((d) => d.kind).sort()).toEqual(["decision", "steer"]);
-  expect(direction.find((d) => d.kind === "steer")!.text).toContain("unlink 비고");
+  expect(direction.find((d) => d.kind === "steer")!.text).toContain("unlink remarks");
   expect(direction.find((d) => d.kind === "decision")!.text).toContain("merge onto one table");
   expect(JSON.stringify(direction)).not.toContain("do not retry");
 });
@@ -451,9 +451,9 @@ test("the added-line sample is bounded per file and overall", async () => {
 // already measures against the CURRENT brief.
 test("the check measures against the current brief, not the original (HIVE-560)", async () => {
   const { db, id } = setup();
-  db.query("UPDATE tasks SET brief = ? WHERE id = ?").run("Rewritten: unlink 비고 from the public reader UI.", id);
+  db.query("UPDATE tasks SET brief = ? WHERE id = ?").run("Rewritten: unlink remarks from the public reader UI.", id);
   const seen: string[] = [];
   await driftCheckOnce(db, { shellExec: git(WITHIN, ["r3", "r2", "r1"]), exec: judge({ drifting: false, beyond: [], why: "in scope" }, seen) });
-  expect(seen[0]).toContain("Rewritten: unlink 비고");
+  expect(seen[0]).toContain("Rewritten: unlink remarks");
   expect(seen[0]).not.toContain("Do NOT alter task semantics");
 });

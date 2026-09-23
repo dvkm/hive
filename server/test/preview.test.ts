@@ -31,11 +31,11 @@ const PREVIEW = {
   up: "infra/worktree/wt.sh up",
   down: "infra/worktree/wt.sh down",
   urls: [
-    { label: "web", url: "https://{slug}.test.corebeat.co.kr" },
-    { label: "CMS", url: "https://cms-{slug}.test.corebeat.co.kr" },
-    { label: "admin", url: "https://admin-{slug}.test.corebeat.co.kr" },
+    { label: "web", url: "https://{slug}.test.acme.dev" },
+    { label: "CMS", url: "https://cms-{slug}.test.acme.dev" },
+    { label: "admin", url: "https://admin-{slug}.test.acme.dev" },
   ],
-  login_hint: "superadmin@corebeat.co.kr / corebeat1234",
+  login_hint: "admin@acme.dev / changeme",
   paths: ["web/**", "cms/**"],
 };
 
@@ -44,7 +44,7 @@ function freshDb(config: any = { preview: PREVIEW }): { db: DB; projectId: strin
   const projectId = newId("proj");
   db.query("INSERT INTO projects (id, name, repo_path, config, created_at) VALUES (?,?,?,?,?)").run(
     projectId,
-    "corebeat",
+    "acme",
     "/repo",
     JSON.stringify(config),
     now()
@@ -96,11 +96,11 @@ test("preview config needs a runnable command and at least one url", () => {
 
 test("urls carry the worktree's own directory name as the slug", () => {
   const cfg = previewConfig({ preview: PREVIEW })!;
-  expect(previewSlug("/Users/d/.herdr/worktrees/corebeat/hive-abc123/")).toBe("hive-abc123");
+  expect(previewSlug("/Users/d/.herdr/worktrees/acme/hive-abc123/")).toBe("hive-abc123");
   expect(previewUrls(cfg, "/wt/cms-tracker-figma-parity")).toEqual([
-    { label: "web", url: "https://cms-tracker-figma-parity.test.corebeat.co.kr" },
-    { label: "CMS", url: "https://cms-cms-tracker-figma-parity.test.corebeat.co.kr" },
-    { label: "admin", url: "https://admin-cms-tracker-figma-parity.test.corebeat.co.kr" },
+    { label: "web", url: "https://cms-tracker-figma-parity.test.acme.dev" },
+    { label: "CMS", url: "https://cms-cms-tracker-figma-parity.test.acme.dev" },
+    { label: "admin", url: "https://admin-cms-tracker-figma-parity.test.acme.dev" },
   ]);
 });
 
@@ -121,8 +121,8 @@ test("a successful up records the urls, the login hint and the smoke result", as
   const state = previewState(db, getTask(db, id), { preview: PREVIEW })!;
   expect(state.status).toBe("ready");
   expect(state.urls.map((u) => u.label)).toEqual(["web", "CMS", "admin"]);
-  expect(state.urls[0].url).toBe(`https://hive-${id}.test.corebeat.co.kr`);
-  expect(state.login_hint).toBe("superadmin@corebeat.co.kr / corebeat1234");
+  expect(state.urls[0].url).toBe(`https://hive-${id}.test.acme.dev`);
+  expect(state.login_hint).toBe("admin@acme.dev / changeme");
   expect(state).toMatchObject({ smoke_passed: 3, smoke_failed: 1 });
   // The command runs INSIDE the task's worktree — that cwd is what gives the
   // stack its per-task slug.
@@ -255,7 +255,7 @@ test("the agent's --preview-path becomes the primary link and the note context",
   const state = previewState(db, getTask(db, id), { preview: PREVIEW })!;
   expect(state.preview_path).toBe("/coredata-tracker");
   expect(previewNoteContext(db, getTask(db, id), { preview: PREVIEW })).toBe(
-    `(seen on the preview stack: https://hive-${id}.test.corebeat.co.kr/coredata-tracker)`
+    `(seen on the preview stack: https://hive-${id}.test.acme.dev/coredata-tracker)`
   );
 });
 

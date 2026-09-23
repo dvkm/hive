@@ -294,7 +294,7 @@ export function isWorktreeNotEmptyError(r: ExecResult): boolean {
 
 // Guard for the two places that clear a directory outright. Clearable only when
 // the path is absolute, at least three levels deep, not the repo itself, and not
-// an ancestor of the repo. That rules out `/`, `/Users`, `/Users/david` and any
+// an ancestor of the repo. That rules out `/`, `/Users`, `/Users/you` and any
 // parent of the checkout; it does NOT prove the path is a worktree, so callers
 // stay responsible for that (clearOrphanPath's three conditions, or a
 // `worktree remove --force` that already authorised the deletion).

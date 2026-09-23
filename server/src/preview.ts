@@ -9,8 +9,8 @@
 //   preview: {
 //     up:   "infra/worktree/wt.sh up",
 //     down: "infra/worktree/wt.sh down",
-//     urls: [{ label: "web", url: "https://{slug}.test.corebeat.co.kr" }, ...],
-//     login_hint: "superadmin@corebeat.co.kr / corebeat1234",
+//     urls: [{ label: "web", url: "https://{slug}.test.acme.dev" }, ...],
+//     login_hint: "admin@acme.dev / changeme",
 //     paths: ["web/**", "cms/**"]
 //   }
 //
@@ -56,7 +56,7 @@ export type PreviewState = {
   at: string | null;
 };
 
-// How many stacks may be up at once on this machine. Each corebeat stack is
+// How many stacks may be up at once on this machine. A full app stack is
 // ~6 containers and ~1.2 GB, so this is a memory ceiling, not a policy.
 // ponytail: a flat machine-wide cap. Hive runs one fleet per laptop.
 export const PREVIEW_CAP = Number(process.env.HIVE_PREVIEW_CAP || 3);

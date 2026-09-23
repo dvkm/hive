@@ -521,7 +521,7 @@ test("shadow mode still imports and still logs a would-be status push", async ()
 // IMPORT + BOTH DIRECTIONS
 // ============================================================================
 test("import mirrors an issue as a tracking-only task with the mapped state", async () => {
-  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review", summary: "뉴스레터 기획" }] });
+  const jira = fakeJira({ issues: [{ key: "WEB-1", id: "1", status: "In Review", summary: "Add a dark mode toggle" }] });
   const { db, projectId } = freshDb();
   await run(db, projectId, jira.fetchImpl);
 
@@ -529,7 +529,7 @@ test("import mirrors an issue as a tracking-only task with the mapped state", as
   expect(t.source).toBe("external"); // tracking-only: never dispatched, no evidence gate
   expect(t.source_ref).toBe("jira:WEB-1");
   expect(t.state).toBe("in_review");
-  expect(t.title).toBe("[WEB-1] 뉴스레터 기획");
+  expect(t.title).toBe("[WEB-1] Add a dark mode toggle");
   expect(t.brief).toContain(`${SITE}/browse/WEB-1`);
 });
 
@@ -2237,11 +2237,11 @@ test("intake downloads the ticket's attachments and the brief names the local pa
   const { db, projectId } = freshDb(CFG);
   const f = fakeJira({
     issues: [{
-      key: "WEB-163", id: "1", status: "To Do", summary: "탭 추가",
+      key: "WEB-163", id: "1", status: "To Do", summary: "Add a tab",
       description: {
         type: "doc", version: 1,
         content: [
-          { type: "paragraph", content: [{ type: "text", text: "시안: 이미지 3" }] },
+          { type: "paragraph", content: [{ type: "text", text: "Mockup: image 3" }] },
           { type: "mediaSingle", content: [{ type: "media", attrs: { id: "a3", alt: "mockup.png" } }] },
         ],
       },
@@ -4328,7 +4328,7 @@ test.skipIf(process.platform !== "darwin")("the generated spec refuses a non-2xx
   expect(tookShot()).toBe(false);
 });
 
-// The corebeat run that prompted this: the app's API is unreachable inside the
+// The real run that prompted this: the app's API is unreachable inside the
 // seatbelt, so the page answered 200, failed no request hive counts, showed no
 // overlay, and painted a blank white 1280x800. A blank picture is worse than no
 // picture, so the spec fails the shot.
@@ -4958,7 +4958,7 @@ async function finishedTicket(cfg: any) {
 }
 
 const comment = (text: string, id = "10400") => ({
-  id, author: "Iroo Kim", text, created: new Date(Date.now() + 60_000).toISOString(),
+  id, author: "Sam Lee", text, created: new Date(Date.now() + 60_000).toISOString(),
 });
 
 test("a comment after the work finished notifies the director and files the follow-up", async () => {
@@ -4969,7 +4969,7 @@ test("a comment after the work finished notifies the director and files the foll
   const notes = notifications(db, mirror.id);
   expect(notes.length).toBe(1);
   expect(notes[0].urgency).toBe("urgent");
-  expect(notes[0].title).toBe("Jira WEB-101: new comment from Iroo Kim after the work finished");
+  expect(notes[0].title).toBe("Jira WEB-101: new comment from Sam Lee after the work finished");
   expect(notes[0].body).toContain("alert rendering is broken");
 
   const follow = workTasks(db, mirror.id).find((t) => t.id !== work)!;
@@ -5021,7 +5021,7 @@ test("a comment while work is still live only steers: no notification, no new ta
 test("a comment older than the terminal transition is left alone", async () => {
   const { jira, db, projectId, mirror } = await finishedTicket(AUTO);
   jira.byKey.get("WEB-101")!.comments.push({
-    id: "10399", author: "Iroo Kim", text: "said while it was still being worked", created: "2020-01-01T00:00:00.000+0000",
+    id: "10399", author: "Sam Lee", text: "said while it was still being worked", created: "2020-01-01T00:00:00.000+0000",
   });
   await run(db, projectId, jira.fetchImpl, AUTO);
   expect(notifications(db, mirror.id).length).toBe(0);
@@ -5151,8 +5151,8 @@ async function importedWithIntent(cfg: any = AUTO, sections: any = FIXTURE) {
     key: "WEB-500", id: "500", status: "To Do", summary: "Checkout is broken", priority: "High",
     description: { type: "doc", version: 1, content: [{ type: "paragraph", content: [{ type: "text", text: "cards fail at the last step" }] }] },
     comments: [
-      { id: "20001", author: "Iroo Kim", text: "only Visa so far", created: "2020-01-01T00:00:00.000Z" },
-      { id: "20002", author: "Mina Park", text: "please keep refunds alone", created: "2020-01-02T00:00:00.000Z" },
+      { id: "20001", author: "Sam Lee", text: "only Visa so far", created: "2020-01-01T00:00:00.000Z" },
+      { id: "20002", author: "Dana Park", text: "please keep refunds alone", created: "2020-01-02T00:00:00.000Z" },
     ],
   }] });
   const { db, projectId } = freshDb(cfg);

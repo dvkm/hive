@@ -193,7 +193,7 @@ test("retitling a task with a [KEY] prefix forms the link", async () => {
   expect(stripped.jira_mirror_relinked).toBeUndefined();
 });
 
-// The live corebeat shape: the title already carries the prefix but the row is
+// The live shape: the title already carries the prefix but the row is
 // unlinked (it was retitled before this fix), so any edit heals it.
 test("an unlinked task that already carries the prefix heals on the next edit", async () => {
   const m = mirror("WEB-121");

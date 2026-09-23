@@ -73,8 +73,8 @@ test("invalid transition is rejected with a clear error", () => {
 });
 
 test("extractPrUrl pulls a github PR URL out of free text", () => {
-  expect(extractPrUrl("PR https://github.com/corebeatcokr/monorepo/pull/1032")).toBe(
-    "https://github.com/corebeatcokr/monorepo/pull/1032"
+  expect(extractPrUrl("PR https://github.com/acme/monorepo/pull/1032")).toBe(
+    "https://github.com/acme/monorepo/pull/1032"
   );
   expect(extractPrUrl("no url here")).toBeNull();
   expect(extractPrUrl(null)).toBeNull();
@@ -83,11 +83,11 @@ test("extractPrUrl pulls a github PR URL out of free text", () => {
 
 test("transitioning to in_review backfills pr_url from the reason text when only free text carries it", () => {
   const { db, projectId } = freshDb();
-  setProjectRepo(db, projectId, "corebeatcokr/monorepo");
+  setProjectRepo(db, projectId, "acme/monorepo");
   const id = makeTask(db, projectId);
   transition(db, id, "in_progress");
-  transition(db, id, "in_review", { reason: "PR https://github.com/corebeatcokr/monorepo/pull/1032" });
-  expect(getTask(db, id).pr_url).toBe("https://github.com/corebeatcokr/monorepo/pull/1032");
+  transition(db, id, "in_review", { reason: "PR https://github.com/acme/monorepo/pull/1032" });
+  expect(getTask(db, id).pr_url).toBe("https://github.com/acme/monorepo/pull/1032");
   const linked = db.query("SELECT * FROM events WHERE task_id = ? AND type = 'pr_linked'").all(id) as any[];
   expect(linked.length).toBe(1);
   expect(JSON.parse(linked[0].payload).via).toBe("reason_backfill");
@@ -95,17 +95,17 @@ test("transitioning to in_review backfills pr_url from the reason text when only
 
 test("in_review backfill does not clobber an already-linked pr_url", () => {
   const { db, projectId } = freshDb();
-  setProjectRepo(db, projectId, "corebeatcokr/monorepo");
+  setProjectRepo(db, projectId, "acme/monorepo");
   const id = makeTask(db, projectId);
-  db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run("https://github.com/corebeatcokr/monorepo/pull/1", id);
+  db.query("UPDATE tasks SET pr_url = ? WHERE id = ?").run("https://github.com/acme/monorepo/pull/1", id);
   transition(db, id, "in_progress");
-  transition(db, id, "in_review", { reason: "PR https://github.com/corebeatcokr/monorepo/pull/1032" });
-  expect(getTask(db, id).pr_url).toBe("https://github.com/corebeatcokr/monorepo/pull/1");
+  transition(db, id, "in_review", { reason: "PR https://github.com/acme/monorepo/pull/1032" });
+  expect(getTask(db, id).pr_url).toBe("https://github.com/acme/monorepo/pull/1");
 });
 
 test("in_review backfill skips a PR named in the reason that belongs to a different repo", () => {
   const { db, projectId } = freshDb();
-  setProjectRepo(db, projectId, "corebeatcokr/monorepo");
+  setProjectRepo(db, projectId, "acme/monorepo");
   const id = makeTask(db, projectId);
   transition(db, id, "in_progress");
   // Prose an agent wrote can legitimately reference someone else's PR ("same
@@ -116,7 +116,7 @@ test("in_review backfill skips a PR named in the reason that belongs to a differ
 
 test("backfillStuckPrUrls links pr_url for a task already sitting in in_review from before the fix existed", () => {
   const { db, projectId } = freshDb();
-  setProjectRepo(db, projectId, "corebeatcokr/monorepo");
+  setProjectRepo(db, projectId, "acme/monorepo");
   const id = makeTask(db, projectId);
   // Simulate a legacy stuck task: state_change reason carried the PR URL as
   // free text, but pr_url was never set because this predates the in-transition
@@ -126,12 +126,12 @@ test("backfillStuckPrUrls links pr_url for a task already sitting in in_review f
     task_id: id,
     source: "director",
     type: "state_change",
-    payload: { from: "in_progress", to: "in_review", reason: "PR https://github.com/corebeatcokr/monorepo/pull/1024" },
+    payload: { from: "in_progress", to: "in_review", reason: "PR https://github.com/acme/monorepo/pull/1024" },
   });
 
   const count = backfillStuckPrUrls(db);
   expect(count).toBe(1);
-  expect(getTask(db, id).pr_url).toBe("https://github.com/corebeatcokr/monorepo/pull/1024");
+  expect(getTask(db, id).pr_url).toBe("https://github.com/acme/monorepo/pull/1024");
   const linked = db.query("SELECT * FROM events WHERE task_id = ? AND type = 'pr_linked'").all(id) as any[];
   expect(linked.length).toBe(1);
   expect(JSON.parse(linked[0].payload).via).toBe("stuck_reason_backfill");
@@ -139,10 +139,10 @@ test("backfillStuckPrUrls links pr_url for a task already sitting in in_review f
 
 test("backfillStuckPrUrls is a no-op when pr_url is already set or the reason has no URL", () => {
   const { db, projectId } = freshDb();
-  setProjectRepo(db, projectId, "corebeatcokr/monorepo");
+  setProjectRepo(db, projectId, "acme/monorepo");
   const linked = makeTask(db, projectId);
   db.query("UPDATE tasks SET state = 'in_review', pr_url = ? WHERE id = ?").run(
-    "https://github.com/corebeatcokr/monorepo/pull/1",
+    "https://github.com/acme/monorepo/pull/1",
     linked
   );
 
@@ -156,13 +156,13 @@ test("backfillStuckPrUrls is a no-op when pr_url is already set or the reason ha
   });
 
   expect(backfillStuckPrUrls(db)).toBe(0);
-  expect(getTask(db, linked).pr_url).toBe("https://github.com/corebeatcokr/monorepo/pull/1");
+  expect(getTask(db, linked).pr_url).toBe("https://github.com/acme/monorepo/pull/1");
   expect(getTask(db, noUrl).pr_url).toBeNull();
 });
 
 test("backfillStuckPrUrls skips a PR belonging to a different repo, and leaves pr_url null when the reason names more than one PR", () => {
   const { db, projectId } = freshDb();
-  setProjectRepo(db, projectId, "corebeatcokr/monorepo");
+  setProjectRepo(db, projectId, "acme/monorepo");
 
   const foreign = makeTask(db, projectId);
   db.query("UPDATE tasks SET state = 'in_review' WHERE id = ?").run(foreign);
@@ -183,7 +183,7 @@ test("backfillStuckPrUrls skips a PR belonging to a different repo, and leaves p
       from: "in_progress",
       to: "in_review",
       reason:
-        "PR https://github.com/corebeatcokr/monorepo/pull/1024, same fix as https://github.com/corebeatcokr/monorepo/pull/999",
+        "PR https://github.com/acme/monorepo/pull/1024, same fix as https://github.com/acme/monorepo/pull/999",
     },
   });
 

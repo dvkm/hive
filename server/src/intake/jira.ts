@@ -1311,10 +1311,10 @@ export function decideStatusSync(args: {
 export const BRIEF_PRIORITY_PREFIX = "Priority: ";
 
 // ------------------------------------------------------- attachment download
-// A brief that only NAMES a mockup is useless: WEB-163 said "시안: 이미지 3" and
-// carried three PNGs, and not one of them reached the agent. Every attachment
-// hive can read is downloaded once, and its LOCAL PATH rides next to the name
-// in the brief and the intent so the agent can just Read it.
+// A brief that only NAMES a mockup is useless: WEB-163 said "Mockup: image 3"
+// and carried three PNGs, and not one of them reached the agent. Every
+// attachment hive can read is downloaded once, and its LOCAL PATH rides next to
+// the name in the brief and the intent so the agent can just Read it.
 export const ATTACHMENT_MAX_BYTES = 10 * 1024 * 1024;
 const ATTACHMENT_MIME = /^(image\/|application\/pdf$|text\/)/i;
 const ATTACHMENT_EXT = /\.(png|jpe?g|gif|webp|svg|pdf|txt|md|csv|json)$/i;

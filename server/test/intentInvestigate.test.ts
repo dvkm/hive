@@ -146,7 +146,7 @@ test("every prompt that writes for the director writes in English, whatever lang
   const f = fixture();
   const prompts = [
     await buildInvestigatePromptOf(f.intent),
-    buildDraftPrompt({ title: "자산 상세화면 칩", description: "진행단계 칩이 비활성으로 남는다", comments: [] }),
+    buildDraftPrompt({ title: "다크 모드 전환 추가", description: "설정 화면에 다크 모드 스위치가 없다", comments: [] }),
   ];
   expect(PLAIN_ENGLISH).toContain("Write in English");
   for (const prompt of prompts) {

@@ -224,7 +224,7 @@ The Figma MCP needs interactive login, so you cannot use it. Your env has
 
 The file key and node id are in the frame's Figma URL
 (\`figma.com/design/<fileKey>/...?node-id=<nodeId>\`; turn \`1-23\` into \`1:23\`).
-If the repo ships its own helper, prefer it (corebeat has
+If the repo ships its own helper, prefer it (for example
 \`scripts/figma-frame.sh\`). Check the frame BEFORE building or changing UI, and
 attach the render as evidence. Never print, commit, or echo the token.`;
 }

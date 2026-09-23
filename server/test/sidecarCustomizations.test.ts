@@ -1,7 +1,7 @@
 // HIVE-639: hive's own one-shot `claude -p` calls run with cwd inside a
 // worktree, so the CLI used to load that repo's CLAUDE.md, the host user's
 // global CLAUDE.md, every MCP server and every hook into the cached prefix of
-// every turn. Measured on 2026-09-11 in a corebeat worktree whose AGENTS.md was
+// every turn. Measured on 2026-09-11 in a project worktree whose AGENTS.md was
 // 201KB: 92,128 prefix tokens per call, 18,057 with `--safe-mode`.
 //
 // The advisory sidecars now pass NO_CUSTOMIZATIONS. The reviewer deliberately

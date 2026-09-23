@@ -107,7 +107,7 @@ export function mirrorStillWorking(task: Task, tasks: Task[]): boolean {
 // tracking-only row (a mirrored ticket, another agent's board entry) parked in a
 // work column is deliberate: the real work runs under its children, and hive
 // never dispatches an agent for the row itself. Counting those told the director
-// six things were moving on corebeat when none of them were (HIVE-541). One a
+// six things were moving on a project when none of them were (HIVE-541). One a
 // director spawned by hand is real hive work and still counts — that is what
 // agent_target distinguishes, same test as taskNeedsAttention.
 const IN_MOTION_STATES = ["in_progress", "needs_decision", "in_review", "verifying"];

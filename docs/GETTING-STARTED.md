@@ -19,7 +19,7 @@ Read a project's config straight from the API:
 
 ```
 $ curl -sS "$HIVE_URL/api/projects" | jq -c '.[] | select(.name=="hive") | {id, repo_path, config: {auto_dispatch: .config.auto_dispatch, dispatch_kinds: .config.dispatch_kinds, max_agents: .config.max_agents, default_branch: .config.default_branch}}'
-{"id":"proj_e60f3994fbf7","repo_path":"/Users/david/projects/hive","config":{"auto_dispatch":true,"dispatch_kinds":["ship","scout","chore"],"max_agents":4,"default_branch":null}}
+{"id":"proj_e60f3994fbf7","repo_path":"/Users/you/projects/hive","config":{"auto_dispatch":true,"dispatch_kinds":["ship","scout","chore"],"max_agents":4,"default_branch":null}}
 ```
 
 A `null` `default_branch` is normal. It means the project has not overridden the default, so hive uses `main`.

@@ -252,7 +252,7 @@ const devOverlay = async (page) => {
   // The last way a broken page looks healthy: nothing at all. A single-page app
   // whose API is unreachable inside the fence can answer 200, fail no request
   // hive counts, show no overlay, and still paint a blank white page — which is
-  // what the first real run against corebeat posted. So ask the browser for two
+  // what the first run against a real app posted. So ask the browser for two
   // facts and decide here: how much text the body actually shows, and whether
   // any image, drawing or video is big enough to see. A page with neither is
   // not proof of anything.

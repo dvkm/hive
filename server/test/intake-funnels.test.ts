@@ -173,7 +173,7 @@ test("braindump: never classified, so the director is asked once, not twice", as
   expect(openCards(db, task.id).length).toBe(0);
 });
 
-// Every other project — corebeat included — must be untouched until its config
+// Every other project must be untouched until its config
 // says otherwise. This is the switch that keeps the rollout to hive alone.
 test("a project without intake_triage is never classified, on any funnel", async () => {
   resetGchatState();

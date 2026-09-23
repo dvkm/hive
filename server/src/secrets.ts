@@ -221,8 +221,8 @@ export async function resolveProjectSecrets(
 // use it and end up building UI without ever looking at the frames. The
 // headless path is the Figma REST API with a personal access token, so hive
 // passes FIGMA_TOKEN through to every agent it spawns: from its own env, or
-// from ~/.figma-token (the file corebeat's scripts/figma-frame.sh already
-// reads). The value is registered for redaction so it can never land in an
+// from ~/.figma-token (the file a repo's own scripts/figma-frame.sh may already
+// read). The value is registered for redaction so it can never land in an
 // event or evidence payload. A project secret named FIGMA_TOKEN still wins —
 // this is applied before resolveProjectSecrets in the spawn env.
 export function figmaTokenEnv(

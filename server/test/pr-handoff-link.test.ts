@@ -179,7 +179,7 @@ test("a PR in another repo on a same-named branch is refused", async () => {
   const s = makeServer(
     {
       "https://github.com/dvkm/hive/pull/141": "hive/mine",
-      "https://github.com/corebeatcokr/monorepo/pull/900": "hive/mine",
+      "https://github.com/acme/monorepo/pull/900": "hive/mine",
     },
     "git@github.com:dvkm/hive.git"
   );
@@ -187,11 +187,11 @@ test("a PR in another repo on a same-named branch is refused", async () => {
 
   const r = await post(s.base, `/api/tasks/${id}/events`, {
     type: "ready",
-    pr_url: "https://github.com/corebeatcokr/monorepo/pull/900",
+    pr_url: "https://github.com/acme/monorepo/pull/900",
   });
   expect(r.json.held).toBe(true);
   expect(r.json.reason).toBe("pr_repo_mismatch");
-  expect(r.json.message).toContain("corebeatcokr/monorepo");
+  expect(r.json.message).toContain("acme/monorepo");
   expect((s.db.query("SELECT pr_url FROM tasks WHERE id = ?").get(id) as any).pr_url).toBe(
     "https://github.com/dvkm/hive/pull/141"
   );

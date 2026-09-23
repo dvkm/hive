@@ -1,18 +1,18 @@
-# Hive-watch corebeat — token audit and TypeSafe Jev offload candidates
+# Hive-watch acme — token audit and TypeSafe Jev offload candidates
 
 Audited 2026-09-17. Scripts: `audit.py`, `audit2.py`, `audit3.py`, `audit4.py` in this scratchpad. Nothing in the hive repo was touched.
 
 ## Sessions
 
-All three carry `customTitle: "Hive-watch corebeat"`, all in one project dir
-`/Users/david/.claude/projects/-Users-david-projects-monorepo--claude-worktrees-agent-task-prioritization-87902a/`.
-They are the same watch lineage (S3 is the original `/hive-watch corebeat` invocation, S2 and S1 are its continuations after auto-compaction).
+All three carry `customTitle: "Hive-watch acme"`, all in one project dir
+`~/.claude/projects/-Users-you-projects-monorepo--claude-worktrees-agent-task-prioritization-87902a/`.
+They are the same watch lineage (S3 is the original `/hive-watch acme` invocation, S2 and S1 are its continuations after auto-compaction).
 
 | # | file | size | date | first user msg |
 |---|---|---|---|---|
-| S1 | `11bfaffa-4556-449c-a72b-e905cae41582.jsonl` | 41.5 MB | Sep 17 | fork/continuation, title `Hive-watch corebeat` |
+| S1 | `11bfaffa-4556-449c-a72b-e905cae41582.jsonl` | 41.5 MB | Sep 17 | fork/continuation, title `Hive-watch acme` |
 | S2 | `8d28249e-5c1f-4d3d-9d4f-69faa147c088.jsonl` | 29.1 MB | Sep 1 | continuation, same title |
-| S3 | `996792b6-8bcf-4e1a-91c2-2575ec90e938.jsonl` | 5.6 MB | Aug 29 | `<command-name>/hive-watch</command-name> <command-args>corebeat</command-args>` |
+| S3 | `996792b6-8bcf-4e1a-91c2-2575ec90e938.jsonl` | 5.6 MB | Aug 29 | `<command-name>/hive-watch</command-name> <command-args>acme</command-args>` |
 
 ## 1. Turns, tool calls, tokens
 
@@ -63,10 +63,10 @@ Consequence that governs everything below: **cost is linear in the number of ass
 | Bash cd ~/projects/monorepo … | 41 | 78,624 | 1,917 |
 | Bash gh pr view | 140 | 64,793 | 462 |
 | ScheduleWakeup | 382 | 60,328 | 157 |
-| Bash cd /Users/david/projects/monorepo … | 63 | 57,967 | 920 |
+| Bash cd /Users/you/projects/monorepo … | 63 | 57,967 | 920 |
 | Bash gh run | 42 | 50,940 | 1,212 |
 | Bash cd ~/projects/hive-live … | 40 | 48,587 | 1,214 |
-| Bash cd /Users/david/projects/hive-live … | 48 | 39,891 | 831 |
+| Bash cd /Users/you/projects/hive-live … | 48 | 39,891 | 831 |
 | Bash python3 inline | 41 | 39,294 | 958 |
 | Bash curl /api/understanding-quizzes | 36 | 27,982 | 777 |
 | Bash git log | 36 | 26,373 | 732 |
@@ -79,31 +79,31 @@ Consequence that governs everything below: **cost is linear in the number of ass
 | pattern | n | total chars | mean |
 |---|---:|---:|---:|
 | Bash curl /api/tasks/`<id>` | 76 | 106,789 | 1,405 |
-| Bash cd /Users/david/projects/hive-live … | 35 | 48,961 | 1,398 |
+| Bash cd /Users/you/projects/hive-live … | 35 | 48,961 | 1,398 |
 | Bash curl /api/decisions?status=open | 15 | 42,247 | 2,816 |
 | Bash echo "=== … (multi-probe) | 18 | 34,176 | 1,898 |
 | Bash cd …/monorepo/.claude/worktrees/… | 28 | 34,111 | 1,218 |
 | Bash curl /api/tasks | 23 | 22,572 | 981 |
 | Bash grep "api/checkpoints" | 1 | 19,049 | 19,049 |
-| Bash cd /Users/david/projects/monorepo | 19 | 15,900 | 836 |
+| Bash cd /Users/you/projects/monorepo | 19 | 15,900 | 836 |
 | Bash gh run | 5 | 13,353 | 2,670 |
 | Bash gh pr view | 19 | 11,559 | 608 |
 | Bash curl /api/projects | 9 | 10,302 | 1,144 |
 | WebSearch | 3 | 8,508 | 2,836 |
 | Bash python3 inline | 15 | 8,283 | 552 |
-| Bash ssh corebeat prod box | 13 | 6,899 | 530 |
+| Bash ssh acme prod box | 13 | 6,899 | 530 |
 | Bash hive CLI | 8 | 6,711 | 838 |
 
 Shape of the fetch layer: **`sqlite3 ~/.hive/hive.db` + `hive` CLI + `curl /api/tasks/<id>` + `gh pr view` + `gh run` are ~70% of all bytes read**, in ~1,200 calls averaging under 1.1 kB each. These are small, structured, highly repetitive state reads — exactly the input a judgment model would take.
 
 ## 3. The repeated per-tick decision
 
-The skill (`/Users/david/.claude/skills/hive-watch/SKILL.md`) is explicit that **all classification lives in the deterministic script** and "Claude only reacts to the lines". In practice the transcripts show Claude re-classifying every line it receives. One tick looks like this:
+The skill (`~/.claude/skills/hive-watch/SKILL.md`) is explicit that **all classification lives in the deterministic script** and "Claude only reacts to the lines". In practice the transcripts show Claude re-classifying every line it receives. One tick looks like this:
 
-1. A Monitor line arrives: `CLASS project=corebeat task=<id> :: <summary>` (mean ~300 chars).
+1. A Monitor line arrives: `CLASS project=acme task=<id> :: <summary>` (mean ~300 chars).
 2. Claude fetches the surrounding state — typically 3 to 8 calls: `sqlite3 ~/.hive/hive.db` for the task row and its recent events, `hive task <id>` / `curl /api/tasks/<id>`, `gh pr view --json state,mergeable,mergeStateStatus`, sometimes `gh run list`, `git log origin/main`.
-3. Claude makes a **small classification judgment** in prose: is this new or a re-announcement on the throttle; is it transient or a real blocker; is it a duplicate and which side is younger; is it already fixed on main; does it need David or can I act; is the agent stuck or merely rate-limited/racing.
-4. Claude acts (`hive land`, cancel, steer, requeue, ack) or does nothing, then writes one line to David, then re-arms `ScheduleWakeup`.
+3. Claude makes a **small classification judgment** in prose: is this new or a re-announcement on the throttle; is it transient or a real blocker; is it a duplicate and which side is younger; is it already fixed on main; does it need the director or can I act; is the agent stuck or merely rate-limited/racing.
+4. Claude acts (`hive land`, cancel, steer, requeue, ack) or does nothing, then writes one line to the director, then re-arms `ScheduleWakeup`.
 
 Mean **11 assistant turns per tick** across 935 ticks. The dominant outcome is *nothing to do*: a large share of the judgment snippets end in "Nothing new", "Nothing to do; holding", "informational", "Self-clears — no action".
 
@@ -115,7 +115,7 @@ Representative judgment-shaped snippets (all under 40 words):
 
 > "The name-lock refusal from my own spawn attempt, surfacing as an event. Self-clears — no action."
 
-> "The parity job on WEB-149's head is only queued (CodeBuild backlog), not failed… The CI_FAILURE signal was transient. Landing waits for that queued run."
+> "The parity job on ABC-149's head is only queued (CodeBuild backlog), not failed… The CI_FAILURE signal was transient. Landing waits for that queued run."
 
 > "The 6-hourly reminder of the six director-gated parked tasks… Informational; they wait on you."
 
@@ -131,7 +131,7 @@ Turns classified by role; cost = input + cache-read + cache-write + output on th
 | **judgment — thinking-only turns** | 2,859 | 1,520,276,283 | 26.8% |
 | **judgment — interstitial prose turns** | 1,734 | 958,750,287 | 16.9% |
 | **wait/arm** (ScheduleWakeup, Monitor, TaskStop) | 824 | 520,175,222 | 9.2% |
-| **report to David** (turn ending a tick) | 814 | 500,281,390 | 8.8% |
+| **report to the director** (turn ending a tick) | 814 | 500,281,390 | 8.8% |
 | other tools | 103 | 49,124,747 | 0.9% |
 | total | 10,307 | 5,680,598,875 | 100% |
 
@@ -142,10 +142,10 @@ Per session:
 | fetch | 33.3% | 40.7% | 36.6% |
 | judgment (thinking) | 36.0% | 20.4% | 26.1% |
 | judgment (prose) | 11.3% | 20.2% | 19.9% |
-| report to David | 5.7% | 9.3% | 17.2% |
+| report to the director | 5.7% | 9.3% | 17.2% |
 | wait/arm | 12.3% | 8.7% | 0.0% |
 
-**Judgment = 43.6% of all tokens (4,593 turns).** Fetching = 37.5%. Writing to David = 8.8%. Loop bookkeeping = 9.2%.
+**Judgment = 43.6% of all tokens (4,593 turns).** Fetching = 37.5%. Writing to the director = 8.8%. Loop bookkeeping = 9.2%.
 
 That 43.6% is the direct offload target. A meaningful slice of the 37.5% fetch cost is downstream of the same judgments — probes run only to settle "is this real or transient" — so the reachable ceiling is higher than 43.6%, call it 55-65% if the judgment is answered before Claude is woken at all.
 
@@ -164,7 +164,7 @@ Each is a decision the session makes many times per night, from state the hive s
 - **Input state**: the new line; the list of (class, task, one-line resolution) this session already closed; the throttle windows (6h failed/checkpoints/duplicates, 1h stale/orphan/mirror, 30m decisions/land-fail/land-ready).
 - **Question**: is this the same open item Claude already resolved or already decided to hold?
 - **Answer**: yes/no. On yes, replay the stored one-liner instead of re-deriving it.
-- **Evidence**: "The 6-hour re-announcement of CORE-1255's context-exhaustion failure… Nothing new."; "Routine repeat of an already-resolved task."; "The known failed parent again; informational." (three consecutive ticks in S1).
+- **Evidence**: "The 6-hour re-announcement of ACME-1255's context-exhaustion failure… Nothing new."; "Routine repeat of an already-resolved task."; "The known failed parent again; informational." (three consecutive ticks in S1).
 - **Estimate**: ~150 ticks × ~5 turns ≈ 750 turns ≈ **413 M (7%)**.
 
 ### 3. "Transient or real blocker?" — Choice {transient-retry, real-blocker, needs-human}
@@ -188,12 +188,12 @@ Each is a decision the session makes many times per night, from state the hive s
 - **Evidence**: "#2102 is confirmed a duplicate of already-merged work (#1216)… I'm cancelling the respawned agent now"; "Adjacent, not duplicate — but they'd collide"; and a whole tick spent re-tightening the watcher because DUPLICATE fired on a landed pair.
 - **Estimate**: ~40 × ~6 turns ≈ 240 turns ≈ **132 M (2.3%)**.
 
-### 6. "Does this need David, or may I act?" — Score on ordered levels {act-silently, act-and-mention, ask-David, urgent-wake-David}
-- **Input state**: the item (decision card body, checkpoint note, quiz), its kind (chore/scout/ship/product/security), the project's `auto_merge.kinds` config, whether David delegated this class in-session, the `needs_human` flag.
+### 6. "Does this need the director, or may I act?" — Score on ordered levels {act-silently, act-and-mention, ask-director, urgent-wake-director}
+- **Input state**: the item (decision card body, checkpoint note, quiz), its kind (chore/scout/ship/product/security), the project's `auto_merge.kinds` config, whether the director delegated this class in-session, the `needs_human` flag.
 - **Question**: how high does this escalate?
 - **Answer**: ordered score — this is the one that must be conservative, so a calibrated level with a high bar for the bottom rung.
 - **Evidence**: "Well-judged card. Notably it refused to mint a CMS admin JWT…"; "The map-pin decision is the one already surfaced to you; still waiting on your 1/2/3/park."
-- **Estimate**: ~80 × ~4 turns ≈ 320 turns ≈ **176 M (3.1%)**. Keep a human-side floor: never let the model move something *down* from ask-David without David's in-session delegation.
+- **Estimate**: ~80 × ~4 turns ≈ 320 turns ≈ **176 M (3.1%)**. Keep a human-side floor: never let the model move something *down* from ask-director without the director's in-session delegation.
 
 ### 7. "Agent silent: stalled, rate-limited, deferred, or director-queue?" — Choice {respawn, wait, deferred-noop, verifying-tell-director}
 - **Input state**: task state, `agent_target`, last event kind + age, last `recovery_nudge` text, deferred flag/`deferred_until`, whether a usage-limit event appears in the last hour.
@@ -216,4 +216,4 @@ Each is a decision the session makes many times per night, from state the hive s
 
 Nothing here is helped by trimming tool output — 3.57 M chars of data cost 0.9 M tokens against a 5.68 B bill. The bill is 10,307 turns each dragging a ~551k-token context. So the Jev integration that pays is one that answers the question **before the session is woken**, inside `hive_watch.py`, so the suppressed tick produces zero Claude turns — not one that Claude calls as a tool, which would still cost a full turn to invoke and another to read.
 
-Design that follows: `hive_watch.py` gathers the same task/PR/event state it already gathers for its board-state classes, puts it to Jev as the typed question above, and emits a line only when the answer clears the threshold — plus a nightly digest of what it suppressed so David can see the recall. The skill's "no classification lives in Claude" invariant then becomes true in fact, and its determinism claim weakens in a bounded, auditable way (Jev's answers are typed and loggable, so a fixed fixture still replays).
+Design that follows: `hive_watch.py` gathers the same task/PR/event state it already gathers for its board-state classes, puts it to Jev as the typed question above, and emits a line only when the answer clears the threshold — plus a nightly digest of what it suppressed so the director can see the recall. The skill's "no classification lives in Claude" invariant then becomes true in fact, and its determinism claim weakens in a bounded, auditable way (Jev's answers are typed and loggable, so a fixed fixture still replays).

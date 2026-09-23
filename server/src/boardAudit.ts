@@ -91,7 +91,7 @@ function mergedNotClosed(db: DB): AuditFinding[] {
 }
 
 // 2. Closed but not merged, the dangerous direction: hive says done, and the PR
-//    never landed. Hive's OWN events cannot answer this — 35 corebeat tasks
+//    never landed. Hive's OWN events cannot answer this — 35 real tasks
 //    carry no `merged` event and every one of them is merged on GitHub, because
 //    a human landed them outside hive. Believing the local record here would
 //    have made this the noisiest check in the audit and the first one ignored.

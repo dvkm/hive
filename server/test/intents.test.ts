@@ -79,7 +79,7 @@ test("body_md must carry the five playbook headings in order", () => {
 });
 
 test("open questions: a plain bullet is unanswered, a ticked one is not", () => {
-  const body = BODY + "- [x] which repo? corebeat\n- [ ] who signs off?\n- and the rollback path?\n";
+  const body = BODY + "- [x] which repo? acme\n- [ ] who signs off?\n- and the rollback path?\n";
   expect(openQuestions(body)).toEqual(["who signs off?", "and the rollback path?"]);
   expect(openQuestions(BODY)).toEqual([]);
   expect(intentSection(BODY, "Problem")).toBe("Post-Done Jira comments land on nothing.");

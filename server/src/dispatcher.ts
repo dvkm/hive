@@ -88,7 +88,7 @@ const WORKING_STATES = "('in_progress','needs_decision')";
 const ACTIVE_STATES = "('in_progress','needs_decision','in_review','verifying')";
 // ...and neither does a DEFERRED task (HIVE-619). Deferring parks a task on an
 // OFFLINE human action, often with no end date, so its slot was never given
-// back: two corebeat tasks held 2 of 12 slots forever with no live agent on
+// back: two real tasks held 2 of 12 slots forever with no live agent on
 // either. Same exclusion the queued scan above uses, for the same reason.
 const NOT_DEFERRED = "(deferred_until IS NULL OR deferred_until <= ?)";
 // ponytail: fixed 2× multiplier — total live agents (incl. review-parked) may

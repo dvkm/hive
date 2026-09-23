@@ -26,7 +26,7 @@ test("re-routes an acme braindump away from the requested hive project", () => {
   });
 
   const text =
-    "New homepage hero for the CoreData sharing flow — see https://figma.com/file/CoreData/CoreData-공유";
+    "New homepage hero for the CoreData sharing flow — see https://figma.com/file/CoreData/CoreData-share";
   const r = routeIntakeProject(db, text, hive); // requested = hive (the default)
   expect(r.project_id).toBe(acme);
   expect(r.rerouted).toBe(true);

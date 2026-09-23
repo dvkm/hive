@@ -6,7 +6,7 @@ Date: 2026-09-17. Source: web/src/views/ReviewCard.tsx (ReviewCard, VerifyCard),
 
 Yes. The numbers and the code both say the mental model is the better lead.
 
-- The lead line "What changed" is chosen by a fallback chain: the pre-reviewer's diff summary first (present on 68% of reviews), then the agent's `essence`, then the first Completed line. The pre-reviewer writes from the diff, in engineer voice: "Adds a sectorOrder prop to CategoryListPanel so player-search asset rows cluster by 섹터…". The agent's `essence` is written for a person: "The list is re-ordered in the browser so rows of the same 섹터 sit together, inside the 매매거래 and 개발 groups it already had." The card demotes the second into the collapsed panel as "Core idea".
+- The lead line "What changed" is chosen by a fallback chain: the pre-reviewer's diff summary first (present on 68% of reviews), then the agent's `essence`, then the first Completed line. The pre-reviewer writes from the diff, in engineer voice: "Adds a sectorOrder prop to CategoryListPanel so player-search asset rows cluster by sector…". The agent's `essence` is written for a person: "The list is re-ordered in the browser so rows of the same sector sit together, inside the sales and rentals groups it already had." The card demotes the second into the collapsed panel as "Core idea".
 - The packet exists almost always: 97% of reviews carry `understanding`, 96% a `background`, 96% an `essence`, 93% a walkthrough, 91% a `participate`. It is the one piece of text the protocol tells agents to write "the way you would explain the change to a colleague on the phone".
 - The card already fights duplication between the three sources (`withoutPromoted` deletes the essence from the panel when it matches the lead). Three phrasings of one fact is the structural cause. One source should own the headline.
 
@@ -22,7 +22,7 @@ Recommendation: the headline is `essence`. `background` is the second line. The 
 | 4 | CI badge | when ci_status set | most | Show only failing, pending, or never ran. Green CI is the default, not news. |
 | 5 | Open decision cards (radios) | open decisions on the task | 36% of tasks have had one | Keep. It is the thing to do first. |
 | 6 | Stacked-PR warning | branch shares commits with another open task | rare | Keep. Changes the merge decision. |
-| 7 | Preview panel (stack status, start/stop) | projects with a preview config | corebeat only | Keep, it is an action. Collapse to one line when nothing is running. |
+| 7 | Preview panel (stack status, start/stop) | projects with a preview config | one project | Keep, it is an action. Collapse to one line when nothing is running. |
 | 8 | What changed + paths + diffstat | any of auto_review summary / essence / done[0] | ~100% | Replace with `essence`. Diffstat goes to the trail. |
 | 9 | Before → after table | a done/testing line contains "A -> B" with a number | 87 of 6,431 lines (1.4%) | Cut. Rare, regex on prose, and when it fires the line is usually a test count nobody decides on. |
 | 10 | Why it was needed | background, else a Completed line with "because" | 96% | Keep as line two. |
@@ -47,7 +47,7 @@ Recommendation: the headline is `essence`. `background` is the second line. The 
 
 Blocks: meta, PR link, What changed, Why it was needed, evidence strip, "Understand this change" (collapsed), "Needs you: Check it, then close it. This merged and is waiting on you. Nothing else moves it.", Verified button, Open task.
 
-What a verifier needs is different from what a reviewer needs: what to look at, where, and what good looks like. That is `participate` ("Open a 플레이어 on the map search and check the list reads the way you want…"), the screenshots, and the preview URL. Today `participate` is inside the collapsed panel as the last paragraph and the lead is the pre-reviewer's jargon line.
+What a verifier needs is different from what a reviewer needs: what to look at, where, and what good looks like. That is `participate` ("Open a player on the map search and check the list reads the way you want…"), the screenshots, and the preview URL. Today `participate` is inside the collapsed panel as the last paragraph and the lead is the pre-reviewer's jargon line.
 
 Recommended verify card: Core idea, then "Check this" (participate) with the preview or PR link, then screenshots, then the button. Before and How it works collapsed. Evidence chips in the trail.
 

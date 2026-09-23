@@ -57,10 +57,10 @@ export function claudeBin(): string {
 // Hive's own one-shot `claude -p` calls run with cwd inside a worktree, so the
 // CLI loads that repo's CLAUDE.md, the host user's global CLAUDE.md, every MCP
 // server and every hook into the cached prefix of EVERY turn. None of that is
-// input to the job, and hive does not control how big it gets: corebeat's
+// input to the job, and hive does not control how big it gets: one project's
 // AGENTS.md reached 201KB before it was cut by hand on 2026-09-04.
 //
-// Measured 2026-09-11, same trivial prompt, same corebeat worktree:
+// Measured 2026-09-11, same trivial prompt, same worktree of that project:
 //   201KB AGENTS.md: 92,128 prefix tokens -> 18,057 with this flag ($0.1520 -> $0.0094)
 //    17KB AGENTS.md: 35,919 prefix tokens -> 18,061 with this flag ($0.0478 -> $0.0114)
 // The floor is flat either way, which is the point: hive stops paying for a file

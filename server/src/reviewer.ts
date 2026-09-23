@@ -558,7 +558,7 @@ const MAX_VERIFY_ATTEMPTS = 3;
 // The 60s reviewer tick is shorter than one verification pass (up to
 // TIMEOUT_MS per finding), so without this every tick stacked ANOTHER full pass
 // on the same head: six overlapping runs all timing out, each overwriting the
-// last with an emptier result (observed on corebeat ed28a0ca27c6).
+// last with an emptier result (observed on task ed28a0ca27c6).
 const verifyInFlight = new Set<string>();
 
 // What the TypeSafe (Jev) pre-judgment said about this finding, recorded on the
@@ -643,7 +643,7 @@ export function extractAnswer(raw: string): { answerable: "machine" | "human"; a
 // Answered decisions on this task, oldest first, each with the date it was
 // answered (HIVE-571). The risk check saw only the diff, so a product ambiguity
 // the director had ALREADY ruled on came back as a merge-blocking risk: on
-// corebeat 3f6e5ffe5aaa the finding was "if the reporter meant separate
+// task 3f6e5ffe5aaa the finding was "if the reporter meant separate
 // windows, this ships the wrong UI", which is exactly the question decision
 // dec_3874b7587abf answered. Same blind spot the scope check had, same input
 // fixes it (drift.ts directionSinceBrief).

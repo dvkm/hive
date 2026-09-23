@@ -130,7 +130,7 @@ test("the repo itself, and a shallow path, are never clearable", async () => {
   expect(isClearableWorktreePath("/repo", "")).toBe(false);
   expect(isClearableWorktreePath("/repo", "relative/path")).toBe(false);
   // Shallow paths stay off limits: a home directory is not a worktree.
-  expect(isClearableWorktreePath("/repo", "/Users/david")).toBe(false);
+  expect(isClearableWorktreePath("/repo", "/Users/you")).toBe(false);
   // An ancestor of the repo is never clearable, however deep it is.
   expect(isClearableWorktreePath("/a/b/c/repo", "/a/b/c")).toBe(false);
   expect(isClearableWorktreePath("/repo", "/wt/hive/x")).toBe(true);

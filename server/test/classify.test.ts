@@ -364,13 +364,13 @@ test("destructive SQL against the agent's OWN worktree docker DB downgrades; any
 });
 
 test("a docker DB client built in a shell variable is waived only for the agent's own container", () => {
-  // Live 2026-08-31 (dec_e01966a50764): a corebeat agent resetting its own
+  // Live 2026-08-31 (dec_e01966a50764): an agent resetting its own
   // disposable MariaDB for a clean "before" screenshot was escalated, because
   // the delete runs through `$DBC`, not a literal `mysql` call.
   const env = { HOME: "/Users/ada" };
   const cwd = "/Users/ada/.herdr/worktrees/monorepo/hive-d46ff4c08728";
   const reset = (container: string) =>
-    `set -e\nDBC="docker exec -i ${container} mysql -uroot -proot corebeat"\n` +
+    `set -e\nDBC="docker exec -i ${container} mysql -uroot -proot acme"\n` +
     '$DBC -e "delete from dev_tracker where coredata_visible=0; delete from coredata_import_log" 2>/dev/null\n' +
     '$DBC -t -e "select coredata_visible, count(*) c from dev_tracker group by 1" 2>/dev/null';
   const own = reset("hive-d46ff4c08728-mariadb");
@@ -384,16 +384,16 @@ test("a docker DB client built in a shell variable is waived only for the agent'
   expect(classify(reset("hive-abc123def456-mariadb"), env, cwd).decision).toBe("dangerous");
   // production / staging hosts: gated no matter how the client is built
   expect(
-    classify('DB="mysql -h prod-db.corebeat.co.kr -uroot corebeat"\n$DB -e "delete from dev_tracker"', env, cwd).decision
+    classify('DB="mysql -h prod-db.acme.dev -uroot acme"\n$DB -e "delete from dev_tracker"', env, cwd).decision
   ).toBe("dangerous");
   expect(
-    classify('docker exec -i staging-mariadb mysql corebeat -e "delete from dev_tracker"', env, cwd).decision
+    classify('docker exec -i staging-mariadb mysql acme -e "delete from dev_tracker"', env, cwd).decision
   ).toBe("dangerous");
   // own container AND an out-of-sandbox target in one command: gated
   expect(
     classify(
       'docker exec -i hive-d46ff4c08728-mariadb mysql -e "delete from t"\n' +
-        'mysql -h staging-db.corebeat.co.kr -e "delete from t"',
+        'mysql -h staging-db.acme.dev -e "delete from t"',
       env,
       cwd
     ).decision
