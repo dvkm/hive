@@ -36,7 +36,7 @@ When this task reaches review, hive brings your worktree's stack up and puts its
 web / CMS / admin URLs on the review card. Name the page you changed so the
 director lands on it instead of a home page:
 
-  hive emit <task-id> ready --pr-url <url> --preview-path /coredata-tracker
+  hive emit <task-id> ready --pr-url <url> --preview-path /reports
 
 One path, starting with \`/\`, on the site you changed. Leave it out if your
 change has no single page.`;

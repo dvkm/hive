@@ -22,11 +22,11 @@ test("re-routes an acme braindump away from the requested hive project", () => {
   const hive = mkProject(db, "hive", { repo_path: "/Users/ada/projects/hive" });
   const acme = mkProject(db, "acme", {
     repo_path: "/Users/ada/projects/acme",
-    keywords: ["coredata", "figma.com/file/CoreData"],
+    keywords: ["atlas", "figma.com/file/Atlas"],
   });
 
   const text =
-    "New homepage hero for the CoreData sharing flow — see https://figma.com/file/CoreData/CoreData-share";
+    "New homepage hero for the Atlas sharing flow — see https://figma.com/file/Atlas/Atlas-share";
   const r = routeIntakeProject(db, text, hive); // requested = hive (the default)
   expect(r.project_id).toBe(acme);
   expect(r.rerouted).toBe(true);
@@ -36,7 +36,7 @@ test("re-routes an acme braindump away from the requested hive project", () => {
 test("keeps the requested project when text matches nothing", () => {
   const db = openDb(":memory:");
   const hive = mkProject(db, "hive");
-  mkProject(db, "acme", { keywords: ["coredata"] });
+  mkProject(db, "acme", { keywords: ["atlas"] });
   const r = routeIntakeProject(db, "refactor the scheduler retry backoff", hive);
   expect(r.project_id).toBe(hive);
   expect(r.rerouted).toBe(false);
@@ -45,7 +45,7 @@ test("keeps the requested project when text matches nothing", () => {
 test("keeps the requested project when it is the best match", () => {
   const db = openDb(":memory:");
   const hive = mkProject(db, "hive");
-  mkProject(db, "acme", { keywords: ["coredata"] });
+  mkProject(db, "acme", { keywords: ["atlas"] });
   const r = routeIntakeProject(db, "the hive dispatcher drops queued tasks", hive);
   expect(r.project_id).toBe(hive);
   expect(r.rerouted).toBe(false);
@@ -65,14 +65,14 @@ test("short project names only match on word boundaries", () => {
 test("POST /api/intake files the braindump in the routed project", async () => {
   const db = openDb(":memory:");
   const hive = mkProject(db, "hive");
-  const acme = mkProject(db, "acme", { keywords: ["coredata"] });
+  const acme = mkProject(db, "acme", { keywords: ["atlas"] });
   const handler = makeHandler(db, { plannerExec: async () => ({ code: 0, stdout: "{}", stderr: "" }) });
 
   const res = await handler(
     new Request("http://x/api/intake", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ project_id: hive, text: "redesign the CoreData share sheet" }),
+      body: JSON.stringify({ project_id: hive, text: "redesign the Atlas share sheet" }),
     })
   );
   const body: any = await res.json();

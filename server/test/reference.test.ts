@@ -12,7 +12,7 @@ const { addReference, listReferences, captureRecurringRefs, resolveRefCaptureFor
 const { composeBrief } = await import("../src/briefs.ts");
 import type { DB } from "../src/db.ts";
 
-const FIGMA = "https://www.figma.com/design/Fak3K3yFak3K3yFak3K3y0/CoreData";
+const FIGMA = "https://www.figma.com/design/Fak3K3yFak3K3yFak3K3y0/Atlas";
 
 function freshDb(): { db: DB; projectId: string } {
   const db = openDb(":memory:");
@@ -82,8 +82,8 @@ test("captureRecurringRefs proposes a card for a link in >=3 tasks, once, and sa
   captureRecurringRefs(db); // idempotent — no second card
   expect(openCards(db)).toHaveLength(1);
 
-  resolveRefCaptureForDecision(db, cards[0].id, "save", "CoreData design file");
-  expect(listReferences(db, projectId)[0].title).toBe("CoreData design file");
+  resolveRefCaptureForDecision(db, cards[0].id, "save", "Atlas design file");
+  expect(listReferences(db, projectId)[0].title).toBe("Atlas design file");
   // already stored → no re-propose even after the card is answered
   db.query("UPDATE decisions SET status = 'answered' WHERE id = ?").run(cards[0].id);
   captureRecurringRefs(db);

@@ -71,7 +71,7 @@ worktree path, e.g. `["bun","infra/worktree/wt.ts","up","{worktree}"]` /
 and `gchat_spaces` (`[{space, label?}]`, the Google Chat intake allowlist —
 messages in each `spaces/<id>` become draft tasks in THIS project; see Intake
 connectors below), and `intake_keywords` (`string[]`, domains / links / keywords
-that mark a braindump as belonging to THIS project — e.g. `["coredata",
+that mark a braindump as belonging to THIS project — e.g. `["atlas",
 "figma.com/file/…"]`. At `POST /api/intake` the raw text is scored against every
 project's name, repo basename, and these keywords, and the braindump is re-routed
 to the best match when it strictly out-scores the requested project).

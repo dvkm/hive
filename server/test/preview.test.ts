@@ -250,19 +250,19 @@ test("the agent's --preview-path becomes the primary link and the note context",
     task_id: id,
     source: "agent",
     type: "ready_for_review",
-    payload: { preview_path: "/coredata-tracker" },
+    payload: { preview_path: "/reports" },
   });
   const state = previewState(db, getTask(db, id), { preview: PREVIEW })!;
-  expect(state.preview_path).toBe("/coredata-tracker");
+  expect(state.preview_path).toBe("/reports");
   expect(previewNoteContext(db, getTask(db, id), { preview: PREVIEW })).toBe(
-    `(seen on the preview stack: https://hive-${id}.test.acme.dev/coredata-tracker)`
+    `(seen on the preview stack: https://hive-${id}.test.acme.dev/reports)`
   );
 });
 
 test("a preview path that is not a plain path on the preview host is dropped", async () => {
   const { db, projectId } = freshDb();
   const id = seedTask(db, projectId);
-  for (const bad of ["https://evil.example/x", "//evil.example/x", "coredata"]) {
+  for (const bad of ["https://evil.example/x", "//evil.example/x", "reports"]) {
     writeEvent(db, { task_id: id, source: "agent", type: "ready_for_review", payload: { preview_path: bad } });
     expect(previewState(db, getTask(db, id), { preview: PREVIEW })!.preview_path).toBeNull();
   }

@@ -7255,7 +7255,7 @@ async function ingestEvent(db: DB, taskId: string, req: Request, deps: HandlerDe
             "Handoff held: hive is writing the explanation page for this PR. Stay on the task — it moves to review by itself when the page is ready (usually a few minutes).",
         });
       }
-      // `--preview-path /coredata-tracker` (or preview_path in the handoff JSON):
+      // `--preview-path /reports` (or preview_path in the handoff JSON):
       // the page the agent actually changed. The review card renders it as the
       // primary preview link, so the director opens that page and not a home page.
       const previewPath = String((fields as any).preview_path ?? "").trim();

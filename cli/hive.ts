@@ -58,7 +58,7 @@ Usage:
         deferred: park a task waiting on an OFFLINE human action (no more "gone quiet" nudges);
                   [--until <iso>] or [--days <n>] to auto-resume, else indefinite. undefer to resume early.
         ready: PR open (or scout report written) → hand off to review (in_progress -> in_review)
-        --preview-path <path>: on ready, the page you changed ("/coredata-tracker").
+        --preview-path <path>: on ready, the page you changed ("/reports").
         The review card opens the task's preview stack straight at that page.
   hive decision ask <task-id> --title <t> --context <s> [--risk <s>] [--blast <s>]
         --option key:label:detail  (repeatable)  --recommend <key>  --needs-input <key>

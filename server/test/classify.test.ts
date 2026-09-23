@@ -371,8 +371,8 @@ test("a docker DB client built in a shell variable is waived only for the agent'
   const cwd = "/Users/ada/.herdr/worktrees/monorepo/hive-d46ff4c08728";
   const reset = (container: string) =>
     `set -e\nDBC="docker exec -i ${container} mysql -uroot -proot acme"\n` +
-    '$DBC -e "delete from dev_tracker where coredata_visible=0; delete from coredata_import_log" 2>/dev/null\n' +
-    '$DBC -t -e "select coredata_visible, count(*) c from dev_tracker group by 1" 2>/dev/null';
+    '$DBC -e "delete from orders where visible=0; delete from import_log" 2>/dev/null\n' +
+    '$DBC -t -e "select visible, count(*) c from orders group by 1" 2>/dev/null';
   const own = reset("hive-d46ff4c08728-mariadb");
   expect(classify(own, env, cwd).decision).toBe("unknown"); // waived -> allow-and-log
 
@@ -384,10 +384,10 @@ test("a docker DB client built in a shell variable is waived only for the agent'
   expect(classify(reset("hive-abc123def456-mariadb"), env, cwd).decision).toBe("dangerous");
   // production / staging hosts: gated no matter how the client is built
   expect(
-    classify('DB="mysql -h prod-db.acme.dev -uroot acme"\n$DB -e "delete from dev_tracker"', env, cwd).decision
+    classify('DB="mysql -h prod-db.acme.dev -uroot acme"\n$DB -e "delete from orders"', env, cwd).decision
   ).toBe("dangerous");
   expect(
-    classify('docker exec -i staging-mariadb mysql acme -e "delete from dev_tracker"', env, cwd).decision
+    classify('docker exec -i staging-mariadb mysql acme -e "delete from orders"', env, cwd).decision
   ).toBe("dangerous");
   // own container AND an out-of-sandbox target in one command: gated
   expect(
@@ -400,7 +400,7 @@ test("a docker DB client built in a shell variable is waived only for the agent'
   ).toBe("dangerous");
   // the client variable was set in an EARLIER call, so nothing here proves the
   // target: gated
-  expect(classify('$DBC -e "delete from dev_tracker"\nmysql --version', env, cwd).decision).toBe("dangerous");
+  expect(classify('$DBC -e "delete from orders"\nmysql --version', env, cwd).decision).toBe("dangerous");
 });
 
 test("SQL on a sandboxed sqlite copy downgrades; live/server DBs stay dangerous", () => {
