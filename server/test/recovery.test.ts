@@ -1271,3 +1271,59 @@ test("a requeue that creates nothing returns an error to whoever answered, not a
   expect(res.status).toBe(500);
   expect((await res.json()).error).toContain("no new task was queued");
 });
+
+test("a protocol agent lost to a server restart is respawned in place, once", async () => {
+  const { ClaudeStreamRuntime } = await import("../src/runtime/claudeStream.ts");
+  const { db, projectId } = freshDb({ agent_driver: "protocol" });
+  const id = makeTask(db, projectId);
+  db.query("UPDATE tasks SET agent_target = ?, branch = ? WHERE id = ?").run(id, `hive/${id}`, id);
+  putEvent(db, id, "spawned", { agent_target: id, worktree_path: `/wt/${id}`, tab_id: null, terminal_id: null });
+  putEvent(db, id, "agent_status", { status: "working" });
+
+  // A stream-json child that never exits on its own.
+  const fakeProc = () => ({
+    pid: 4242,
+    stdout: new ReadableStream<Uint8Array>(),
+    stderr: null,
+    exited: new Promise<number>(() => {}),
+    write: () => {},
+    end: () => {},
+    kill: () => {},
+  });
+  // The server's herdr: pane agents come from `exec`, protocol agents from
+  // an in-memory stream runtime. The worktree's shell pane outlives the server.
+  const serverHerdr = () => {
+    const exec: Exec = async (argv) => {
+      if (isPaneList(argv)) return panes(`/wt/${id}`);
+      if (argv.includes("process-info"))
+        return OK('{"result":{"process_info":{"shell_pid":42,"foreground_processes":[{"pid":42,"name":"-zsh"}]}}}');
+      if (argv.includes("get")) return OK('{"error":{"code":"agent_not_found"}}');
+      return OK();
+    };
+    const h = new Herdr(exec, "herdr");
+    (h as any).stream = new ClaudeStreamRuntime(fakeProc, null);
+    const briefs: string[] = [];
+    h.spawn = async (args: any) => {
+      briefs.push(args.brief);
+      await h.stream.spawn({ taskId: args.taskId, cwd: `/wt/${args.taskId}`, hiveUrl: "http://127.0.0.1:1", hiveCli: "hive", brief: args.brief });
+      return { agent_target: args.taskId, worktree_path: `/wt/${args.taskId}`, branch: `hive/${args.taskId}`, workspace_id: null, fleet_workspace_id: null, tab_id: null, terminal_id: null, pane_id: null, label: "t" };
+    };
+    return { h, briefs };
+  };
+
+  const before = serverHerdr();
+  await before.h.stream.spawn({ taskId: id, cwd: `/wt/${id}`, hiveUrl: "http://127.0.0.1:1", hiveCli: "hive", brief: "do it" });
+  await reconcileOnce(db, { ...inert, herdr: before.h });
+  expect(before.briefs.length).toBe(0); // alive: left alone
+
+  const after = serverHerdr(); // restart: the stream sessions are gone
+  for (let i = 0; i < 3; i++) await reconcileOnce(db, { ...inert, herdr: after.h });
+
+  expect(after.briefs.length).toBe(1);
+  expect(after.briefs[0]).toContain("The Hive server restarted");
+  expect(after.h.stream.has(id)).toBe(true);
+  expect(getTask(db, id).state).toBe("in_progress");
+  const decisions = (db.query("SELECT payload FROM events WHERE task_id = ? AND type = 'recovery'").all(id) as { payload: string }[])
+    .map((r) => JSON.parse(r.payload).decision);
+  expect(decisions).toEqual(["stream-lost-respawn"]);
+});

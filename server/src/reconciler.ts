@@ -373,7 +373,16 @@ async function syncAgents(db: DB, deps: ReconcilerDeps): Promise<void> {
     .all() as { id: string; agent_target: string }[];
   for (const t of tasks) {
     if (isJiraMirrorId(db, t.id)) continue;
-    const { alive, status, unconfirmed, reason, exited } = await probeAgent(h, db, t.id, t.agent_target);
+    const { alive, status, unconfirmed, reason, exited, streamLost } = await probeAgent(h, db, t.id, t.agent_target);
+    if (streamLost) {
+      // Its process ended with the previous server. Start it again in the same
+      // worktree, once per server boot, after boot grace has passed.
+      const cur = getTask(db, t.id);
+      if (!cur || agentWorkComplete(db, cur) || streamRespawnTried(db, t.id)) continue;
+      if (teardownBlocked(db, (deps.nowMs ?? (() => Date.now()))(), deps.instanceId)) continue;
+      await respawnCompletedTurn(db, h, cur, deps, STREAM_LOST_RESPAWN);
+      continue;
+    }
     if (unconfirmed) {
       // The agent finished its turn and its process exited — the case that used
       // to log "unconfirmed-dead" every minute forever (HIVE-572). Continue the
@@ -450,7 +459,7 @@ export async function probeAgent(
   db: DB,
   taskId: string,
   target: string
-): Promise<{ alive: boolean; status: AgentStatus; unconfirmed?: boolean; reason?: string; exited?: boolean }> {
+): Promise<{ alive: boolean; status: AgentStatus; unconfirmed?: boolean; reason?: string; exited?: boolean; streamLost?: boolean }> {
   const p = await h.probe(target);
   if (p.alive) return p;
   // A server takeover can briefly make `agent get` miss an agent that is
@@ -461,6 +470,19 @@ export async function probeAgent(
     return { alive: true, status: "unknown" };
   const task = getTask(db, taskId);
   const meta = spawnMeta(db, taskId);
+  // A protocol agent is a child process of the server, so a server restart
+  // kills it and forgets its session. The pane lookup below would find the
+  // worktree's leftover shell pane and never call it dead. A protocol spawn
+  // records no terminal, which keeps a pane agent started before the project
+  // switched drivers out of this.
+  if (!h.hasStream(target) && !meta.terminal_id && task && projectDriver(db, task.project_id) === "protocol")
+    return {
+      alive: true,
+      status: "unknown",
+      unconfirmed: true,
+      streamLost: true,
+      reason: "the server holds no stream session for this protocol agent; it ended with the previous server process",
+    };
   const hint = { cwd: task?.worktree_path ?? null, tabId: meta.tab_id, terminalId: meta.terminal_id };
   const gone = await h.confirmGone(hint);
   if (gone) return p;
@@ -2145,22 +2167,59 @@ function respawnTried(db: DB, taskId: string, target: string): boolean {
     .get(taskId, target);
 }
 
-async function respawnCompletedTurn(db: DB, h: Herdr, task: any, deps: ReconcilerDeps): Promise<void> {
+// Why the agent is being started again: the recovery decision it is logged
+// under and the note the new agent reads first.
+type RespawnKind = { decision: string; note: string };
+const TURN_COMPLETE: RespawnKind = {
+  decision: "turn-complete-respawn",
+  note: "The prior agent turn completed before it received Hive's recovery nudge.",
+};
+const STREAM_LOST_RESPAWN: RespawnKind = {
+  decision: "stream-lost-respawn",
+  note: "The Hive server restarted and ended the prior agent process mid-task.",
+};
+
+// Tried once per server boot: a protocol agent keeps its task id as its
+// target across respawns, so the target cannot tell one episode from the next.
+function streamRespawnTried(db: DB, taskId: string): boolean {
+  return !!db
+    .query(
+      `SELECT 1 FROM events WHERE task_id = ? AND type = 'recovery' AND ts >= ?
+         AND json_extract(payload, '$.decision') = ? LIMIT 1`
+    )
+    .get(taskId, getSetting(db, "server_started_at") ?? "", STREAM_LOST_RESPAWN.decision);
+}
+
+function projectDriver(db: DB, projectId: string): string | undefined {
+  const row = db.query("SELECT config FROM projects WHERE id = ?").get(projectId) as { config: string | null } | undefined;
+  return JSON.parse(row?.config ?? "{}").agent_driver;
+}
+
+async function respawnCompletedTurn(db: DB, h: Herdr, task: any, deps: ReconcilerDeps, kind: RespawnKind = TURN_COMPLETE): Promise<void> {
   const nowMs = (deps.nowMs ?? (() => Date.now()))();
   const prior_agent_target = task.agent_target;
+  // Said once per reason: the stream-lost path retries every lap until it spawns.
+  const held = (reason: string) => {
+    const payload = { decision: `${kind.decision}-held`, reason, prior_agent_target };
+    const last = db
+      .query("SELECT payload FROM events WHERE task_id = ? AND type = 'recovery' ORDER BY ts DESC, rowid DESC LIMIT 1")
+      .get(task.id) as { payload: string } | undefined;
+    if (last?.payload === JSON.stringify(payload)) return;
+    writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload });
+  };
   const blocked = teardownBlocked(db, nowMs, deps.instanceId);
   if (blocked) {
-    writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "turn-complete-respawn-held", reason: blocked, prior_agent_target } });
+    held(blocked);
     return;
   }
   const dead = recentDeadVerdicts(db, nowMs);
   if (dead >= DEAD_BURST_N) {
     openBreakerDecision(db, task, dead, Math.round(DEAD_BURST_MS / 60_000));
-    writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "turn-complete-respawn-held", reason: "recovery breaker", prior_agent_target } });
+    held("recovery breaker");
     return;
   }
   if (inBackoff(db, task.id, nowMs)) {
-    writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "turn-complete-respawn-held", reason: "spawn backoff", prior_agent_target } });
+    held("spawn backoff");
     return;
   }
   const project = db.query("SELECT config FROM projects WHERE id = ?").get(task.project_id) as { config: string | null } | undefined;
@@ -2168,18 +2227,18 @@ async function respawnCompletedTurn(db: DB, h: Herdr, task: any, deps: Reconcile
   const cap = Number.isFinite(config.max_agents) ? Number(config.max_agents) : MAX_AGENTS_DEFAULT;
   const otherAgents = db.query(`SELECT COUNT(*) AS n FROM tasks WHERE project_id = ? AND id != ? AND agent_target IS NOT NULL AND COALESCE(source, '') != 'chat_supervisor' AND state IN ('in_progress','needs_decision')`).get(task.project_id, task.id) as { n: number };
   if (otherAgents.n >= cap) {
-    writeEvent(db, { task_id: task.id, source: "reconciler", type: "recovery", payload: { decision: "turn-complete-respawn-held", reason: "project max_agents", prior_agent_target } });
+    held("project max_agents");
     return;
   }
 
-  queueSteerEvent(db, task.id, `The prior agent turn completed before it received Hive's recovery nudge. Continue task ${task.id} from the existing branch and worktree.`, "queued for turn-complete respawn");
+  queueSteerEvent(db, task.id, `${kind.note} Continue task ${task.id} from the existing branch and worktree.`, `queued for ${kind.decision}`);
   const result = await spawnAgent(db, h, task.id, { supervise: deps.supervise, exec: deps.exec });
   writeEvent(db, {
     task_id: task.id,
     source: "reconciler",
     type: "recovery",
     payload: {
-      decision: "turn-complete-respawn",
+      decision: kind.decision,
       respawned: result.ok,
       prior_agent_target,
       ...(result.ok ? { agent_target: result.agent_target } : { error: result.error }),
