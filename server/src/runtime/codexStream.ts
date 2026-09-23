@@ -63,15 +63,25 @@ function bunSpawn(argv: string[], opts: { cwd: string; env: Record<string, strin
 
 // The pane argv is `codex <flags…> <brief>`; the exec form is the same command
 // with the subcommand spliced in, so hooks, sandbox and model stay identical.
+// `codex exec` rejects the pane-only --ask-for-approval flag, so it is dropped.
+function paneOnlyStripped(flags: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < flags.length; i++) {
+    if (flags[i] === "--ask-for-approval") i++;
+    else if (!flags[i].startsWith("--ask-for-approval=")) out.push(flags[i]);
+  }
+  return out;
+}
+
 export function execArgv(argv: string[]): string[] {
-  return [argv[0], "exec", "--json", ...argv.slice(1)];
+  return [argv[0], "exec", "--json", ...paneOnlyStripped(argv.slice(1, -1)), ...argv.slice(-1)];
 }
 
 // A steer is a new turn on the same thread: same flags, brief swapped for the
 // steer text. `thread_id` first and the prompt last keeps the two positionals
 // in the order `codex exec resume` expects.
 export function resumeArgv(argv: string[], threadId: string, text: string): string[] {
-  return [argv[0], "exec", "resume", threadId, "--json", ...argv.slice(1, -1), text];
+  return [argv[0], "exec", "resume", threadId, "--json", ...paneOnlyStripped(argv.slice(1, -1)), text];
 }
 
 // One transcript line per `item.completed`. Codex's own text comes through as

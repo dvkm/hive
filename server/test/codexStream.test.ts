@@ -111,6 +111,13 @@ test("a first turn that dies before naming a thread is gone, not idle", async ()
   expect(rt.goneByCwd("/elsewhere")).toBeNull();
 });
 
+test("exec and resume argv drop --ask-for-approval, which codex exec rejects", () => {
+  const pane = ["codex", "--ask-for-approval", "on-request", "--sandbox", "workspace-write", "brief"];
+  expect(execArgv(pane)).toEqual(["codex", "exec", "--json", "--sandbox", "workspace-write", "brief"]);
+  expect(resumeArgv(pane, "th-9", "steer")).toEqual(["codex", "exec", "resume", "th-9", "--json", "--sandbox", "workspace-write", "steer"]);
+  expect(execArgv(["codex", "--ask-for-approval=never", "brief"])).toEqual(["codex", "exec", "--json", "brief"]);
+});
+
 test("argv splicing keeps every pane flag and item lines carry one cheap field", () => {
   expect(execArgv(["codex", "-c", "features.hooks=true", "brief"])).toEqual(["codex", "exec", "--json", "-c", "features.hooks=true", "brief"]);
   expect(resumeArgv(["codex", "-c", "features.hooks=true", "brief"], "th-9", "steer")).toEqual([
