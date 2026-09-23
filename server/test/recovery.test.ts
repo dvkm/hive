@@ -1011,6 +1011,27 @@ test("agent_not_found with the task's pane still alive is NOT death", async () =
   expect(payload.agent_target).toBe(getTask(db, id).agent_target);
 });
 
+// ...but not forever: an agent hive cannot reach that has also said nothing for
+// longer than a busy agent may is restarted like a dead one.
+test("an unreachable agent silent for hours is restarted, not left in_progress", async () => {
+  const { db, projectId } = freshDb();
+  const id = taskWithWorktree(db, projectId);
+  // inert's stale window is 1h, so the restart line is 8h of silence.
+  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
+    .run(newId("ev"), id, new Date(Date.now() - 9 * 60 * 60 * 1000).toISOString(), "hive", "spawned", "{}");
+  putEvent(db, id, "stale", { silent_ms: 999 });
+  const exec: Exec = async (argv) => {
+    if (isPaneList(argv)) return panes("/wt/x");
+    if (argv.includes("get")) return OK('{"error":{"code":"agent_not_found"}}');
+    return OK();
+  };
+
+  await reconcileOnce(db, { ...inert, herdr: new Herdr(exec, "herdr") });
+
+  expect(getTask(db, id).state).toBe("failed");
+  expect(db.query("SELECT 1 FROM tasks WHERE parent_task_id = ? AND source = 'requeue'").get(id)).toBeTruthy();
+});
+
 // HIVE-572: it used to re-decide "unconfirmed-dead" every lap, which read like a
 // fleet incident and buried the real recovery events.
 test("unconfirmed death is said ONCE, however many laps it stays unresolved", async () => {

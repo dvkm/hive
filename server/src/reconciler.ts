@@ -1913,8 +1913,13 @@ async function recoverStale(db: DB, deps: ReconcilerDeps): Promise<void> {
     if (!goneNow && !staleFlagged) continue;
 
     const { alive, status, unconfirmed } = await probeAgent(h, db, t.id, t.agent_target);
-    if (unconfirmed) continue; // syncAgents already logged it; never recover on a guess
-    if (!alive) {
+    // syncAgents already logged an agent herdr cannot resolve; never recover on
+    // a guess. Unless it has also said nothing for as long as a busy-looking
+    // agent may: then hive has lost it either way, and it goes through the same
+    // gates as a dead one rather than sitting in_progress for days.
+    const lost = !!unconfirmed && quietMs(db, t.id, nowMs) > (deps.staleMs ?? DEFAULT_STALE_MS) * HUNG_RESTART_MULTIPLIER;
+    if (unconfirmed && !lost) continue;
+    if (!alive || lost) {
       // Both teardown gates sit HERE, in front of the only path that fails and
       // requeues a task. A server that just booted, or a fleet-wide burst of
       // death verdicts, means hive is the thing that lost its footing — the
@@ -1929,7 +1934,7 @@ async function recoverStale(db: DB, deps: ReconcilerDeps): Promise<void> {
         if (cur) openBreakerDecision(db, cur, dead, Math.round(DEAD_BURST_MS / 60_000));
         continue; // breaker now open: every later task this lap is held by teardownBlocked
       }
-      await recoverDead(db, h, t.id, t.agent_target);
+      await recoverDead(db, h, t.id, t.agent_target, lost ? "hive could not reach the agent and it made no progress for hours; restarted" : undefined);
     } else if (staleFlagged) {
       // Quiet but WORKING is not stuck — long tool runs and big builds are
       // silent by nature. Only idle/blocked/unknown agents enter recovery, and
