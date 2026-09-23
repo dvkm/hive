@@ -794,6 +794,12 @@ export class Herdr {
     return null;
   }
 
+  // Does this process hold a stream session for the target? Sessions live in
+  // memory only, so a server restart empties this for every protocol agent.
+  hasStream(target: string | null | undefined): boolean {
+    return this.streamFor(target) !== null;
+  }
+
   private run(argv: string[], opts?: { input?: string }): Promise<ExecResult> {
     return this.exec([this.bin, ...argv], opts);
   }
