@@ -19,7 +19,7 @@
 // own setup hook sees the warm state and no-ops (hive's own `wt.sh up` already
 // short-circuits on `[ -d node_modules ]`). Everything here is best-effort: a
 // seed that fails is a slow spawn, never a broken one, so nothing throws.
-import { existsSync, mkdirSync, cpSync, copyFileSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, cpSync, copyFileSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve, isAbsolute } from "node:path";
 import type { Exec } from "./exec.ts";
 import { defaultExec } from "./exec.ts";
@@ -254,4 +254,25 @@ export async function seedWorktree(
 
   out.ms = Date.now() - started;
   return out;
+}
+
+// HIVE-649: `graft build` writes a repo-root `.ignore` (a ripgrep config
+// re-admitting graft/ to search) that is untracked on both corebeat and hive.
+// Left alone, an agent's `git add -A` picks it up and the risk check blocks
+// the PR as scope creep. Excluding it via the worktree's own git-path (rather
+// than editing a tracked .gitignore) keeps the change invisible to git without
+// touching anything the branch could carry into the PR. A repo that DOES track
+// `.ignore` is a deliberate choice by that project and is left untouched.
+export async function excludeGraftIgnore(worktreePath: string, exec: Exec = defaultExec): Promise<void> {
+  const rel = ".ignore";
+  if (!existsSync(join(worktreePath, rel))) return;
+  const tracked = await exec(["git", "ls-files", "--error-unmatch", rel], { cwd: worktreePath });
+  if (tracked.code === 0) return;
+  const gitPath = await exec(["git", "rev-parse", "--git-path", "info/exclude"], { cwd: worktreePath });
+  if (gitPath.code !== 0) return;
+  const excludePath = join(worktreePath, gitPath.stdout.trim());
+  const existing = existsSync(excludePath) ? readFileSync(excludePath, "utf8") : "";
+  if (existing.split("\n").some((line) => line.trim() === rel)) return;
+  mkdirSync(dirname(excludePath), { recursive: true });
+  writeFileSync(excludePath, `${existing}${existing && !existing.endsWith("\n") ? "\n" : ""}${rel}\n`);
 }
