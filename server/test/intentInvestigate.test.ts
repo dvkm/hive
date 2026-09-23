@@ -110,6 +110,23 @@ test("a failed investigation leaves the draft as written and is not retried", as
   expect(pendingInvestigations(f.db, 5)).toEqual([]);
 });
 
+test("a ticket edited after hive read it is read again, once", async () => {
+  const f = fixture();
+  const reply = JSON.stringify({ ...JSON.parse(answered), open_questions: ["Should archived assets count?"] });
+  await investigateOnce(f.db, { exec: f.stub(() => ({ code: 0, stdout: reply })), accept: f.accept });
+  expect(pendingInvestigations(f.db, 5)).toEqual([]);
+
+  f.db.query("UPDATE tasks SET brief = ? WHERE id = ?").run("the chip stays inactive after a reload", f.taskId);
+  expect(pendingInvestigations(f.db, 5).map((i) => i.id)).toEqual([f.intent.id]);
+  await investigateOnce(f.db, { exec: f.stub(() => ({ code: 0, stdout: reply })), accept: f.accept });
+  expect(pendingInvestigations(f.db, 5)).toEqual([]);
+  expect(f.calls).toHaveLength(2);
+
+  // A run recorded before hive noted what it read counts as a read of an older ticket.
+  f.db.query("UPDATE events SET payload = json_remove(payload, '$.request') WHERE type = 'intent_investigated'").run();
+  expect(pendingInvestigations(f.db, 5).map((i) => i.id)).toEqual([f.intent.id]);
+});
+
 test("a draft the director edited while hive was looking is left alone", async () => {
   const f = fixture();
   const exec: PlannerExec = async () => {

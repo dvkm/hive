@@ -10,6 +10,7 @@ const { adviseOnce, withAdvice, advisorWillJudge, askReporters, withIntentStatus
 const { apiAnswerDecision } = await import("../src/api.ts");
 const { herdr: defaultHerdr } = await import("../src/runtime/herdr.ts");
 const { getIntent } = await import("../src/intents.ts");
+const { investigationDue, requestDigest } = await import("../src/intentInvestigate.ts");
 import type { PlannerExec } from "../src/planner.ts";
 
 function freshDb(config: any = {}): { db: DB; projectId: string; taskId: string } {
@@ -111,16 +112,55 @@ test("a model failure or a pick other than the recommendation leaves the card to
   expect(pushes(db, other)).toBe(1);
 });
 
-test("a Jira ask with questions left is asked of its reporter once, and waits for them", async () => {
+// A Jira ask hive has read the code for, with questions left for the reporter.
+function jiraAsk(questions = ["What is missing from the tracker?"]) {
   const { db, projectId } = freshDb({ jira: { enabled: true, write: true, site: "https://acme.atlassian.net", project_key: "ABC", email: "d@acme.dev" } });
   const mirror = newId();
   db.query("INSERT INTO tasks (id, project_id, title, state, kind, source, source_ref, jira_key, jira_link_kind, created_at, updated_at) VALUES (?,?,?, 'queued', 'ship', 'external', 'jira:ABC-12', 'ABC-12', 'mirror', ?, ?)")
     .run(mirror, projectId, "[ABC-12] tracker", now(), now());
   const intentId = newId("int");
   db.query("INSERT INTO intents (id, project_id, task_id, source, source_ref, status, body_md, created_at, updated_at) VALUES (?,?,?, 'jira', 'ABC-12', 'draft', ?, ?, ?)")
-    .run(intentId, projectId, mirror, "## Problem\nempty ticket\n\n## Open questions\n- [ ] What is missing from the tracker?\n", now(), now());
-  db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
-    .run(newId("ev"), mirror, now(), "system", "intent_investigated", JSON.stringify({ intent_id: intentId }));
+    .run(intentId, projectId, mirror, `## Problem\nempty ticket\n\n## Open questions\n${questions.map((q) => `- [ ] ${q}`).join("\n")}\n`, now(), now());
+  // What the investigator records after reading the ticket as it stands now.
+  const investigated = () =>
+    db.query("INSERT INTO events (id, task_id, ts, source, type, payload) VALUES (?,?,?,?,?,?)")
+      .run(newId("ev"), mirror, now(), "system", "intent_investigated", JSON.stringify({ intent_id: intentId, request: requestDigest(db, getIntent(db, intentId)!) }));
+  investigated();
+  return { db, mirror, intentId, investigated };
+}
+
+test("a ticket filled in after hive read it is read again before its reporter is asked anything", async () => {
+  const { db, mirror, intentId } = jiraAsk();
+  db.query("UPDATE tasks SET brief = ? WHERE id = ?").run("Add a fifth option to the category dropdown.", mirror);
+
+  const m = model({ comment: "Could you tell me what is missing?" });
+  expect(await askReporters(db, { answer: () => false, exec: m.exec })).toBe(0);
+  expect(m.calls()).toBe(0);
+  expect(investigationDue(db, getIntent(db, intentId)!)).toBe(true);
+});
+
+test("a fresh read's new questions are asked; the same questions never twice", async () => {
+  const { db, mirror, intentId, investigated } = jiraAsk();
+  const m = model({ comment: "Could you tell me?" });
+  expect(await askReporters(db, { answer: () => false, exec: m.exec })).toBe(1);
+
+  // The reporter edits the ticket; hive reads it again and has a different question.
+  db.query("UPDATE tasks SET brief = ? WHERE id = ?").run("The tracker needs a new column.", mirror);
+  db.query("UPDATE intents SET body_md = ? WHERE id = ?").run("## Problem\nA column is missing.\n\n## Open questions\n- [ ] Which column?\n", intentId);
+  expect(withIntentStatus(db, getIntent(db, intentId)!).waiting_on).toBeNull();
+  investigated();
+  expect(await askReporters(db, { answer: () => false, exec: m.exec })).toBe(1);
+  expect(withIntentStatus(db, getIntent(db, intentId)!).waiting_on).toBe("reporter");
+
+  // Read again with the same question left: nothing new to ask.
+  db.query("UPDATE tasks SET brief = ? WHERE id = ?").run("The tracker needs a new column, soon.", mirror);
+  investigated();
+  expect(await askReporters(db, { answer: () => false, exec: m.exec })).toBe(0);
+  expect(m.calls()).toBe(2);
+});
+
+test("a Jira ask with questions left is asked of its reporter once, and waits for them", async () => {
+  const { db, mirror, intentId } = jiraAsk();
 
   const m = model({ comment: "Hi! Could you tell me what is missing from the tracker? Thank you!" });
   expect(await askReporters(db, { answer: () => false, exec: m.exec })).toBe(1);

@@ -132,7 +132,7 @@ function projectDigest(db: DB, project: { id: string; name: string }, since: str
     .query(`SELECT * FROM intents WHERE project_id = ? AND status = 'draft' AND source = 'jira' ORDER BY created_at DESC`)
     .all(project.id) as Intent[])
     .flatMap((intent) => {
-      const asked = askedReporterAt(db, intent.id);
+      const asked = askedReporterAt(db, intent);
       if (!asked || reporterReplyAt(db, intent)) return [];
       const mirror = db
         .query("SELECT id, title FROM tasks WHERE project_id = ? AND jira_key = ? AND jira_link_kind = 'mirror' LIMIT 1")

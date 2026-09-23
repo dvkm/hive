@@ -109,7 +109,7 @@ export function withAdvice<T extends { id: string; ts: string; status: string; d
 // the director's yet. `waiting_on`: the reporter was asked and has not replied.
 export function withIntentStatus<T extends Intent>(db: DB, intent: T): T & { hive_working: boolean; waiting_on: "reporter" | null } {
   if (intent.status !== "draft") return { ...intent, hive_working: false, waiting_on: null };
-  const asked = askedReporterAt(db, intent.id);
+  const asked = askedReporterAt(db, intent);
   const replied = reporterReplyAt(db, intent);
   const since = replied ?? intent.created_at;
   const hive_working = investigatorOn() && investigationDue(db, intent) && Date.now() - Date.parse(since) < INVESTIGATE_GRACE_MS;
@@ -255,12 +255,13 @@ export async function askReporters(db: DB, deps: AdvisorDeps): Promise<number> {
       `SELECT i.* FROM intents i JOIN projects p ON p.id = i.project_id
         WHERE i.status = 'draft' AND i.source = 'jira' AND ${notTestProjectSql("p.config")}
           AND EXISTS (SELECT 1 FROM events e WHERE e.type = 'intent_investigated' AND json_extract(e.payload, '$.intent_id') = i.id)
-          AND NOT EXISTS (SELECT 1 FROM events e WHERE e.type = 'asked_reporter' AND json_extract(e.payload, '$.intent_id') = i.id)
-        ORDER BY i.created_at LIMIT 5`
+        ORDER BY i.created_at LIMIT 50`
     )
     .all() as Intent[];
   let asked = 0;
   for (const intent of drafts) {
+    // Never from a read of an older version of the ticket, never the same questions twice.
+    if (investigationDue(db, intent) || askedReporterAt(db, intent)) continue;
     const questions = openQuestions(intent.body_md);
     const mirror = mirrorOf(db, intent);
     const cfg = jiraConfigFor(db, intent.project_id);

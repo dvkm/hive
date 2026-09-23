@@ -14,6 +14,7 @@
 // work start; a draft that still needs a decision stays in the inbox with only
 // those questions. The record itself is written on import as before, so a
 // ticket never reaches hive without one.
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import type { DB } from "./db.ts";
@@ -195,6 +196,15 @@ function requestText(db: DB, intent: Intent, anchor: any): IntentSourceText | nu
   return null;
 }
 
+const digestOf = (src: IntentSourceText) => createHash("sha256").update(`${src.title}\n${src.description}`).digest("hex").slice(0, 16);
+
+// The ticket text an investigation read, recorded on its event. Comments are
+// left out: hive's own question lands there, and replies have their own rule.
+export function requestDigest(db: DB, intent: Intent): string | null {
+  const src = requestText(db, intent, anchorTask(db, intent));
+  return src ? digestOf(src) : null;
+}
+
 export function investigatorOn(): boolean {
   return process.env.HIVE_INTENT_INVESTIGATE !== "0";
 }
@@ -209,17 +219,20 @@ export function mirrorOf(db: DB, intent: Intent): { id: string } | null {
   );
 }
 
-// When hive asked the ticket's reporter about this ask (advisor.ts), or null.
-export function askedReporterAt(db: DB, intentId: string): string | null {
+// When hive asked the ticket's reporter the draft's current questions
+// (advisor.ts), or null. An ask about questions a later read replaced does not
+// count: the new ones were never asked.
+export function askedReporterAt(db: DB, intent: Intent): string | null {
   const row = db
-    .query("SELECT ts FROM events WHERE type = 'asked_reporter' AND json_extract(payload, '$.intent_id') = ? ORDER BY ts DESC LIMIT 1")
-    .get(intentId) as { ts: string } | undefined;
-  return row?.ts ?? null;
+    .query("SELECT ts, payload FROM events WHERE type = 'asked_reporter' AND json_extract(payload, '$.intent_id') = ? ORDER BY ts DESC, rowid DESC LIMIT 1")
+    .get(intent.id) as { ts: string; payload: string } | undefined;
+  if (!row) return null;
+  return JSON.stringify(JSON.parse(row.payload).questions) === JSON.stringify(openQuestions(intent.body_md)) ? row.ts : null;
 }
 
 // The reporter's first comment on the ticket after hive asked, or null.
 export function reporterReplyAt(db: DB, intent: Intent): string | null {
-  const asked = askedReporterAt(db, intent.id);
+  const asked = askedReporterAt(db, intent);
   const mirror = asked ? mirrorOf(db, intent) : null;
   if (!asked || !mirror) return null;
   const row = db
@@ -231,16 +244,19 @@ export function reporterReplyAt(db: DB, intent: Intent): string | null {
   return row?.ts ?? null;
 }
 
-// Does this draft need a (fresh) read of the code? Once when it arrives, and
-// once more after the reporter answers the questions hive asked on the ticket.
-// The `intent_investigated` event is the ledger, and a failed run writes it
-// too, so a broken model call never retries every minute.
+// Does this draft need a (fresh) read of the code? Once when it arrives, again
+// when the ticket's text changed since the last read (reporters often fill a
+// ticket in seconds after creating it, so the first read can see it empty), and
+// again after the reporter answers what hive asked on the ticket. The
+// `intent_investigated` event is the ledger, and a failed run writes it too, so
+// a broken model call never retries every minute.
 export function investigationDue(db: DB, intent: Intent): boolean {
   if (intent.status !== "draft" || !["jira", "director"].includes(intent.source) || !anchorTask(db, intent)) return false;
   const last = db
-    .query("SELECT ts FROM events WHERE type = 'intent_investigated' AND json_extract(payload, '$.intent_id') = ? ORDER BY ts DESC LIMIT 1")
-    .get(intent.id) as { ts: string } | undefined;
+    .query("SELECT ts, payload FROM events WHERE type = 'intent_investigated' AND json_extract(payload, '$.intent_id') = ? ORDER BY ts DESC, rowid DESC LIMIT 1")
+    .get(intent.id) as { ts: string; payload: string } | undefined;
   if (!last) return true;
+  if (JSON.parse(last.payload).request !== requestDigest(db, intent)) return true;
   const replied = reporterReplyAt(db, intent);
   return !!replied && replied > last.ts;
 }
@@ -257,12 +273,13 @@ async function investigateIntent(db: DB, intent: Intent, deps: InvestigatorDeps)
   if (!anchor) return;
   const started = Date.now();
   const model = deps.model ?? INVESTIGATE_MODEL;
+  const src = requestText(db, intent, anchor);
   const record = (payload: Record<string, unknown>) =>
     writeEvent(db, {
       task_id: anchor.id,
       source: "system",
       type: "intent_investigated",
-      payload: { intent_id: intent.id, model, ms: Date.now() - started, ...payload },
+      payload: { intent_id: intent.id, model, ms: Date.now() - started, request: src ? digestOf(src) : null, ...payload },
     });
   const project = db.query("SELECT repo_path, config FROM projects WHERE id = ?").get(intent.project_id) as
     | { repo_path: string | null; config: string | null }
@@ -274,7 +291,6 @@ async function investigateIntent(db: DB, intent: Intent, deps: InvestigatorDeps)
     return;
   }
   const graft = (deps.graftAvailable ?? graftIndexed)(repoPath);
-  const src = requestText(db, intent, anchor);
   const prompt = buildInvestigatePrompt(intent, src, graft);
   const timeoutMs = deps.timeoutMs ?? TIMEOUT_MS;
   let res: Awaited<ReturnType<PlannerExec>>;
